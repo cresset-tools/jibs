@@ -70,17 +70,15 @@ impl<'a> DependencyTraverser<'a> {
         // Key: table name, Value: list of rows
         let mut collected_rows: HashMap<String, Vec<Row>> = HashMap::new();
 
-        // BFS queue: (table_name, pk_values to fetch)
-        let mut queue: VecDeque<(String, Vec<Vec<MySqlValue>>)> = VecDeque::new();
+        // BFS queue: (table_name, fk_column, fk_values to fetch by)
+        let mut queue: VecDeque<(String, String, Vec<MySqlValue>)> = VecDeque::new();
 
         // Start with root table query
         let root_rows = self.query_root_table(aggregate)?;
 
         if !root_rows.is_empty() {
-            // Get PKs from root rows for relation traversal
+            // Mark root rows as visited
             let root_pks = self.extract_primary_keys(&aggregate.root_table, &root_rows)?;
-
-            // Mark as visited and collect
             for pk in root_pks.iter() {
                 let pk_bytes = self.serialize_pk(pk);
                 visited
@@ -88,69 +86,59 @@ impl<'a> DependencyTraverser<'a> {
                     .or_default()
                     .insert(pk_bytes);
             }
-            collected_rows.insert(aggregate.root_table.clone(), root_rows);
 
-            // Add related tables to queue
-            if let Some(relations) = self.relations_by_source.get(&aggregate.root_table) {
-                for relation in relations {
-                    let fk_values = self.collect_fk_values(&aggregate.root_table, relation, &root_pks)?;
-                    if !fk_values.is_empty() {
-                        queue.push_back((relation.to_table.clone(), fk_values));
-                    }
-                }
-            }
+            // Queue related tables based on FK values in root rows
+            self.queue_related_tables(&aggregate.root_table, &root_rows, &mut queue)?;
+
+            // Store root rows
+            collected_rows.insert(aggregate.root_table.clone(), root_rows);
         }
 
         // BFS traversal
-        while let Some((table, pk_values)) = queue.pop_front() {
+        while let Some((table, column, fk_values)) = queue.pop_front() {
             // Skip excluded tables
             if self.plan.excluded_tables.contains(&table) {
                 continue;
             }
 
-            // Filter out already visited PKs
-            let visited_set = visited.entry(table.clone()).or_default();
-            let new_pks: Vec<Vec<MySqlValue>> = pk_values
-                .into_iter()
-                .filter(|pk| {
-                    let pk_bytes = self.serialize_pk(pk);
-                    !visited_set.contains(&pk_bytes)
-                })
-                .collect();
+            // Fetch rows matching the FK values
+            let rows = self.fetch_by_column(&table, &column, &fk_values)?;
 
-            if new_pks.is_empty() {
+            if rows.is_empty() {
                 continue;
             }
 
-            // Fetch rows for these PKs
-            let rows = self.fetch_by_primary_keys(&table, &new_pks)?;
+            // Filter out already visited rows
+            let pks = self.extract_primary_keys(&table, &rows)?;
+            let visited_set = visited.entry(table.clone()).or_default();
 
-            // Mark as visited
-            for pk in &new_pks {
-                let pk_bytes = self.serialize_pk(pk);
-                visited_set.insert(pk_bytes);
-            }
-
-            if !rows.is_empty() {
-                // Extract PKs from fetched rows
-                let fetched_pks = self.extract_primary_keys(&table, &rows)?;
-
-                // Find related tables and add to queue
-                if let Some(relations) = self.relations_by_source.get(&table) {
-                    for relation in relations {
-                        let fk_values = self.collect_fk_values(&table, relation, &fetched_pks)?;
-                        if !fk_values.is_empty() {
-                            queue.push_back((relation.to_table.clone(), fk_values));
-                        }
+            let new_rows: Vec<Row> = rows
+                .into_iter()
+                .zip(pks.iter())
+                .filter(|(_, pk)| {
+                    let pk_bytes = self.serialize_pk(pk);
+                    if visited_set.contains(&pk_bytes) {
+                        false
+                    } else {
+                        visited_set.insert(pk_bytes);
+                        true
                     }
-                }
+                })
+                .map(|(row, _)| row)
+                .collect();
 
-                // Collect rows
-                collected_rows
-                    .entry(table)
-                    .or_default()
-                    .extend(rows);
+            if new_rows.is_empty() {
+                continue;
             }
+
+            // Queue related tables from these new rows
+            self.queue_related_tables(&table, &new_rows, &mut queue)?;
+
+            // Collect rows
+            collected_rows
+                .entry(table)
+                .or_default()
+                .extend(new_rows);
         }
 
         // Now stream the collected data table by table
@@ -159,6 +147,51 @@ impl<'a> DependencyTraverser<'a> {
         }
 
         Ok(())
+    }
+
+    /// Queue related tables based on FK values in the given rows
+    fn queue_related_tables(
+        &mut self,
+        source_table: &str,
+        rows: &[Row],
+        queue: &mut VecDeque<(String, String, Vec<MySqlValue>)>,
+    ) -> Result<()> {
+        if let Some(relations) = self.relations_by_source.get(source_table).cloned() {
+            for relation in relations {
+                // Extract FK column values from source rows
+                let fk_values: Vec<MySqlValue> = rows
+                    .iter()
+                    .filter_map(|row| {
+                        row.get_opt::<MySqlValue, _>(relation.from_column.as_str())
+                            .and_then(|r| r.ok())
+                            .filter(|v| !matches!(v, MySqlValue::NULL))
+                    })
+                    .collect();
+
+                if !fk_values.is_empty() {
+                    // Deduplicate FK values
+                    let unique_fks = self.dedupe_values(fk_values);
+                    queue.push_back((
+                        relation.to_table.clone(),
+                        relation.to_column.clone(),
+                        unique_fks,
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Deduplicate MySQL values
+    fn dedupe_values(&self, values: Vec<MySqlValue>) -> Vec<MySqlValue> {
+        let mut seen = HashSet::new();
+        values
+            .into_iter()
+            .filter(|v| {
+                let bytes = self.serialize_pk(&[v.clone()]);
+                seen.insert(bytes)
+            })
+            .collect()
     }
 
     /// Query the root table with WHERE, ORDER BY, and LIMIT
@@ -268,73 +301,29 @@ impl<'a> DependencyTraverser<'a> {
         bytes
     }
 
-    /// Collect foreign key values from rows to fetch related records
-    fn collect_fk_values(
-        &self,
-        _source_table: &str,
-        _relation: &Relation,
-        _source_pks: &[Vec<MySqlValue>],
-    ) -> Result<Vec<Vec<MySqlValue>>> {
-        // For now, we assume single-column FKs
-        // The FK column in the source table points to the PK in the target table
-        // We need to collect unique FK values from the source rows
-
-        // Note: This is simplified - we'd need the actual row data to extract FK values
-        // In a full implementation, we'd query for the FK column values
-        Ok(Vec::new()) // Placeholder - full implementation below
-    }
-
-    /// Fetch rows by primary key values
-    fn fetch_by_primary_keys(
+    /// Fetch rows by column values (used for FK lookups)
+    fn fetch_by_column(
         &mut self,
         table: &str,
-        pks: &[Vec<MySqlValue>],
+        column: &str,
+        values: &[MySqlValue],
     ) -> Result<Vec<Row>> {
-        if pks.is_empty() {
+        if values.is_empty() {
             return Ok(Vec::new());
         }
 
-        let pk_columns = self.get_pk_columns(table)?;
+        // Build IN clause
+        let placeholders: Vec<&str> = (0..values.len()).map(|_| "?").collect();
+        let query = format!(
+            "SELECT * FROM `{}` WHERE `{}` IN ({})",
+            table,
+            column,
+            placeholders.join(", ")
+        );
 
-        if pk_columns.len() == 1 {
-            // Simple case: single-column PK
-            let col = &pk_columns[0];
-            let values: Vec<&MySqlValue> = pks.iter().map(|pk| &pk[0]).collect();
-
-            // Build IN clause
-            let placeholders: Vec<&str> = (0..values.len()).map(|_| "?").collect();
-            let query = format!(
-                "SELECT * FROM `{}` WHERE `{}` IN ({})",
-                table,
-                col,
-                placeholders.join(", ")
-            );
-
-            // Convert values to params
-            let params: Vec<MySqlValue> = values.into_iter().cloned().collect();
-            self.conn.query_rows_with_params(&query, mysql::Params::Positional(params))
-        } else {
-            // Composite PK - use OR conditions
-            let mut conditions = Vec::new();
-            let mut all_params = Vec::new();
-
-            for pk in pks {
-                let mut condition_parts = Vec::new();
-                for (col, val) in pk_columns.iter().zip(pk.iter()) {
-                    condition_parts.push(format!("`{}` = ?", col));
-                    all_params.push(val.clone());
-                }
-                conditions.push(format!("({})", condition_parts.join(" AND ")));
-            }
-
-            let query = format!(
-                "SELECT * FROM `{}` WHERE {}",
-                table,
-                conditions.join(" OR ")
-            );
-
-            self.conn.query_rows_with_params(&query, mysql::Params::Positional(all_params))
-        }
+        // Convert values to params
+        let params: Vec<MySqlValue> = values.to_vec();
+        self.conn.query_rows_with_params(&query, mysql::Params::Positional(params))
     }
 
     /// Stream table data to the writer

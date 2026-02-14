@@ -24,9 +24,70 @@ use crate::mysql::MySqlConnection;
 use crate::traversal::DependencyTraverser;
 
 fn main() {
+    // Parse simple command line args
+    let args: Vec<String> = std::env::args().collect();
+
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        println!("jibs-server {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
+
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        eprintln!("jibs-server - Remote database import server");
+        eprintln!();
+        eprintln!("USAGE:");
+        eprintln!("    jibs-server [OPTIONS]");
+        eprintln!();
+        eprintln!("OPTIONS:");
+        eprintln!("    -h, --help       Print help information");
+        eprintln!("    -V, --version    Print version information");
+        eprintln!("    --echo           Echo mode: read Init, print plan summary, exit");
+        eprintln!();
+        eprintln!("ENVIRONMENT:");
+        eprintln!("    JIBS_MYSQL_URL   MySQL connection URL (default: mysql://root@localhost:3306)");
+        return;
+    }
+
+    if args.iter().any(|a| a == "--echo") {
+        if let Err(e) = run_echo_mode() {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+        return;
+    }
+
     if let Err(e) = run() {
         eprintln!("Server error: {}", e);
         std::process::exit(1);
+    }
+}
+
+/// Echo mode for testing: read Init message and print plan summary
+fn run_echo_mode() -> Result<()> {
+    let stdin = io::stdin();
+    let mut reader = BufReader::new(stdin.lock());
+
+    // Read initial message
+    let init_msg: ClientMessage = read_message(&mut reader)?;
+
+    match init_msg {
+        ClientMessage::Init { plan, compression } => {
+            eprintln!("Received Init message:");
+            eprintln!("  Compression: {:?}", compression);
+            eprintln!("  Variables: {}", plan.variables.len());
+            eprintln!("  Relations: {}", plan.relations.len());
+            eprintln!("  Aggregates: {}", plan.aggregates.len());
+            for agg in &plan.aggregates {
+                eprintln!("    - {} (root: {}, where: {:?}, limit: {:?})",
+                    agg.name, agg.root_table, agg.where_clause, agg.limit);
+            }
+            eprintln!("  Excluded tables: {:?}", plan.excluded_tables);
+            eprintln!("  Anonymization rules: {} tables", plan.anonymization.len());
+            eprintln!("  Fakers: {}", plan.fakers.len());
+            eprintln!("  After statements: {}", plan.after_statements.len());
+            Ok(())
+        }
+        _ => Err(ServerError::Protocol("Expected Init message".to_string())),
     }
 }
 
