@@ -21,7 +21,8 @@ serde = { version = "1.0", features = ["derive"] }
 bincode = "2.0.0-rc.3"
 
 # Server dependencies (sync MySQL)
-mysql = "25"
+# Use default-rustls for fully static binary (no system TLS/zlib dependencies)
+mysql = { version = "25", default-features = false, features = ["default-rustls"] }
 
 # Client dependencies
 tokio = { version = "1", features = ["full"] }
