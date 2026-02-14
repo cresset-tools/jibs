@@ -1,0 +1,124 @@
+[package]
+name = "mysql"
+version = "25.0.1"
+authors = ["blackbeam"]
+description = "Mysql client library implemented in rust"
+license = "MIT/Apache-2.0"
+documentation = "https://docs.rs/mysql"
+repository = "https://github.com/blackbeam/rust-mysql-simple"
+keywords = ["database", "sql"]
+exclude = ["tests/*", ".*", "Makefile"]
+categories = ["database"]
+edition = "2021"
+build = "build.rs"
+
+[badges.azure-devops]
+build = "1"
+pipeline = "blackbeam.rust-mysql-simple"
+project = "aikorsky/mysql Rust"
+
+[lib]
+name = "mysql"
+path = "src/lib.rs"
+
+[profile.bench]
+debug = true
+
+[features]
+default = [
+    "native-tls",
+
+    # It is necessary to choose one of `flate2` backends.
+    "flate2/zlib",
+
+    # set of enabled-by-default mysql_common features
+    "bigdecimal",
+    "rust_decimal",
+    "time",
+    "frunk",
+    "binlog",
+
+    "derive",
+    # use global buffer pool by default
+    "buffer-pool",
+]
+default-rustls = [
+    "rustls-tls",
+
+    # default-rustls uses rust_backend for flate2.
+    "flate2/rust_backend",
+
+    "bigdecimal",
+    "rust_decimal",
+    "time",
+    "frunk",
+    "binlog",
+
+    "derive",
+    "buffer-pool",
+]
+# minimal feature set with system flate2 impl
+minimal = ["flate2/zlib"]
+# minimal feature set with rust flate2 impl
+minimal-rust = ["flate2/rust_backend"]
+rustls-tls = ["rustls", "webpki", "webpki-roots", "rustls-pemfile"]
+buffer-pool = []
+nightly = []
+
+# mysql_common features
+derive = ["mysql_common/derive"]
+chrono = ["mysql_common/chrono"]
+time = ["mysql_common/time"]
+bigdecimal = ["mysql_common/bigdecimal"]
+rust_decimal = ["mysql_common/rust_decimal"]
+frunk = ["mysql_common/frunk"]
+binlog = ["mysql_common/binlog"]
+
+[dev-dependencies]
+rand = "0.8.2"
+serde_derive = "1"
+time = "0.3"
+frunk = "0.4"
+
+[dependencies]
+bufstream = "~0.1"
+bytes = "1.0.1"
+crossbeam = "0.8.1"
+io-enum = "1.0.0"
+flate2 = { version = "1.0", default-features = false }
+lru = "0.12"
+mysql_common = { version = "0.32", default-features = false }
+socket2 = "0.5.2"
+pem = "3"
+percent-encoding = "2.1.0"
+serde = "1"
+serde_json = "1"
+twox-hash = "1"
+url = "2.1"
+
+[dependencies.native-tls]
+version = "0.2.3"
+optional = true
+
+[dependencies.rustls]
+version = "0.23"
+optional = true
+
+[dependencies.rustls-pemfile]
+version = "2.1"
+optional = true
+
+[dependencies.webpki]
+version = "0.22.0"
+features = ["std"]
+optional = true
+
+[dependencies.webpki-roots]
+version = "0.26"
+optional = true
+
+[target.'cfg(target_os = "windows")'.dependencies]
+named_pipe = "~0.4"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

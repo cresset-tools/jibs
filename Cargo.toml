@@ -44,3 +44,8 @@ home = "0.5"
 
 # Shared
 hex = "0.4"
+
+# Use vendored mysql implementation
+[patch.crates-io]
+mysql = { path = "vendor/mysql" }
+mysql_common = { path = "vendor/mysql_common" }
