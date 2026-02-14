@@ -1,0 +1,23 @@
+[package]
+name = "jibs_server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Remote server component for Jibs database imports"
+
+[[bin]]
+name = "jibs-server"
+path = "src/main.rs"
+
+[dependencies]
+jibs_protocol = { path = "../protocol" }
+mysql.workspace = true
+serde.workspace = true
+bincode.workspace = true
+zstd.workspace = true
+thiserror.workspace = true
+hex.workspace = true
+rand.workspace = true
+
+[features]
+default = []

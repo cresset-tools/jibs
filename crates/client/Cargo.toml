@@ -1,0 +1,33 @@
+[package]
+name = "jibs_client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CLI client for Jibs database imports"
+
+[[bin]]
+name = "jibs"
+path = "src/main.rs"
+
+[dependencies]
+jibs_parser = { path = "../parser" }
+jibs_protocol = { path = "../protocol" }
+mysql.workspace = true
+tokio.workspace = true
+russh.workspace = true
+russh-keys.workspace = true
+clap.workspace = true
+sha2.workspace = true
+zstd.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+directories.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+bincode.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+hex.workspace = true
+home.workspace = true
