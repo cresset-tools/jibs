@@ -14,9 +14,8 @@ pub enum ClientMessage {
         plan: ExecutionPlan,
         compression: CompressionMode,
     },
-    /// Request data for a specific aggregate (or resume from checkpoint)
-    FetchAggregate {
-        name: String,
+    /// Start streaming data (optionally resume from checkpoint)
+    Start {
         resume_from: Option<Checkpoint>,
     },
     /// Acknowledge receipt of chunk (for flow control)
@@ -48,8 +47,8 @@ pub enum ServerMessage {
     },
     /// Table fully transferred
     TableDone { table: String, row_count: u64 },
-    /// Aggregate fully transferred
-    AggregateDone { name: String },
+    /// All data transferred
+    Done,
     /// Error occurred
     Error { message: String, recoverable: bool },
 }

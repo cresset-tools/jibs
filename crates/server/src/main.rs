@@ -129,12 +129,12 @@ fn run() -> Result<()> {
     };
     write_message(&mut writer, &ready_msg)?;
 
-    // Wait for client to request data
+    // Wait for client to start
     let msg: ClientMessage = read_message(&mut reader)?;
 
     match msg {
-        ClientMessage::FetchAggregate { .. } => {
-            // Client requested data - stream all tables
+        ClientMessage::Start { resume_from: _ } => {
+            // TODO: handle resume_from for resumable imports
             let mut traverser = DependencyTraverser::new(&mut conn, &plan)?;
 
             if let Err(e) = traverser.stream_all_tables(compression, &mut writer) {
@@ -147,22 +147,19 @@ fn run() -> Result<()> {
             }
 
             // Send completion message
-            let done_msg = ServerMessage::AggregateDone {
-                name: "all".to_string(),
-            };
-            write_message(&mut writer, &done_msg)?;
+            write_message(&mut writer, &ServerMessage::Done)?;
         }
         ClientMessage::Shutdown => {
             return Ok(());
         }
         _ => {
             return Err(ServerError::Protocol(
-                "Expected FetchAggregate or Shutdown".to_string(),
+                "Expected Start or Shutdown".to_string(),
             ));
         }
     }
 
-    // Wait for shutdown
+    // Wait for shutdown (client may send Acks during streaming)
     loop {
         match read_message(&mut reader)? {
             ClientMessage::Shutdown => break,
