@@ -1,0 +1,39 @@
+{
+  "name": "mysqlimport-dsl",
+  "displayName": "MySQL Import DSL",
+  "description": "Syntax highlighting for MySQL Import DSL files",
+  "version": "0.1.0",
+  "publisher": "mysqlimport",
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "mysqlimport-dsl",
+        "aliases": [
+          "MySQL Import DSL",
+          "mysqlimport"
+        ],
+        "extensions": [
+          ".dsl",
+          ".mysqlimport"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "mysqlimport-dsl",
+        "scopeName": "source.mysqlimport-dsl",
+        "path": "./syntaxes/mysqlimport-dsl.tmLanguage.json",
+        "embeddedLanguages": {
+          "meta.embedded.block.sql": "sql"
+        }
+      }
+    ]
+  }
+}
