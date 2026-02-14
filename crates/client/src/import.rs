@@ -15,7 +15,8 @@ use jibs_protocol::{
 
 use crate::error::ClientError;
 use crate::resolver;
-use crate::ssh::{get_server_path, RemoteProcess, SshConfig, SshSession};
+use crate::server_binary;
+use crate::ssh::{compute_hash, get_server_path, RemoteProcess, SshConfig, SshSession};
 
 /// Configuration for an import operation
 pub struct ImportConfig {
@@ -302,12 +303,57 @@ async fn recv_message(server: &mut RemoteProcess) -> Result<ServerMessage> {
 
 /// Deploy the server binary to the remote host if needed
 async fn deploy_server(session: &SshSession) -> Result<String> {
-    // Get the embedded server binary
-    // For now, we assume the server is already on the remote host
-    // In production, we'd embed the binary and upload it
+    // Detect remote architecture
+    let (code, arch_output, _) = session
+        .exec("uname -m")
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to detect architecture: {}", e))?;
 
-    // Check if jibs-server exists in PATH
-    let (code, stdout, _) = session.exec("which jibs-server").await
+    if code != 0 {
+        return Err(anyhow::anyhow!("Failed to detect remote architecture"));
+    }
+
+    let arch = arch_output.trim();
+    debug!("Remote architecture: {}", arch);
+
+    // Get the appropriate embedded binary
+    let server_binary = server_binary::get_server_binary(arch);
+
+    if let Some(binary) = server_binary {
+        // Compute hash-based path for CAS deployment
+        let server_path = get_server_path(binary);
+
+        // Check if binary already exists at this path
+        let (code, _, _) = session
+            .exec(&format!("test -x {}", server_path))
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to check for server: {}", e))?;
+
+        if code == 0 {
+            info!("Server already deployed: {}", server_path);
+            return Ok(server_path);
+        }
+
+        // Upload the binary
+        info!(
+            "Uploading server binary ({} bytes) to {}",
+            binary.len(),
+            server_path
+        );
+
+        session
+            .upload_file(binary, &server_path)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to upload server: {}", e))?;
+
+        info!("Server deployed successfully");
+        return Ok(server_path);
+    }
+
+    // No embedded binary - check for existing server
+    let (code, stdout, _) = session
+        .exec("which jibs-server")
+        .await
         .map_err(|e| anyhow::anyhow!("Failed to check for server: {}", e))?;
 
     if code == 0 {
@@ -317,7 +363,9 @@ async fn deploy_server(session: &SshSession) -> Result<String> {
     }
 
     // Check for server in /tmp
-    let (code, _, _) = session.exec("test -x /tmp/jibs-server").await
+    let (code, _, _) = session
+        .exec("test -x /tmp/jibs-server")
+        .await
         .map_err(|e| anyhow::anyhow!("Failed to check for server: {}", e))?;
 
     if code == 0 {
@@ -325,12 +373,23 @@ async fn deploy_server(session: &SshSession) -> Result<String> {
         return Ok("/tmp/jibs-server".to_string());
     }
 
-    // For now, fail if server isn't available
-    // TODO: embed and upload server binary
-    Err(anyhow::anyhow!(
-        "jibs-server not found on remote host. \
-         Please copy the server binary to the remote host first."
-    ))
+    // No server available
+    let available = server_binary::available_architectures();
+    if available.is_empty() {
+        Err(anyhow::anyhow!(
+            "No embedded server binary available and jibs-server not found on remote host.\n\
+             Build the server for Linux with:\n  \
+             cross build -p jibs_server --release --target x86_64-unknown-linux-musl\n\
+             Then rebuild the client to embed it."
+        ))
+    } else {
+        Err(anyhow::anyhow!(
+            "No server binary for architecture '{}'. Available: {:?}\n\
+             jibs-server also not found on remote host.",
+            arch,
+            available
+        ))
+    }
 }
 
 /// Create a table in local MySQL based on schema

@@ -11,6 +11,7 @@
 mod error;
 mod import;
 mod resolver;
+mod server_binary;
 mod ssh;
 
 use std::path::PathBuf;
