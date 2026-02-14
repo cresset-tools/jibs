@@ -6,12 +6,16 @@ use std::path::PathBuf;
 use anyhow::Result;
 use mysql::prelude::*;
 use mysql::{Conn, LocalInfileHandler, Opts};
-use tracing::info;
+use tracing::{debug, info, warn};
 
-use jibs_protocol::{ColumnDef, CompressionMode};
+use jibs_protocol::{
+    framing::{read_message, write_message},
+    Checkpoint, ClientMessage, ColumnDef, CompressionMode, ExecutionPlan, ServerMessage,
+};
 
+use crate::error::ClientError;
 use crate::resolver;
-use crate::ssh::{get_server_path, SshConfig, SshSession};
+use crate::ssh::{get_server_path, RemoteProcess, SshConfig, SshSession};
 
 /// Configuration for an import operation
 pub struct ImportConfig {
@@ -61,29 +65,188 @@ pub async fn run_import(config: ImportConfig) -> Result<()> {
     let plan = resolver::resolve(&source, &program, &vars)
         .map_err(|e| anyhow::anyhow!("Resolution failed: {}", e))?;
 
-    info!("Resolved {} aggregates", plan.aggregates.len());
+    info!(
+        "Resolved plan: {} aggregates, {} relations, {} excluded tables",
+        plan.aggregates.len(),
+        plan.relations.len(),
+        plan.excluded_tables.len()
+    );
 
     // Connect to SSH
-    let ssh_config = SshConfig::parse(&config.remote_host, config.ssh_port, config.identity_file)?;
-    info!("Connecting to {}@{}:{}", ssh_config.user, ssh_config.host, ssh_config.port);
+    let ssh_config =
+        SshConfig::parse(&config.remote_host, config.ssh_port, config.identity_file.clone())?;
+    info!(
+        "Connecting to {}@{}:{}",
+        ssh_config.user, ssh_config.host, ssh_config.port
+    );
     let session = SshSession::connect(ssh_config).await?;
 
     // Deploy server binary if needed
-    deploy_server(&session).await?;
+    let server_path = deploy_server(&session).await?;
 
     // Connect to local MySQL
+    info!("Connecting to local MySQL: {}", config.local_mysql);
     let local_opts = Opts::from_url(&config.local_mysql)
         .map_err(|e| anyhow::anyhow!("Invalid local MySQL URL: {}", e))?;
     let mut local_conn = Conn::new(local_opts)?;
 
-    // Start the server on remote host
-    let server_path = get_server_path(&[]); // TODO: use actual binary
-    info!("Starting remote server at {}", server_path);
+    // Disable foreign key checks for import
+    local_conn.query_drop("SET FOREIGN_KEY_CHECKS = 0")?;
+    local_conn.query_drop("SET UNIQUE_CHECKS = 0")?;
 
-    // For now, we'll implement a simplified version that doesn't use the remote server
-    // This is a placeholder for the full implementation
-    info!("Import process would run here");
-    info!("Plan has {} aggregates, {} relations", plan.aggregates.len(), plan.relations.len());
+    // Start the remote server
+    info!("Starting remote server: {}", server_path);
+    let mut server = session.start_process(&server_path).await?;
+
+    // Run the import protocol
+    let result = run_protocol(&mut server, &mut local_conn, plan, config.compression).await;
+
+    // Re-enable checks
+    local_conn.query_drop("SET FOREIGN_KEY_CHECKS = 1")?;
+    local_conn.query_drop("SET UNIQUE_CHECKS = 1")?;
+
+    // Handle result
+    match result {
+        Ok(stats) => {
+            info!(
+                "Import complete: {} tables, {} rows",
+                stats.tables_imported, stats.rows_imported
+            );
+            Ok(())
+        }
+        Err(e) => {
+            // Try to send shutdown
+            let _ = send_message(&mut server, &ClientMessage::Shutdown).await;
+            Err(e)
+        }
+    }
+}
+
+/// Import statistics
+struct ImportStats {
+    tables_imported: usize,
+    rows_imported: u64,
+}
+
+/// Run the import protocol with the remote server
+async fn run_protocol(
+    server: &mut RemoteProcess,
+    local_conn: &mut Conn,
+    plan: ExecutionPlan,
+    compression: CompressionMode,
+) -> Result<ImportStats> {
+    let mut stats = ImportStats {
+        tables_imported: 0,
+        rows_imported: 0,
+    };
+
+    // Send Init message
+    info!("Sending execution plan to server");
+    let init_msg = ClientMessage::Init {
+        plan: plan.clone(),
+        compression,
+    };
+    send_message(server, &init_msg).await?;
+
+    // Wait for Ready
+    let ready_msg: ServerMessage = recv_message(server).await?;
+    let (tables, negotiated_compression) = match ready_msg {
+        ServerMessage::Ready {
+            tables,
+            compression,
+        } => {
+            info!("Server ready: {} tables discovered", tables.len());
+            (tables, compression)
+        }
+        ServerMessage::Error { message, .. } => {
+            return Err(anyhow::anyhow!("Server error: {}", message));
+        }
+        other => {
+            return Err(anyhow::anyhow!("Unexpected message: {:?}", other));
+        }
+    };
+
+    // Log discovered tables
+    for table in &tables {
+        debug!(
+            "  {} (~{} rows)",
+            table.name, table.estimated_rows
+        );
+    }
+
+    // Send Start message
+    info!("Starting data transfer");
+    let start_msg = ClientMessage::Start { resume_from: None };
+    send_message(server, &start_msg).await?;
+
+    // Process incoming messages
+    let mut current_table: Option<String> = None;
+    let mut current_schema: Vec<ColumnDef> = Vec::new();
+
+    loop {
+        let msg: ServerMessage = recv_message(server).await?;
+
+        match msg {
+            ServerMessage::Schema { table, columns } => {
+                info!("Receiving table: {}", table);
+                current_table = Some(table.clone());
+                current_schema = columns.clone();
+
+                // Create table in local MySQL
+                create_table(local_conn, &table, &columns)?;
+            }
+
+            ServerMessage::Data {
+                table,
+                row_count,
+                tsv_data,
+                checkpoint,
+            } => {
+                let decompressed = maybe_decompress(tsv_data, negotiated_compression)?;
+
+                debug!(
+                    "Data chunk: {} rows, {} bytes for {}",
+                    row_count,
+                    decompressed.len(),
+                    table
+                );
+
+                // Load data into MySQL
+                let loaded = load_tsv_data(local_conn, &table, &current_schema, &decompressed)?;
+                stats.rows_imported += loaded;
+
+                // Send ack
+                let ack_msg = ClientMessage::Ack { checkpoint };
+                send_message(server, &ack_msg).await?;
+            }
+
+            ServerMessage::TableDone { table, row_count } => {
+                info!("Table {} complete: {} rows", table, row_count);
+                stats.tables_imported += 1;
+                current_table = None;
+            }
+
+            ServerMessage::Done => {
+                info!("All tables transferred");
+                break;
+            }
+
+            ServerMessage::Error {
+                message,
+                recoverable,
+            } => {
+                if recoverable {
+                    warn!("Recoverable server error: {}", message);
+                } else {
+                    return Err(anyhow::anyhow!("Server error: {}", message));
+                }
+            }
+
+            ServerMessage::Ready { .. } => {
+                return Err(anyhow::anyhow!("Unexpected Ready message"));
+            }
+        }
+    }
 
     // Run after statements
     for statement in &plan.after_statements {
@@ -91,47 +254,90 @@ pub async fn run_import(config: ImportConfig) -> Result<()> {
         local_conn.query_drop(statement)?;
     }
 
-    info!("Import complete");
+    // Send shutdown
+    send_message(server, &ClientMessage::Shutdown).await?;
+
+    Ok(stats)
+}
+
+/// Send a message to the server
+async fn send_message(server: &mut RemoteProcess, msg: &ClientMessage) -> Result<()> {
+    let mut buffer = Vec::new();
+    write_message(&mut buffer, msg)
+        .map_err(|e| anyhow::anyhow!("Failed to serialize message: {}", e))?;
+    server
+        .write(&buffer)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to send message: {}", e))?;
     Ok(())
+}
+
+/// Receive a message from the server
+async fn recv_message(server: &mut RemoteProcess) -> Result<ServerMessage> {
+    // Read length prefix
+    let mut len_bytes = [0u8; 4];
+    server
+        .read_exact(&mut len_bytes)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to read message length: {}", e))?;
+    let len = u32::from_le_bytes(len_bytes) as usize;
+
+    if len > 100 * 1024 * 1024 {
+        return Err(anyhow::anyhow!("Message too large: {} bytes", len));
+    }
+
+    // Read message body
+    let mut buffer = vec![0u8; len];
+    server
+        .read_exact(&mut buffer)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to read message body: {}", e))?;
+
+    // Decode
+    let (msg, _) = bincode::decode_from_slice(&buffer, jibs_protocol::framing::bincode_config())
+        .map_err(|e| anyhow::anyhow!("Failed to decode message: {}", e))?;
+
+    Ok(msg)
 }
 
 /// Deploy the server binary to the remote host if needed
-async fn deploy_server(_session: &SshSession) -> Result<()> {
-    // For now, we'll skip actual binary deployment since we need cross-compilation
-    // In a full implementation, we'd:
-    // 1. Compute hash of the server binary
-    // 2. Check if binary exists at /tmp/jibs-{hash}
-    // 3. Upload if missing
+async fn deploy_server(session: &SshSession) -> Result<String> {
+    // Get the embedded server binary
+    // For now, we assume the server is already on the remote host
+    // In production, we'd embed the binary and upload it
 
-    info!("Server deployment skipped (not yet implemented)");
-    Ok(())
-}
+    // Check if jibs-server exists in PATH
+    let (code, stdout, _) = session.exec("which jibs-server").await
+        .map_err(|e| anyhow::anyhow!("Failed to check for server: {}", e))?;
 
-/// State for receiving data from the server
-struct ImportState {
-    /// Current table being imported
-    current_table: Option<String>,
-    /// Schema for the current table
-    current_schema: Vec<ColumnDef>,
-    /// Buffer for TSV data
-    tsv_buffer: Vec<u8>,
-    /// Total rows imported
-    total_rows: u64,
-}
-
-impl ImportState {
-    fn new() -> Self {
-        Self {
-            current_table: None,
-            current_schema: Vec::new(),
-            tsv_buffer: Vec::new(),
-            total_rows: 0,
-        }
+    if code == 0 {
+        let path = stdout.trim().to_string();
+        info!("Using existing server: {}", path);
+        return Ok(path);
     }
+
+    // Check for server in /tmp
+    let (code, _, _) = session.exec("test -x /tmp/jibs-server").await
+        .map_err(|e| anyhow::anyhow!("Failed to check for server: {}", e))?;
+
+    if code == 0 {
+        info!("Using existing server: /tmp/jibs-server");
+        return Ok("/tmp/jibs-server".to_string());
+    }
+
+    // For now, fail if server isn't available
+    // TODO: embed and upload server binary
+    Err(anyhow::anyhow!(
+        "jibs-server not found on remote host. \
+         Please copy the server binary to the remote host first."
+    ))
 }
 
 /// Create a table in local MySQL based on schema
 fn create_table(conn: &mut Conn, table: &str, columns: &[ColumnDef]) -> Result<()> {
+    // Drop existing table
+    conn.query_drop(format!("DROP TABLE IF EXISTS `{}`", table))?;
+
     let mut column_defs = Vec::new();
 
     for col in columns {
@@ -177,23 +383,32 @@ fn create_table(conn: &mut Conn, table: &str, columns: &[ColumnDef]) -> Result<(
     }
 
     let create_sql = format!(
-        "CREATE TABLE IF NOT EXISTS `{}` (\n  {}\n)",
+        "CREATE TABLE `{}` (\n  {}\n)",
         table,
         column_defs.join(",\n  ")
     );
 
+    debug!("Creating table: {}", create_sql);
     conn.query_drop(&create_sql)?;
     Ok(())
 }
 
 /// Load TSV data into a table using LOAD DATA LOCAL INFILE
-fn load_tsv_data(conn: &mut Conn, table: &str, columns: &[ColumnDef], tsv_data: &[u8]) -> Result<u64> {
+fn load_tsv_data(
+    conn: &mut Conn,
+    table: &str,
+    columns: &[ColumnDef],
+    tsv_data: &[u8],
+) -> Result<u64> {
     use std::io::Write;
+
+    if tsv_data.is_empty() {
+        return Ok(0);
+    }
 
     // Set up the local infile handler
     let data = tsv_data.to_vec();
 
-    // Create a handler that writes our data to the LocalInfile
     let handler = LocalInfileHandler::new(move |_file_name, local_infile| {
         local_infile.write_all(&data)?;
         Ok(())
@@ -215,8 +430,6 @@ fn load_tsv_data(conn: &mut Conn, table: &str, columns: &[ColumnDef], tsv_data: 
     );
 
     let result = conn.query_iter(&load_sql)?;
-
-    // Get affected rows
     let affected = result.affected_rows();
 
     Ok(affected)

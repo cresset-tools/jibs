@@ -5,9 +5,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use russh::client::{self, Config, Handle};
+use russh::client::{self, Config, Handle, Msg};
 use russh::keys::key::PublicKey;
-use russh::ChannelMsg;
+use russh::{Channel, ChannelMsg};
 use sha2::{Digest, Sha256};
 
 use crate::error::{ClientError, Result};
@@ -208,6 +208,130 @@ impl SshSession {
         self.exec(&format!("chmod +x {}", remote_path)).await?;
 
         Ok(())
+    }
+
+    /// Start a command and return a bidirectional channel for stdin/stdout
+    pub async fn start_process(&self, command: &str) -> Result<RemoteProcess> {
+        let channel = self
+            .handle
+            .channel_open_session()
+            .await
+            .map_err(|e| ClientError::Ssh(format!("Failed to open channel: {}", e)))?;
+
+        RemoteProcess::new(channel, command).await
+    }
+}
+
+/// A running process on the remote host with stdin/stdout access
+pub struct RemoteProcess {
+    channel: Channel<Msg>,
+    /// Buffer for incoming data
+    stdout_buffer: Vec<u8>,
+    /// Whether the process has exited
+    exited: bool,
+    /// Exit code (if exited)
+    exit_code: Option<i32>,
+}
+
+impl RemoteProcess {
+    async fn new(mut channel: Channel<Msg>, command: &str) -> Result<Self> {
+        channel
+            .exec(true, command)
+            .await
+            .map_err(|e| ClientError::Ssh(format!("Failed to exec: {}", e)))?;
+
+        Ok(Self {
+            channel,
+            stdout_buffer: Vec::new(),
+            exited: false,
+            exit_code: None,
+        })
+    }
+
+    /// Write data to the process stdin
+    pub async fn write(&mut self, data: &[u8]) -> Result<()> {
+        self.channel
+            .data(data)
+            .await
+            .map_err(|e| ClientError::Ssh(format!("Failed to write: {}", e)))?;
+        Ok(())
+    }
+
+    /// Read data from stdout, returns bytes read
+    /// Blocks until data is available or process exits
+    pub async fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+        // First, drain any buffered data
+        if !self.stdout_buffer.is_empty() {
+            let len = std::cmp::min(buf.len(), self.stdout_buffer.len());
+            buf[..len].copy_from_slice(&self.stdout_buffer[..len]);
+            self.stdout_buffer.drain(..len);
+            return Ok(len);
+        }
+
+        if self.exited {
+            return Ok(0);
+        }
+
+        // Wait for more data
+        loop {
+            match self.channel.wait().await {
+                Some(ChannelMsg::Data { data }) => {
+                    let len = std::cmp::min(buf.len(), data.len());
+                    buf[..len].copy_from_slice(&data[..len]);
+                    if data.len() > len {
+                        self.stdout_buffer.extend_from_slice(&data[len..]);
+                    }
+                    return Ok(len);
+                }
+                Some(ChannelMsg::ExtendedData { data, ext }) => {
+                    if ext == 1 {
+                        // stderr - log it
+                        let msg = String::from_utf8_lossy(&data);
+                        tracing::debug!("Remote stderr: {}", msg);
+                    }
+                }
+                Some(ChannelMsg::ExitStatus { exit_status }) => {
+                    self.exit_code = Some(exit_status as i32);
+                }
+                Some(ChannelMsg::Eof) | None => {
+                    self.exited = true;
+                    return Ok(0);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Read exact number of bytes
+    pub async fn read_exact(&mut self, buf: &mut [u8]) -> Result<()> {
+        let mut offset = 0;
+        while offset < buf.len() {
+            let n = self.read(&mut buf[offset..]).await?;
+            if n == 0 {
+                return Err(ClientError::Ssh("Unexpected EOF".to_string()));
+            }
+            offset += n;
+        }
+        Ok(())
+    }
+
+    /// Close stdin (signal EOF to the process)
+    pub async fn close_stdin(&mut self) -> Result<()> {
+        self.channel
+            .eof()
+            .await
+            .map_err(|e| ClientError::Ssh(format!("Failed to send EOF: {}", e)))?;
+        Ok(())
+    }
+
+    /// Check if the process has exited
+    pub fn has_exited(&self) -> bool {
+        self.exited
+    }
+
+    /// Get exit code (if process has exited)
+    pub fn exit_code(&self) -> Option<i32> {
+        self.exit_code
     }
 }
 
