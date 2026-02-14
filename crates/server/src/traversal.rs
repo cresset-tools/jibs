@@ -61,11 +61,17 @@ impl<'a> DependencyTraverser<'a> {
     /// 2. Tables NOT touched by aggregates: include ALL rows
     /// 3. Excluded tables: skip data (structure only)
     /// 4. Ignored tables: skip entirely
+    ///
+    /// If `resume_from` is provided, skip tables already completed.
     pub fn stream_all_tables<W: Write>(
         &mut self,
+        resume_from: Option<Checkpoint>,
         compression: CompressionMode,
         writer: &mut W,
     ) -> Result<()> {
+        // Initialize checkpoint (either from resume or fresh)
+        let mut checkpoint = resume_from.unwrap_or_default();
+
         // First, collect rows from all aggregates
         let (aggregate_rows, aggregate_tables) = self.collect_aggregate_rows()?;
 
@@ -84,17 +90,26 @@ impl<'a> DependencyTraverser<'a> {
                 continue;
             }
 
+            // Skip already completed tables (on resume)
+            if checkpoint.should_skip_table(&table) {
+                continue;
+            }
+
+            checkpoint.start_table(&table);
+
             if aggregate_tables.contains(&table) {
                 // This table is filtered by an aggregate - use collected rows
                 if let Some(rows) = aggregate_rows.get(&table) {
                     if !rows.is_empty() {
-                        self.stream_table_data(&table, rows.clone(), compression, writer)?;
+                        self.stream_table_data(&table, rows.clone(), &mut checkpoint, compression, writer)?;
                     }
                 }
             } else {
                 // This table is not filtered - stream ALL rows
-                self.stream_full_table(&table, compression, writer)?;
+                self.stream_full_table(&table, &mut checkpoint, compression, writer)?;
             }
+
+            checkpoint.complete_table(&table);
         }
 
         Ok(())
@@ -200,6 +215,7 @@ impl<'a> DependencyTraverser<'a> {
     fn stream_full_table<W: Write>(
         &mut self,
         table: &str,
+        checkpoint: &mut Checkpoint,
         compression: CompressionMode,
         writer: &mut W,
     ) -> Result<()> {
@@ -208,7 +224,7 @@ impl<'a> DependencyTraverser<'a> {
         let rows = self.conn.query_rows(&query)?;
 
         if !rows.is_empty() {
-            self.stream_table_data(table, rows, compression, writer)?;
+            self.stream_table_data(table, rows, checkpoint, compression, writer)?;
         }
 
         Ok(())
@@ -396,6 +412,7 @@ impl<'a> DependencyTraverser<'a> {
         &mut self,
         table: &str,
         rows: Vec<Row>,
+        checkpoint: &mut Checkpoint,
         compression: CompressionMode,
         writer: &mut W,
     ) -> Result<()> {
@@ -429,41 +446,39 @@ impl<'a> DependencyTraverser<'a> {
         );
 
         // Write rows in chunks
-        let mut row_count = 0u32;
-        let mut total_rows = 0u64;
-        let mut checkpoint = Checkpoint::new(&self.plan.aggregates.first().map(|a| a.name.clone()).unwrap_or_default());
+        let mut chunk_row_count = 0u32;
+        let mut table_row_count = 0u64;
 
         for row in rows {
             tsv_writer.write_row(&row)?;
-            row_count += 1;
-            total_rows += 1;
+            chunk_row_count += 1;
+            table_row_count += 1;
+            checkpoint.rows_transferred += 1;
 
             // Check if we should flush a chunk
-            if row_count >= CHUNK_ROW_LIMIT as u32 || tsv_writer.buffer_size() >= CHUNK_BYTE_LIMIT {
+            if chunk_row_count >= CHUNK_ROW_LIMIT as u32 || tsv_writer.buffer_size() >= CHUNK_BYTE_LIMIT {
                 let tsv_data = tsv_writer.take_buffer();
-                checkpoint.rows_transferred = total_rows;
                 checkpoint.bytes_transferred += tsv_data.len() as u64;
 
                 let data_msg = ServerMessage::Data {
                     table: table.to_string(),
-                    row_count,
+                    row_count: chunk_row_count,
                     tsv_data: maybe_compress(tsv_data, compression),
                     checkpoint: checkpoint.clone(),
                 };
                 write_message(writer, &data_msg)?;
-                row_count = 0;
+                chunk_row_count = 0;
             }
         }
 
         // Flush remaining data
         if !tsv_writer.is_empty() {
             let tsv_data = tsv_writer.take_buffer();
-            checkpoint.rows_transferred = total_rows;
             checkpoint.bytes_transferred += tsv_data.len() as u64;
 
             let data_msg = ServerMessage::Data {
                 table: table.to_string(),
-                row_count,
+                row_count: chunk_row_count,
                 tsv_data: maybe_compress(tsv_data, compression),
                 checkpoint: checkpoint.clone(),
             };
@@ -473,7 +488,7 @@ impl<'a> DependencyTraverser<'a> {
         // Send TableDone
         let done_msg = ServerMessage::TableDone {
             table: table.to_string(),
-            row_count: total_rows,
+            row_count: table_row_count,
         };
         write_message(writer, &done_msg)?;
 

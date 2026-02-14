@@ -133,11 +133,10 @@ fn run() -> Result<()> {
     let msg: ClientMessage = read_message(&mut reader)?;
 
     match msg {
-        ClientMessage::Start { resume_from: _ } => {
-            // TODO: handle resume_from for resumable imports
+        ClientMessage::Start { resume_from } => {
             let mut traverser = DependencyTraverser::new(&mut conn, &plan)?;
 
-            if let Err(e) = traverser.stream_all_tables(compression, &mut writer) {
+            if let Err(e) = traverser.stream_all_tables(resume_from, compression, &mut writer) {
                 let error_msg = ServerMessage::Error {
                     message: e.to_string(),
                     recoverable: e.is_recoverable(),
