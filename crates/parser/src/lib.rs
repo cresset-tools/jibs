@@ -1,4 +1,4 @@
-//! MySQL Import DSL Parser
+//! Jibs Parser - Jelle's Importer with Better Speed
 //!
 //! A domain-specific language for directing MySQL database imports from remote
 //! (production) databases to local development environments.

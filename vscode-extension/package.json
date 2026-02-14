@@ -1,9 +1,9 @@
 {
-  "name": "mysqlimport-dsl",
-  "displayName": "MySQL Import DSL",
-  "description": "Syntax highlighting for MySQL Import DSL files",
+  "name": "jibs",
+  "displayName": "Jibs - Jelle's Importer with Better Speed",
+  "description": "Syntax highlighting for Jibs DSL files",
   "version": "0.1.0",
-  "publisher": "mysqlimport",
+  "publisher": "jibs",
   "engines": {
     "vscode": "^1.75.0"
   },
@@ -13,23 +13,22 @@
   "contributes": {
     "languages": [
       {
-        "id": "mysqlimport-dsl",
+        "id": "jibs",
         "aliases": [
-          "MySQL Import DSL",
-          "mysqlimport"
+          "Jibs",
+          "jibs"
         ],
         "extensions": [
-          ".dsl",
-          ".mysqlimport"
+          ".jibs"
         ],
         "configuration": "./language-configuration.json"
       }
     ],
     "grammars": [
       {
-        "language": "mysqlimport-dsl",
-        "scopeName": "source.mysqlimport-dsl",
-        "path": "./syntaxes/mysqlimport-dsl.tmLanguage.json",
+        "language": "jibs",
+        "scopeName": "source.jibs",
+        "path": "./syntaxes/jibs.tmLanguage.json",
         "embeddedLanguages": {
           "meta.embedded.block.sql": "sql"
         }
