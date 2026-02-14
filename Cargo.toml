@@ -1,8 +1,14 @@
-[package]
-name = "mysqlimport_dsl"
+[workspace]
+resolver = "2"
+members = [
+    "crates/*",
+]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
 
-[dependencies]
+[workspace.dependencies]
 chumsky = "1.0.0-alpha.8"
 ariadne = "0.4"

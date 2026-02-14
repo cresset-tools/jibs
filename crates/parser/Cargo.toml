@@ -1,0 +1,10 @@
+[package]
+name = "mysqlimport-parser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Parser for the MySQL Import DSL"
+
+[dependencies]
+chumsky.workspace = true
+ariadne.workspace = true
