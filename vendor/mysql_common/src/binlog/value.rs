@@ -256,6 +256,13 @@ pub enum BinlogValueToValueError {
     JsonDiff,
 }
 
+#[cfg(not(feature = "serde_json_support"))]
+#[derive(Debug, thiserror::Error)]
+pub enum BinlogValueToValueError {
+    #[error("Impossible to convert JsonDiff to Value")]
+    JsonDiff,
+}
+
 #[cfg(feature = "serde_json_support")]
 impl<'a> TryFrom<BinlogValue<'a>> for Value {
     type Error = BinlogValueToValueError;
@@ -266,6 +273,23 @@ impl<'a> TryFrom<BinlogValue<'a>> for Value {
             BinlogValue::Jsonb(x) => {
                 let json = serde_json::Value::try_from(x)?;
                 Ok(Value::Bytes(Vec::from(json.to_string())))
+            }
+            BinlogValue::JsonDiff(_) => Err(BinlogValueToValueError::JsonDiff),
+        }
+    }
+}
+
+/// Without serde_json_support, JSONB uses debug representation
+#[cfg(not(feature = "serde_json_support"))]
+impl<'a> TryFrom<BinlogValue<'a>> for Value {
+    type Error = BinlogValueToValueError;
+
+    fn try_from(value: BinlogValue<'a>) -> Result<Self, Self::Error> {
+        match value {
+            BinlogValue::Value(x) => Ok(x),
+            BinlogValue::Jsonb(x) => {
+                // Without serde, use debug representation
+                Ok(Value::Bytes(format!("{:?}", x).into_bytes()))
             }
             BinlogValue::JsonDiff(_) => Err(BinlogValueToValueError::JsonDiff),
         }
