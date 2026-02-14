@@ -1,11 +1,11 @@
 //! Execution plan types - resolved DSL for server execution
 
 use bincode::{Decode, Encode};
-use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
 /// Compression mode for data transfer
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum CompressionMode {
     /// No compression
     None,
@@ -22,7 +22,8 @@ impl Default for CompressionMode {
 }
 
 /// A fully resolved execution plan sent to the server
-#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
+#[derive(Debug, Clone, Encode, Decode)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ExecutionPlan {
     /// All resolved variables
     pub variables: HashMap<String, Value>,
@@ -71,7 +72,8 @@ impl Default for ExecutionPlan {
 }
 
 /// A resolved value (after variable interpolation)
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Encode, Decode)]
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Value {
     String(String),
     Int(i64),
@@ -110,7 +112,8 @@ impl Value {
 }
 
 /// A relation between two tables
-#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
+#[derive(Debug, Clone, Encode, Decode)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Relation {
     /// Source table.column
     pub from_table: String,
@@ -121,7 +124,8 @@ pub struct Relation {
 }
 
 /// A resolved aggregate definition
-#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
+#[derive(Debug, Clone, Encode, Decode)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ResolvedAggregate {
     /// Name of the aggregate
     pub name: String,
@@ -138,14 +142,16 @@ pub struct ResolvedAggregate {
 }
 
 /// Sort direction
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum SortDirection {
     Asc,
     Desc,
 }
 
 /// Rule for preserving data in a table
-#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
+#[derive(Debug, Clone, Encode, Decode)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct PreserveRule {
     /// Table to preserve rows in
     pub table: String,
@@ -154,7 +160,8 @@ pub struct PreserveRule {
 }
 
 /// Anonymization rule for a column
-#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
+#[derive(Debug, Clone, Encode, Decode)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct AnonymizeRule {
     /// Column to anonymize
     pub column: String,
@@ -163,7 +170,8 @@ pub struct AnonymizeRule {
 }
 
 /// What to replace the column value with
-#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
+#[derive(Debug, Clone, Encode, Decode)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum AnonymizeTarget {
     /// Use values from a faker pool
     Faker(String),
@@ -172,7 +180,8 @@ pub enum AnonymizeTarget {
 }
 
 /// Post-import SET rule
-#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
+#[derive(Debug, Clone, Encode, Decode)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct SetRule {
     /// Table to update
     pub table: String,
@@ -183,7 +192,8 @@ pub struct SetRule {
 }
 
 /// Column assignment
-#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
+#[derive(Debug, Clone, Encode, Decode)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Assignment {
     /// Column name
     pub column: String,
@@ -192,7 +202,8 @@ pub struct Assignment {
 }
 
 /// Information about a table discovered on the server
-#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
+#[derive(Debug, Clone, Encode, Decode)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct TableInfo {
     /// Table name
     pub name: String,
@@ -203,7 +214,8 @@ pub struct TableInfo {
 }
 
 /// MySQL column definition
-#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
+#[derive(Debug, Clone, Encode, Decode)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ColumnDef {
     /// Column name
     pub name: String,
@@ -224,7 +236,8 @@ pub struct ColumnDef {
 }
 
 /// Column flags from MySQL
-#[derive(Debug, Clone, Default, Serialize, Deserialize, Encode, Decode)]
+#[derive(Debug, Clone, Default, Encode, Decode)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ColumnFlags {
     pub unsigned: bool,
     pub zerofill: bool,

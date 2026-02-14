@@ -12,7 +12,6 @@ path = "src/main.rs"
 [dependencies]
 jibs_protocol = { path = "../protocol" }
 mysql.workspace = true
-serde.workspace = true
 bincode.workspace = true
 zstd.workspace = true
 thiserror.workspace = true

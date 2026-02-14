@@ -11,7 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 jibs_parser = { path = "../parser" }
-jibs_protocol = { path = "../protocol" }
+jibs_protocol = { path = "../protocol", features = ["serde"] }
 mysql.workspace = true
 tokio.workspace = true
 russh.workspace = true

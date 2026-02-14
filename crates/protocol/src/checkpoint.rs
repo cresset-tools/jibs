@@ -1,11 +1,11 @@
 //! Checkpoint types for resumable transfers
 
 use bincode::{Decode, Encode};
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// A checkpoint for resuming an interrupted transfer
-#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
+#[derive(Debug, Clone, Encode, Decode)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Checkpoint {
     /// Name of the aggregate being transferred
     pub aggregate: String,
@@ -59,7 +59,8 @@ impl Checkpoint {
 }
 
 /// Import session metadata for checkpoint persistence
-#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
+#[derive(Debug, Clone, Encode, Decode)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ImportSession {
     /// Unique import ID (hash of host + plan + timestamp)
     pub import_id: String,

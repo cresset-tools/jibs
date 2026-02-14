@@ -1,13 +1,13 @@
 //! Protocol message types for client-server communication
 
 use bincode::{Decode, Encode};
-use serde::{Deserialize, Serialize};
 
 use crate::checkpoint::Checkpoint;
 use crate::plan::{ColumnDef, CompressionMode, ExecutionPlan, TableInfo};
 
 /// Messages sent from client to server
-#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
+#[derive(Debug, Clone, Encode, Decode)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum ClientMessage {
     /// Initial handshake with full execution plan
     Init {
@@ -26,7 +26,8 @@ pub enum ClientMessage {
 }
 
 /// Messages sent from server to client
-#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
+#[derive(Debug, Clone, Encode, Decode)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum ServerMessage {
     /// Server ready, reports discovered tables and estimated row counts
     Ready {

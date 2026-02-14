@@ -6,5 +6,9 @@ license.workspace = true
 description = "Protocol types for Jibs client-server communication"
 
 [dependencies]
-serde.workspace = true
 bincode.workspace = true
+serde = { workspace = true, optional = true }
+
+[features]
+default = []
+serde = ["dep:serde"]
