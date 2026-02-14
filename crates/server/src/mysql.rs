@@ -33,14 +33,18 @@ impl MySqlConnection {
         })
     }
 
+    /// Get all table names in the database
+    pub fn get_all_table_names(&mut self) -> Result<Vec<String>> {
+        let table_names: Vec<String> = self.conn.query("SHOW TABLES")?;
+        Ok(table_names)
+    }
+
     /// Discover tables and their metadata
     pub fn discover_tables(&mut self, plan: &ExecutionPlan) -> Result<Vec<TableInfo>> {
         let mut tables = Vec::new();
 
         // Get all tables from the database
-        let table_names: Vec<String> = self
-            .conn
-            .query("SHOW TABLES")?;
+        let table_names = self.get_all_table_names()?;
 
         for table_name in table_names {
             // Skip ignored tables

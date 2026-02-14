@@ -54,96 +54,161 @@ impl<'a> DependencyTraverser<'a> {
         })
     }
 
-    /// Traverse from an aggregate root and stream data
-    pub fn traverse_and_stream<W: Write>(
+    /// Stream all tables, with aggregates providing filtered subsets
+    ///
+    /// Logic:
+    /// 1. Tables touched by aggregates: only include rows reachable from aggregate
+    /// 2. Tables NOT touched by aggregates: include ALL rows
+    /// 3. Excluded tables: skip data (structure only)
+    /// 4. Ignored tables: skip entirely
+    pub fn stream_all_tables<W: Write>(
         &mut self,
-        aggregate: &ResolvedAggregate,
-        _resume_from: Option<Checkpoint>,
         compression: CompressionMode,
         writer: &mut W,
     ) -> Result<()> {
-        // Track visited rows per table to avoid duplicates
-        // Key: table name, Value: set of serialized PK values
-        let mut visited: HashMap<String, HashSet<Vec<u8>>> = HashMap::new();
+        // First, collect rows from all aggregates
+        let (aggregate_rows, aggregate_tables) = self.collect_aggregate_rows()?;
 
-        // Rows to process, grouped by table
-        // Key: table name, Value: list of rows
-        let mut collected_rows: HashMap<String, Vec<Row>> = HashMap::new();
+        // Get all tables in the database
+        let all_tables: Vec<String> = self.conn.get_all_table_names()?;
 
-        // BFS queue: (table_name, fk_column, fk_values to fetch by)
-        let mut queue: VecDeque<(String, String, Vec<MySqlValue>)> = VecDeque::new();
-
-        // Start with root table query
-        let root_rows = self.query_root_table(aggregate)?;
-
-        if !root_rows.is_empty() {
-            // Mark root rows as visited
-            let root_pks = self.extract_primary_keys(&aggregate.root_table, &root_rows)?;
-            for pk in root_pks.iter() {
-                let pk_bytes = self.serialize_pk(pk);
-                visited
-                    .entry(aggregate.root_table.clone())
-                    .or_default()
-                    .insert(pk_bytes);
+        // Stream tables
+        for table in all_tables {
+            // Skip ignored tables
+            if self.plan.ignored_tables.contains(&table) {
+                continue;
             }
 
-            // Queue related tables based on FK values in root rows
-            self.queue_related_tables(&aggregate.root_table, &root_rows, &mut queue)?;
-
-            // Store root rows
-            collected_rows.insert(aggregate.root_table.clone(), root_rows);
-        }
-
-        // BFS traversal
-        while let Some((table, column, fk_values)) = queue.pop_front() {
-            // Skip excluded tables
+            // Skip excluded tables (structure only, handled elsewhere)
             if self.plan.excluded_tables.contains(&table) {
                 continue;
             }
 
-            // Fetch rows matching the FK values
-            let rows = self.fetch_by_column(&table, &column, &fk_values)?;
-
-            if rows.is_empty() {
-                continue;
-            }
-
-            // Filter out already visited rows
-            let pks = self.extract_primary_keys(&table, &rows)?;
-            let visited_set = visited.entry(table.clone()).or_default();
-
-            let new_rows: Vec<Row> = rows
-                .into_iter()
-                .zip(pks.iter())
-                .filter(|(_, pk)| {
-                    let pk_bytes = self.serialize_pk(pk);
-                    if visited_set.contains(&pk_bytes) {
-                        false
-                    } else {
-                        visited_set.insert(pk_bytes);
-                        true
+            if aggregate_tables.contains(&table) {
+                // This table is filtered by an aggregate - use collected rows
+                if let Some(rows) = aggregate_rows.get(&table) {
+                    if !rows.is_empty() {
+                        self.stream_table_data(&table, rows.clone(), compression, writer)?;
                     }
-                })
-                .map(|(row, _)| row)
-                .collect();
-
-            if new_rows.is_empty() {
-                continue;
+                }
+            } else {
+                // This table is not filtered - stream ALL rows
+                self.stream_full_table(&table, compression, writer)?;
             }
-
-            // Queue related tables from these new rows
-            self.queue_related_tables(&table, &new_rows, &mut queue)?;
-
-            // Collect rows
-            collected_rows
-                .entry(table)
-                .or_default()
-                .extend(new_rows);
         }
 
-        // Now stream the collected data table by table
-        for (table, rows) in collected_rows {
-            self.stream_table_data(&table, rows, compression, writer)?;
+        Ok(())
+    }
+
+    /// Collect all rows reachable from aggregates via relations
+    fn collect_aggregate_rows(&mut self) -> Result<(HashMap<String, Vec<Row>>, HashSet<String>)> {
+        // Track visited rows per table to avoid duplicates
+        let mut visited: HashMap<String, HashSet<Vec<u8>>> = HashMap::new();
+
+        // Rows collected, grouped by table
+        let mut collected_rows: HashMap<String, Vec<Row>> = HashMap::new();
+
+        // Tables that are touched by aggregates (will be filtered)
+        let mut aggregate_tables: HashSet<String> = HashSet::new();
+
+        // Process each aggregate
+        for aggregate in &self.plan.aggregates.clone() {
+            aggregate_tables.insert(aggregate.root_table.clone());
+
+            // BFS queue: (table_name, fk_column, fk_values to fetch by)
+            let mut queue: VecDeque<(String, String, Vec<MySqlValue>)> = VecDeque::new();
+
+            // Start with root table query
+            let root_rows = self.query_root_table(aggregate)?;
+
+            if !root_rows.is_empty() {
+                // Mark root rows as visited
+                let root_pks = self.extract_primary_keys(&aggregate.root_table, &root_rows)?;
+                for pk in root_pks.iter() {
+                    let pk_bytes = self.serialize_pk(pk);
+                    visited
+                        .entry(aggregate.root_table.clone())
+                        .or_default()
+                        .insert(pk_bytes);
+                }
+
+                // Queue related tables based on FK values in root rows
+                self.queue_related_tables(&aggregate.root_table, &root_rows, &mut queue)?;
+
+                // Store root rows
+                collected_rows
+                    .entry(aggregate.root_table.clone())
+                    .or_default()
+                    .extend(root_rows);
+            }
+
+            // BFS traversal for this aggregate
+            while let Some((table, column, fk_values)) = queue.pop_front() {
+                // Mark this table as aggregate-touched
+                aggregate_tables.insert(table.clone());
+
+                // Skip excluded tables
+                if self.plan.excluded_tables.contains(&table) {
+                    continue;
+                }
+
+                // Fetch rows matching the FK values
+                let rows = self.fetch_by_column(&table, &column, &fk_values)?;
+
+                if rows.is_empty() {
+                    continue;
+                }
+
+                // Filter out already visited rows
+                let pks = self.extract_primary_keys(&table, &rows)?;
+                let visited_set = visited.entry(table.clone()).or_default();
+
+                let new_rows: Vec<Row> = rows
+                    .into_iter()
+                    .zip(pks.iter())
+                    .filter(|(_, pk)| {
+                        let pk_bytes = self.serialize_pk(pk);
+                        if visited_set.contains(&pk_bytes) {
+                            false
+                        } else {
+                            visited_set.insert(pk_bytes);
+                            true
+                        }
+                    })
+                    .map(|(row, _)| row)
+                    .collect();
+
+                if new_rows.is_empty() {
+                    continue;
+                }
+
+                // Queue related tables from these new rows
+                self.queue_related_tables(&table, &new_rows, &mut queue)?;
+
+                // Collect rows
+                collected_rows
+                    .entry(table)
+                    .or_default()
+                    .extend(new_rows);
+            }
+        }
+
+        Ok((collected_rows, aggregate_tables))
+    }
+
+    /// Stream an entire table (no filtering)
+    fn stream_full_table<W: Write>(
+        &mut self,
+        table: &str,
+        compression: CompressionMode,
+        writer: &mut W,
+    ) -> Result<()> {
+        // Query all rows from the table
+        let query = format!("SELECT * FROM `{}`", table);
+        let rows = self.conn.query_rows(&query)?;
+
+        if !rows.is_empty() {
+            self.stream_table_data(table, rows, compression, writer)?;
         }
 
         Ok(())

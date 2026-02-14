@@ -16,7 +16,7 @@ use std::io::{self, BufReader, BufWriter, Write};
 
 use jibs_protocol::{
     framing::{read_message, write_message},
-    ClientMessage, Checkpoint, CompressionMode, ExecutionPlan, ServerMessage,
+    ClientMessage, CompressionMode, ServerMessage,
 };
 
 use crate::error::{Result, ServerError};
@@ -124,41 +124,52 @@ fn run() -> Result<()> {
 
     // Send Ready message
     let ready_msg = ServerMessage::Ready {
-        tables,
+        tables: tables.clone(),
         compression,
     };
     write_message(&mut writer, &ready_msg)?;
 
-    // Main message loop
-    loop {
-        let msg: ClientMessage = read_message(&mut reader)?;
+    // Wait for client to request data
+    let msg: ClientMessage = read_message(&mut reader)?;
 
-        match msg {
-            ClientMessage::FetchAggregate { name, resume_from } => {
-                if let Err(e) = handle_fetch_aggregate(
-                    &mut conn,
-                    &plan,
-                    &name,
-                    resume_from,
-                    compression,
-                    &mut writer,
-                ) {
-                    let error_msg = ServerMessage::Error {
-                        message: e.to_string(),
-                        recoverable: e.is_recoverable(),
-                    };
-                    write_message(&mut writer, &error_msg)?;
-                }
+    match msg {
+        ClientMessage::FetchAggregate { .. } => {
+            // Client requested data - stream all tables
+            let mut traverser = DependencyTraverser::new(&mut conn, &plan)?;
+
+            if let Err(e) = traverser.stream_all_tables(compression, &mut writer) {
+                let error_msg = ServerMessage::Error {
+                    message: e.to_string(),
+                    recoverable: e.is_recoverable(),
+                };
+                write_message(&mut writer, &error_msg)?;
+                return Err(e);
             }
-            ClientMessage::Ack { checkpoint: _ } => {
-                // Flow control acknowledgment - for now just continue
-            }
-            ClientMessage::Shutdown => {
-                break;
-            }
-            ClientMessage::Init { .. } => {
+
+            // Send completion message
+            let done_msg = ServerMessage::AggregateDone {
+                name: "all".to_string(),
+            };
+            write_message(&mut writer, &done_msg)?;
+        }
+        ClientMessage::Shutdown => {
+            return Ok(());
+        }
+        _ => {
+            return Err(ServerError::Protocol(
+                "Expected FetchAggregate or Shutdown".to_string(),
+            ));
+        }
+    }
+
+    // Wait for shutdown
+    loop {
+        match read_message(&mut reader)? {
+            ClientMessage::Shutdown => break,
+            ClientMessage::Ack { .. } => continue,
+            _ => {
                 return Err(ServerError::Protocol(
-                    "Unexpected Init message".to_string(),
+                    "Expected Ack or Shutdown".to_string(),
                 ));
             }
         }
@@ -176,34 +187,4 @@ fn negotiate_compression(client_pref: CompressionMode) -> CompressionMode {
         }
         other => other,
     }
-}
-
-fn handle_fetch_aggregate<W: Write>(
-    conn: &mut MySqlConnection,
-    plan: &ExecutionPlan,
-    aggregate_name: &str,
-    resume_from: Option<Checkpoint>,
-    compression: CompressionMode,
-    writer: &mut W,
-) -> Result<()> {
-    // Find the aggregate in the plan
-    let aggregate = plan
-        .aggregates
-        .iter()
-        .find(|a| a.name == aggregate_name)
-        .ok_or_else(|| ServerError::NotFound(format!("Aggregate '{}'", aggregate_name)))?;
-
-    // Build dependency traverser
-    let mut traverser = DependencyTraverser::new(conn, plan)?;
-
-    // Traverse and stream data
-    traverser.traverse_and_stream(aggregate, resume_from, compression, writer)?;
-
-    // Send AggregateDone
-    let done_msg = ServerMessage::AggregateDone {
-        name: aggregate_name.to_string(),
-    };
-    write_message(writer, &done_msg)?;
-
-    Ok(())
 }
