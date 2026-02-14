@@ -147,9 +147,11 @@ version = "0.1"
 [dependencies.serde]
 version = "1"
 features = ["derive"]
+optional = true
 
 [dependencies.serde_json]
 version = "1"
+optional = true
 
 [dependencies.sha1]
 version = "0.10"
@@ -216,10 +218,12 @@ default = [
     "frunk",
     "derive",
     "binlog",
+    "serde_json_support",
 ]
 derive = ["mysql-common-derive"]
 nightly = ["test"]
 test = ["derive"]
+serde_json_support = ["serde", "serde_json"]
 
 [badges.travis-ci]
 repository = "blackbeam/rust_mysql_common"

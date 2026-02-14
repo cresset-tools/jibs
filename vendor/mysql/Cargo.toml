@@ -81,9 +81,11 @@ optional = true
 
 [dependencies.serde]
 version = "1"
+optional = true
 
 [dependencies.serde_json]
 version = "1"
+optional = true
 
 [dependencies.socket2]
 version = "0.5.2"
@@ -130,6 +132,7 @@ default = [
     "binlog",
     "derive",
     "buffer-pool",
+    "serde_json_support",
 ]
 default-rustls = [
     "rustls-tls",
@@ -141,6 +144,7 @@ default-rustls = [
     "binlog",
     "derive",
     "buffer-pool",
+    "serde_json_support",
 ]
 derive = ["mysql_common/derive"]
 frunk = ["mysql_common/frunk"]
@@ -155,6 +159,7 @@ rustls-tls = [
     "rustls-pemfile",
 ]
 time = ["mysql_common/time"]
+serde_json_support = ["serde", "serde_json", "mysql_common/serde_json_support"]
 
 [target."cfg(target_os = \"windows\")".dependencies.named_pipe]
 version = "~0.4"

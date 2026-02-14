@@ -23,6 +23,7 @@ use crate::{
 };
 
 pub mod convert;
+#[cfg(feature = "serde_json_support")]
 pub mod json;
 
 /// Side of MySql value serialization.

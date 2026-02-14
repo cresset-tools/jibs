@@ -375,7 +375,9 @@ pub use uuid;
 extern crate mysql_common_derive;
 
 pub use num_bigint;
+#[cfg(feature = "serde_json_support")]
 pub use serde;
+#[cfg(feature = "serde_json_support")]
 pub use serde_json;
 
 pub use value::convert::FromValueError;
@@ -384,6 +386,7 @@ pub use value::Value;
 pub use row::convert::FromRowError;
 pub use row::Row;
 
+#[cfg(feature = "serde_json_support")]
 pub use value::json::{Deserialized, Serialized};
 
 pub mod prelude {
@@ -703,6 +706,7 @@ mod tests {
         assert_eq!(value, Value::Bytes(b"en-US".into()));
     }
 
+    #[cfg(feature = "serde_json_support")]
     #[test]
     fn from_row_derive() {
         #[derive(FromRow)]

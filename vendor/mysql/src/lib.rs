@@ -884,9 +884,11 @@
 extern crate test;
 
 use mysql_common as myc;
+#[cfg(feature = "serde_json_support")]
 pub extern crate serde;
+#[cfg(feature = "serde_json_support")]
 pub extern crate serde_json;
-#[cfg(test)]
+#[cfg(all(test, feature = "serde_json_support"))]
 #[macro_use]
 extern crate serde_derive;
 
@@ -959,6 +961,7 @@ pub use crate::myc::row::convert::{from_row, from_row_opt, FromRowError};
 pub use crate::myc::row::Row;
 #[doc(inline)]
 pub use crate::myc::value::convert::{from_value, from_value_opt, FromValueError};
+#[cfg(feature = "serde_json_support")]
 #[doc(inline)]
 pub use crate::myc::value::json::{Deserialized, Serialized};
 #[doc(inline)]

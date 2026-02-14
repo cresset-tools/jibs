@@ -310,6 +310,7 @@ impl<'a, T: StorageFormat, U: ComplexType> ComplexValue<'a, T, U> {
     }
 }
 
+#[cfg(feature = "serde_json_support")]
 impl<'a, T: StorageFormat> TryFrom<ComplexValue<'a, T, Array>> for serde_json::Value {
     type Error = JsonbToJsonError;
 
@@ -325,6 +326,7 @@ impl<'a, T: StorageFormat> TryFrom<ComplexValue<'a, T, Array>> for serde_json::V
     }
 }
 
+#[cfg(feature = "serde_json_support")]
 impl<'a, T: StorageFormat> TryFrom<ComplexValue<'a, T, Object>> for serde_json::Value {
     type Error = JsonbToJsonError;
 
@@ -557,6 +559,7 @@ impl<'a> Value<'a> {
     }
 }
 
+#[cfg(feature = "serde_json_support")]
 impl<'a> TryFrom<Value<'a>> for serde_json::Value {
     type Error = JsonbToJsonError;
 
@@ -581,6 +584,7 @@ impl<'a> TryFrom<Value<'a>> for serde_json::Value {
     }
 }
 
+#[cfg(feature = "serde_json_support")]
 #[derive(Debug, thiserror::Error)]
 pub enum JsonbToJsonError {
     #[error("JSONB value is invalid: {}", _0)]
