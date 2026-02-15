@@ -67,8 +67,12 @@ struct ImportArgs {
     var_file: Option<PathBuf>,
 
     /// Resume a previously interrupted import
-    #[arg(long)]
+    #[arg(long, conflicts_with = "clean")]
     resume: bool,
+
+    /// Clean up backup tables from a previous interrupted import and start fresh
+    #[arg(long, conflicts_with = "resume")]
+    clean: bool,
 
     /// Number of parallel SSH sessions
     #[arg(long, default_value = "1")]
@@ -154,6 +158,7 @@ async fn run_import(args: ImportArgs) -> Result<()> {
         vars: args.vars.into_iter().collect(),
         var_file: args.var_file,
         resume: args.resume,
+        clean: args.clean,
         parallel: args.parallel,
         compression,
         identity_file: args.identity,

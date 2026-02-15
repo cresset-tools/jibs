@@ -26,6 +26,7 @@ pub struct ImportConfig {
     pub vars: HashMap<String, String>,
     pub var_file: Option<PathBuf>,
     pub resume: bool,
+    pub clean: bool,
     pub parallel: usize,
     pub compression: CompressionMode,
     pub identity_file: Option<PathBuf>,
@@ -91,6 +92,30 @@ pub async fn run_import(config: ImportConfig) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("Invalid local MySQL URL: {}", e))?;
     let mut local_conn = Conn::new(local_opts)?;
 
+    // Check for existing backup tables from a previous interrupted import
+    let existing_backups = find_backup_tables(&mut local_conn)?;
+    if !existing_backups.is_empty() {
+        if config.clean {
+            // Clean up backup tables and start fresh
+            info!("Cleaning up {} backup tables from previous import", existing_backups.len());
+            for backup_table in &existing_backups {
+                local_conn.query_drop(format!("DROP TABLE `{}`", backup_table))?;
+                info!("  Dropped {}", backup_table);
+            }
+        } else if !config.resume {
+            // Error: backup tables exist but not resuming or cleaning
+            let tables_list = existing_backups.join(", ");
+            return Err(anyhow::anyhow!(
+                "Found backup tables from a previous interrupted import: {}\n\n\
+                 Use --resume to continue the interrupted import, or\n\
+                 Use --clean to discard the backup tables and start fresh.",
+                tables_list
+            ));
+        } else {
+            info!("Resuming import with {} existing backup tables", existing_backups.len());
+        }
+    }
+
     // Disable foreign key checks for import
     local_conn.query_drop("SET FOREIGN_KEY_CHECKS = 0")?;
     local_conn.query_drop("SET UNIQUE_CHECKS = 0")?;
@@ -130,9 +155,25 @@ struct ImportStats {
     rows_imported: u64,
 }
 
+/// Prefix for backup tables
+const BACKUP_TABLE_PREFIX: &str = "_jibs_preserve_";
+
 /// Name of the backup table used to preserve rows
 fn preserve_backup_table(table: &str) -> String {
-    format!("_jibs_preserve_{}", table)
+    format!("{}{}", BACKUP_TABLE_PREFIX, table)
+}
+
+/// Find all existing backup tables from a previous import
+fn find_backup_tables(conn: &mut Conn) -> Result<Vec<String>> {
+    let tables: Vec<String> = conn.query_map(
+        format!(
+            "SELECT TABLE_NAME FROM information_schema.TABLES \
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME LIKE '{}%'",
+            BACKUP_TABLE_PREFIX
+        ),
+        |table_name: String| table_name,
+    )?;
+    Ok(tables)
 }
 
 /// Run the import protocol with the remote server
@@ -637,13 +678,32 @@ fn value_to_sql(value: &Value) -> String {
 }
 
 /// Backup rows matching preserve rules to a backup table before the main table is dropped.
-/// Returns true if any rows were backed up.
+/// Returns true if a backup exists (either created now or from a previous run).
+///
+/// On resume: uses existing backup table if present.
+/// On fresh start: creates new backup table.
 fn backup_preserved_rows(
     conn: &mut Conn,
     table: &str,
     preserve_rules: &[&PreserveRule],
 ) -> Result<bool> {
     let backup_table = preserve_backup_table(table);
+
+    // Check if backup table already exists (resume scenario)
+    let backup_exists: Option<String> = conn.query_first(format!(
+        "SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = '{}'",
+        backup_table
+    ))?;
+
+    if backup_exists.is_some() {
+        let count: Option<u64> = conn.query_first(format!("SELECT COUNT(*) FROM `{}`", backup_table))?;
+        debug!(
+            "Using existing backup {} ({} rows)",
+            backup_table,
+            count.unwrap_or(0)
+        );
+        return Ok(true);
+    }
 
     // Check if the source table exists
     let table_exists: Option<String> = conn.query_first(format!(
@@ -662,9 +722,6 @@ fn backup_preserved_rows(
         .map(|p| format!("({})", p.where_clause))
         .collect();
     let combined_where = where_clauses.join(" OR ");
-
-    // Drop any existing backup table
-    conn.query_drop(format!("DROP TABLE IF EXISTS `{}`", backup_table))?;
 
     // Create backup table with same structure and copy matching rows
     let create_backup_sql = format!(
