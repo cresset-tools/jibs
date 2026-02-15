@@ -1,0 +1,6 @@
+// Level 1a - imports level2
+import "level2.jibs"
+
+after {
+    """SELECT 'level1a-after-1'"""
+}

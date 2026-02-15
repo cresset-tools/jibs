@@ -97,6 +97,17 @@ impl Resolver {
         Ok(std::mem::take(&mut self.plan))
     }
 
+    /// Process an import statement by loading and resolving the imported file.
+    ///
+    /// Import processing order (depth-first):
+    /// 1. Recursively process nested imports in the imported file
+    /// 2. Collect variable declarations from the imported file
+    /// 3. Process all other statements (relations, aggregates, after blocks, etc.)
+    ///
+    /// This means that for `after` blocks, the order is:
+    /// - Nested imports' after blocks run first (depth-first)
+    /// - Then the imported file's own after blocks
+    /// - Finally, the importing file's after blocks
     fn process_import(&mut self, import_path: &str) -> Result<()> {
         // Resolve the import path relative to the current file's directory
         let base_dir = self.base_path.parent().unwrap_or(Path::new("."));

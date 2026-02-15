@@ -1,0 +1,4 @@
+// Level 1b - no imports
+after {
+    """SELECT 'level1b-after-1'"""
+}

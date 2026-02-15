@@ -1,0 +1,5 @@
+// Level 2 - deepest import
+after {
+    """SELECT 'level2-after-1'"""
+    """SELECT 'level2-after-2'"""
+}

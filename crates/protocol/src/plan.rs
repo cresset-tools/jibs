@@ -44,6 +44,16 @@ pub struct ExecutionPlan {
     /// Set blocks (post-processing)
     pub sets: Vec<SetRule>,
     /// After blocks (raw SQL to run post-import)
+    ///
+    /// Statements are executed in order. When imports are used, the order is
+    /// depth-first based on import position:
+    /// 1. First import's after statements (including its nested imports, depth-first)
+    /// 2. Second import's after statements (including its nested imports)
+    /// 3. ... and so on for each import in the file
+    /// 4. Current file's after statements (top to bottom)
+    ///
+    /// This means imports are "hoisted" - their after statements run before
+    /// the importing file's after statements.
     pub after_statements: Vec<String>,
 }
 

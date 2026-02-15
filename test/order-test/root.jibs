@@ -1,0 +1,16 @@
+// Root file - tests import ordering
+// Expected after order:
+// 1. level2-after-1 (from level1a's import of level2, depth-first)
+// 2. level2-after-2
+// 3. level1a-after-1 (from first import)
+// 4. level1b-after-1 (from second import)
+// 5. root-after-1 (this file)
+// 6. root-after-2
+
+import "level1a.jibs"
+import "level1b.jibs"
+
+after {
+    """SELECT 'root-after-1'"""
+    """SELECT 'root-after-2'"""
+}
