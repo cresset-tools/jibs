@@ -94,27 +94,46 @@ pub async fn run_import(config: ImportConfig) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("Invalid local MySQL URL: {}", e))?;
     let mut local_conn = Conn::new(local_opts)?;
 
-    // Check for existing backup tables from a previous interrupted import
+    // Check for existing state from a previous interrupted import
     let existing_backups = find_backup_tables(&mut local_conn)?;
-    if !existing_backups.is_empty() {
+    let has_checkpoint = checkpoint_exists(&mut local_conn)?;
+    let has_previous_state = !existing_backups.is_empty() || has_checkpoint;
+
+    if has_previous_state {
         if config.clean {
-            // Clean up backup tables and start fresh
-            info!("Cleaning up {} backup tables from previous import", existing_backups.len());
+            // Clean up and start fresh
+            info!("Cleaning up state from previous import");
             for backup_table in &existing_backups {
                 local_conn.query_drop(format!("DROP TABLE `{}`", backup_table))?;
                 info!("  Dropped {}", backup_table);
             }
+            cleanup_checkpoint(&mut local_conn)?;
+            if has_checkpoint {
+                info!("  Dropped checkpoint table");
+            }
         } else if !config.resume {
-            // Error: backup tables exist but not resuming or cleaning
-            let tables_list = existing_backups.join(", ");
+            // Error: previous state exists but not resuming or cleaning
+            let mut state_parts = Vec::new();
+            if !existing_backups.is_empty() {
+                state_parts.push(format!("backup tables: {}", existing_backups.join(", ")));
+            }
+            if has_checkpoint {
+                let completed = get_completed_tables(&mut local_conn)?;
+                state_parts.push(format!("checkpoint ({} tables completed)", completed.len()));
+            }
             return Err(anyhow::anyhow!(
-                "Found backup tables from a previous interrupted import: {}\n\n\
+                "Found state from a previous interrupted import:\n  {}\n\n\
                  Use --resume to continue the interrupted import, or\n\
-                 Use --clean to discard the backup tables and start fresh.",
-                tables_list
+                 Use --clean to discard the state and start fresh.",
+                state_parts.join("\n  ")
             ));
         } else {
-            info!("Resuming import with {} existing backup tables", existing_backups.len());
+            let completed = get_completed_tables(&mut local_conn)?;
+            info!(
+                "Resuming import: {} tables already completed, {} backup tables",
+                completed.len(),
+                existing_backups.len()
+            );
         }
     }
 
@@ -133,6 +152,7 @@ pub async fn run_import(config: ImportConfig) -> Result<()> {
         &mut local_conn,
         plan,
         config.compression,
+        config.resume,
         config.fail_after_tables,
     )
     .await;
@@ -167,6 +187,9 @@ struct ImportStats {
 /// Prefix for backup tables
 const BACKUP_TABLE_PREFIX: &str = "_jibs_preserve_";
 
+/// Name of the checkpoint table
+const CHECKPOINT_TABLE: &str = "_jibs_checkpoint";
+
 /// Name of the backup table used to preserve rows
 fn preserve_backup_table(table: &str) -> String {
     format!("{}{}", BACKUP_TABLE_PREFIX, table)
@@ -185,17 +208,76 @@ fn find_backup_tables(conn: &mut Conn) -> Result<Vec<String>> {
     Ok(tables)
 }
 
+/// Check if checkpoint table exists
+fn checkpoint_exists(conn: &mut Conn) -> Result<bool> {
+    let exists: Option<String> = conn.query_first(format!(
+        "SELECT TABLE_NAME FROM information_schema.TABLES \
+         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = '{}'",
+        CHECKPOINT_TABLE
+    ))?;
+    Ok(exists.is_some())
+}
+
+/// Create the checkpoint table
+fn create_checkpoint_table(conn: &mut Conn) -> Result<()> {
+    conn.query_drop(format!(
+        "CREATE TABLE IF NOT EXISTS `{}` (
+            table_name VARCHAR(255) PRIMARY KEY,
+            row_count BIGINT UNSIGNED NOT NULL,
+            completed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )",
+        CHECKPOINT_TABLE
+    ))?;
+    Ok(())
+}
+
+/// Get set of completed tables from checkpoint
+fn get_completed_tables(conn: &mut Conn) -> Result<std::collections::HashSet<String>> {
+    if !checkpoint_exists(conn)? {
+        return Ok(std::collections::HashSet::new());
+    }
+    let tables: Vec<String> = conn.query_map(
+        format!("SELECT table_name FROM `{}`", CHECKPOINT_TABLE),
+        |name: String| name,
+    )?;
+    Ok(tables.into_iter().collect())
+}
+
+/// Mark a table as complete in the checkpoint
+fn mark_table_complete(conn: &mut Conn, table: &str, row_count: u64) -> Result<()> {
+    conn.query_drop(format!(
+        "INSERT INTO `{}` (table_name, row_count) VALUES ('{}', {})",
+        CHECKPOINT_TABLE, table, row_count
+    ))?;
+    Ok(())
+}
+
+/// Clean up the checkpoint table
+fn cleanup_checkpoint(conn: &mut Conn) -> Result<()> {
+    conn.query_drop(format!("DROP TABLE IF EXISTS `{}`", CHECKPOINT_TABLE))?;
+    Ok(())
+}
+
 /// Run the import protocol with the remote server
 async fn run_protocol(
     server: &mut RemoteProcess,
     local_conn: &mut Conn,
     plan: ExecutionPlan,
     compression: CompressionMode,
+    is_resume: bool,
     fail_after_tables: Option<usize>,
 ) -> Result<ImportStats> {
     let mut stats = ImportStats {
         tables_imported: 0,
         rows_imported: 0,
+    };
+
+    // Set up checkpointing
+    create_checkpoint_table(local_conn)?;
+    let completed_tables = if is_resume {
+        get_completed_tables(local_conn)?
+    } else {
+        std::collections::HashSet::new()
     };
 
     // Send Init message
@@ -226,9 +308,14 @@ async fn run_protocol(
 
     // Log discovered tables
     for table in &tables {
+        let status = if completed_tables.contains(&table.name) {
+            " (already completed)"
+        } else {
+            ""
+        };
         debug!(
-            "  {} (~{} rows)",
-            table.name, table.estimated_rows
+            "  {} (~{} rows){}",
+            table.name, table.estimated_rows, status
         );
     }
 
@@ -240,6 +327,9 @@ async fn run_protocol(
     // Track tables with preserved backups
     let mut tables_with_preserves: Vec<String> = Vec::new();
 
+    // Track which table is being skipped (already completed)
+    let mut skipping_table: Option<String> = None;
+
     // Process incoming messages
     let mut current_table: Option<String> = None;
     let mut current_schema: Vec<ColumnDef> = Vec::new();
@@ -249,7 +339,15 @@ async fn run_protocol(
 
         match msg {
             ServerMessage::Schema { table, columns } => {
+                // Check if this table was already completed in a previous run
+                if completed_tables.contains(&table) {
+                    info!("Skipping table {} (already completed)", table);
+                    skipping_table = Some(table.clone());
+                    continue;
+                }
+
                 info!("Receiving table: {}", table);
+                skipping_table = None;
                 current_table = Some(table.clone());
                 current_schema = columns.clone();
 
@@ -279,6 +377,15 @@ async fn run_protocol(
                 tsv_data,
                 checkpoint,
             } => {
+                // Skip data for already-completed tables
+                if skipping_table.as_ref() == Some(&table) {
+                    debug!("Skipping data chunk for {} (already completed)", table);
+                    // Still need to send ack
+                    let ack_msg = ClientMessage::Ack { checkpoint };
+                    send_message(server, &ack_msg).await?;
+                    continue;
+                }
+
                 let decompressed = maybe_decompress(tsv_data, negotiated_compression)?;
 
                 debug!(
@@ -298,9 +405,19 @@ async fn run_protocol(
             }
 
             ServerMessage::TableDone { table, row_count } => {
+                // Skip marking complete for already-completed tables
+                if skipping_table.as_ref() == Some(&table) {
+                    debug!("Table {} was already complete", table);
+                    skipping_table = None;
+                    continue;
+                }
+
                 info!("Table {} complete: {} rows", table, row_count);
                 stats.tables_imported += 1;
                 current_table = None;
+
+                // Mark table as complete in checkpoint
+                mark_table_complete(local_conn, &table, row_count)?;
 
                 // Debug: simulate crash for testing resume
                 if let Some(fail_after) = fail_after_tables {
@@ -336,9 +453,13 @@ async fn run_protocol(
     }
 
     // Restore preserved rows from backup tables
-    if !tables_with_preserves.is_empty() {
-        info!("Restoring preserved rows for {} tables", tables_with_preserves.len());
-        for table in &tables_with_preserves {
+    // On resume, we need to restore from any existing backup tables too
+    let backup_tables = find_backup_tables(local_conn)?;
+    if !backup_tables.is_empty() {
+        info!("Restoring preserved rows for {} tables", backup_tables.len());
+        for backup_table in &backup_tables {
+            // Extract original table name from backup table name
+            let table = backup_table.strip_prefix(BACKUP_TABLE_PREFIX).unwrap_or(backup_table);
             restore_preserved_rows(local_conn, table)?;
         }
     }
@@ -356,6 +477,9 @@ async fn run_protocol(
         info!("Running after statement: {}", statement);
         local_conn.query_drop(statement)?;
     }
+
+    // Clean up checkpoint table on successful completion
+    cleanup_checkpoint(local_conn)?;
 
     // Send shutdown
     send_message(server, &ClientMessage::Shutdown).await?;
