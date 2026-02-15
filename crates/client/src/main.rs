@@ -195,8 +195,6 @@ async fn run_import(args: ImportArgs) -> Result<()> {
         aggregate_overrides: None,
         #[cfg(feature = "test-utils")]
         fail_after_tables: args.fail_after_tables,
-        #[cfg(not(feature = "test-utils"))]
-        fail_after_tables: None,
     };
 
     import::run_import(config).await
@@ -231,8 +229,6 @@ async fn run_get(args: GetArgs) -> Result<()> {
         ssh_port: args.connection.port,
         aggregate_overrides: Some(aggregate_overrides),
         #[cfg(feature = "test-utils")]
-        fail_after_tables: None,
-        #[cfg(not(feature = "test-utils"))]
         fail_after_tables: None,
     };
 

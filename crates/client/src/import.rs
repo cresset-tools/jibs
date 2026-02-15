@@ -35,6 +35,7 @@ pub struct ImportConfig {
     /// Each pair is (aggregate_name, where_clause)
     pub aggregate_overrides: Option<Vec<(String, String)>>,
     /// Debug: simulate crash after N tables (for testing resume)
+    #[cfg(feature = "test-utils")]
     pub fail_after_tables: Option<usize>,
 }
 
@@ -161,7 +162,10 @@ pub async fn run_import(config: ImportConfig) -> Result<()> {
         plan,
         config.compression,
         config.resume,
+        #[cfg(feature = "test-utils")]
         config.fail_after_tables,
+        #[cfg(not(feature = "test-utils"))]
+        None,
     )
     .await;
 

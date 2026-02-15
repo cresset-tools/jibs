@@ -7,6 +7,8 @@ use std::env;
 use std::path::Path;
 
 fn main() {
+    println!("cargo::rustc-check-cfg=cfg(has_server_x86_64)");
+    println!("cargo::rustc-check-cfg=cfg(has_server_aarch64)");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=../../target/x86_64-unknown-linux-musl/release/jibs-server");
     println!("cargo:rerun-if-changed=../../target/aarch64-unknown-linux-musl/release/jibs-server");
