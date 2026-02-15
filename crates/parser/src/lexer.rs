@@ -283,10 +283,8 @@ pub fn lexer<'src>(
         ident,
     ));
 
-    // Comments start with # and go to end of line
-    // But we need to be careful: # followed by [ is an attribute, not a comment
-    let comment = just('#')
-        .then(none_of('[').rewind())
+    // Comments start with // and go to end of line
+    let comment = just("//")
         .then(any().and_is(text::newline().not()).repeated())
         .padded();
 
@@ -399,7 +397,7 @@ mod tests {
 
     #[test]
     fn test_comment() {
-        let tokens = lex("import # this is a comment\nvar");
+        let tokens = lex("import // this is a comment\nvar");
         assert_eq!(tokens, vec![Token::Import, Token::Var]);
     }
 

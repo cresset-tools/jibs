@@ -22,8 +22,8 @@
     "comments": {
       "patterns": [
         {
-          "name": "comment.line.number-sign.jibs",
-          "match": "#(?!\\[).*$"
+          "name": "comment.line.double-slash.jibs",
+          "match": "//.*$"
         }
       ]
     },

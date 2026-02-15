@@ -1,32 +1,32 @@
-# Test import configuration for jibs
-# Imports from the "remote" test database
-#
-# Database connection is passed via --remote-mysql CLI argument
+// Test import configuration for jibs
+// Imports from the "remote" test database
+//
+// Database connection is passed via --remote-mysql CLI argument
 
-# Exclude audit_log table (data only, structure will be created)
+// Exclude audit_log table (data only, structure will be created)
 exclude audit_log
 
-# Ignore sessions table entirely (no structure, no data)
+// Ignore sessions table entirely (no structure, no data)
 ignore sessions
 
-# Define relations between tables
+// Define relations between tables
 relation orders.user_id -> users.id
 relation order_items.order_id -> orders.id
 relation order_items.product_id -> products.id
 
-# Import all orders for a specific user (with related data)
+// Import all orders for a specific user (with related data)
 aggregate user_orders {
     root orders
     where "user_id = ${user_id}"
 }
 
-# Anonymize sensitive user data
+// Anonymize sensitive user data
 anonymize users {
     email -> emails
     password_hash -> null
 }
 
-# Faker pool for email anonymization
+// Faker pool for email anonymization
 faker emails [
     "user1@test.local",
     "user2@test.local",
@@ -35,7 +35,7 @@ faker emails [
     "user5@test.local"
 ]
 
-# Post-import SQL
+// Post-import SQL
 after {
     """UPDATE users SET password_hash = '$2b$10$testpasswordhash' WHERE password_hash IS NULL"""
 }
