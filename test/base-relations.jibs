@@ -1,0 +1,6 @@
+// Base relations file - imported by other configs
+// Defines common table relationships
+
+relation orders.user_id -> users.id
+relation order_items.order_id -> orders.id
+relation order_items.product_id -> products.id

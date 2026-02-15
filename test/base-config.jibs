@@ -1,0 +1,14 @@
+// Base configuration - imports relations and anonymization
+// Other configs can import this single file
+
+import "base-relations.jibs"
+import "base-anonymize.jibs"
+
+// Common exclusions
+exclude_data audit_log
+ignore_table sessions
+
+// Common after hook
+after {
+    """UPDATE users SET password_hash = '$2b$10$testpasswordhash' WHERE password_hash IS NULL"""
+}

@@ -1,0 +1,10 @@
+// Test nested imports
+// Imports base-config.jibs which imports base-relations.jibs and base-anonymize.jibs
+
+import "base-config.jibs"
+
+// Just add an aggregate - everything else comes from imports
+aggregate user1_orders {
+    root orders
+    where "user_id = 1"
+}

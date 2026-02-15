@@ -212,7 +212,7 @@ fn run_plan(args: PlanArgs) -> Result<()> {
     }
 
     // Resolve the plan
-    let plan = resolver::resolve(&source, &program, &vars)?;
+    let plan = resolver::resolve(&args.config, &program, &vars)?;
 
     // Print the plan as JSON
     println!("{}", serde_json::to_string_pretty(&plan)?);

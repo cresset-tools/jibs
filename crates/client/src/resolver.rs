@@ -1,6 +1,7 @@
 //! DSL resolution - evaluating conditions and interpolating variables
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 use jibs_parser::ast::{
     AggregateBlock, AnonymizeBlock, Expr, FakerDecl, IncludeStmt, LimitValue, Literal,
@@ -15,17 +16,24 @@ use jibs_protocol::{
 use crate::error::{ClientError, Result};
 
 /// Resolve a parsed program into an execution plan
+///
+/// `base_path` is the path to the .jibs file being resolved, used for resolving
+/// relative import paths.
 pub fn resolve(
-    _source: &str,
+    base_path: &Path,
     program: &Program<'_>,
     cli_vars: &HashMap<String, String>,
 ) -> Result<ExecutionPlan> {
-    let mut resolver = Resolver::new(cli_vars.clone());
+    let mut resolver = Resolver::new(base_path, cli_vars.clone());
     resolver.resolve_program(program)
 }
 
 /// State for the resolver
 struct Resolver {
+    /// Base path for resolving relative imports
+    base_path: PathBuf,
+    /// Files that have been imported (to detect circular imports)
+    imported_files: HashSet<PathBuf>,
     /// Variable values (from CLI, files, or defaults)
     variables: HashMap<String, Value>,
     /// Pending variable declarations (name -> (type, default))
@@ -35,14 +43,22 @@ struct Resolver {
 }
 
 impl Resolver {
-    fn new(cli_vars: HashMap<String, String>) -> Self {
+    fn new(base_path: &Path, cli_vars: HashMap<String, String>) -> Self {
         // Convert CLI string vars to Values (we'll validate types later)
         let mut variables = HashMap::new();
         for (k, v) in cli_vars {
             variables.insert(k, Value::String(v));
         }
 
+        // Track the initial file as imported
+        let mut imported_files = HashSet::new();
+        if let Ok(canonical) = base_path.canonicalize() {
+            imported_files.insert(canonical);
+        }
+
         Self {
+            base_path: base_path.to_path_buf(),
+            imported_files,
             variables,
             pending_vars: HashMap::new(),
             plan: ExecutionPlan::new(),
@@ -50,7 +66,20 @@ impl Resolver {
     }
 
     fn resolve_program(&mut self, program: &Program<'_>) -> Result<ExecutionPlan> {
-        // First pass: collect all variable declarations
+        // First pass: process imports (they may define variables, fakers, etc.)
+        for (stmt, _span) in &program.statements {
+            if let StatementKind::Import((path, _path_span)) = &stmt.kind {
+                // Check #[when] condition if present
+                if let Some((condition, _span)) = &stmt.attribute {
+                    if !self.evaluate_condition(condition)? {
+                        continue; // Skip this import
+                    }
+                }
+                self.process_import(path)?;
+            }
+        }
+
+        // Second pass: collect all variable declarations
         for (stmt, _span) in &program.statements {
             if let StatementKind::Var(var_decl) = &stmt.kind {
                 self.collect_var_decl(var_decl)?;
@@ -60,12 +89,83 @@ impl Resolver {
         // Validate and finalize variable values
         self.finalize_variables()?;
 
-        // Second pass: process all statements (evaluating #[when] conditions)
+        // Third pass: process all statements (evaluating #[when] conditions)
         for (stmt, _span) in &program.statements {
             self.process_statement(stmt)?;
         }
 
         Ok(std::mem::take(&mut self.plan))
+    }
+
+    fn process_import(&mut self, import_path: &str) -> Result<()> {
+        // Resolve the import path relative to the current file's directory
+        let base_dir = self.base_path.parent().unwrap_or(Path::new("."));
+        let import_file = base_dir.join(import_path);
+
+        // Canonicalize to detect circular imports
+        let canonical_path = import_file.canonicalize().map_err(|e| {
+            ClientError::Io(format!(
+                "Cannot resolve import path '{}': {}",
+                import_path, e
+            ))
+        })?;
+
+        // Check for circular imports
+        if self.imported_files.contains(&canonical_path) {
+            // Already imported, skip (this is not an error, allows diamond imports)
+            return Ok(());
+        }
+        self.imported_files.insert(canonical_path.clone());
+
+        // Read and parse the imported file
+        let source = std::fs::read_to_string(&canonical_path).map_err(|e| {
+            ClientError::Io(format!("Cannot read import '{}': {}", import_path, e))
+        })?;
+
+        let program = jibs_parser::parse(&source).map_err(|errors| {
+            ClientError::Parse(format!(
+                "Parse error in '{}': {}",
+                import_path,
+                errors
+                    .iter()
+                    .map(|e| e.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+        })?;
+
+        // Save and update base path for nested imports
+        let old_base_path = std::mem::replace(&mut self.base_path, canonical_path);
+
+        // Recursively process the imported program's statements
+        // First: handle nested imports
+        for (stmt, _span) in &program.statements {
+            if let StatementKind::Import((path, _path_span)) = &stmt.kind {
+                if let Some((condition, _span)) = &stmt.attribute {
+                    if !self.evaluate_condition(condition)? {
+                        continue;
+                    }
+                }
+                self.process_import(path)?;
+            }
+        }
+
+        // Second: collect variable declarations from import
+        for (stmt, _span) in &program.statements {
+            if let StatementKind::Var(var_decl) = &stmt.kind {
+                self.collect_var_decl(var_decl)?;
+            }
+        }
+
+        // Third: process other statements from import
+        for (stmt, _span) in &program.statements {
+            self.process_statement(stmt)?;
+        }
+
+        // Restore base path
+        self.base_path = old_base_path;
+
+        Ok(())
     }
 
     fn collect_var_decl(&mut self, var_decl: &VarDecl<'_>) -> Result<()> {
@@ -153,7 +253,7 @@ impl Resolver {
 
         match &stmt.kind {
             StatementKind::Import(_) => {
-                // TODO: Handle imports
+                // Imports are processed in the first pass
                 Ok(())
             }
             StatementKind::Var(_) => {

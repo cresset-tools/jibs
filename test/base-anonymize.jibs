@@ -1,0 +1,13 @@
+// Base anonymization rules
+// Can be imported to apply consistent anonymization
+
+anonymize users {
+    email -> emails
+    password_hash -> null
+}
+
+faker emails [
+    "anon1@test.local",
+    "anon2@test.local",
+    "anon3@test.local"
+]

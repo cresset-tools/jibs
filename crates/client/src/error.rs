@@ -7,7 +7,7 @@ pub type Result<T> = std::result::Result<T, ClientError>;
 #[derive(Debug, Error)]
 pub enum ClientError {
     #[error("IO error: {0}")]
-    Io(#[from] std::io::Error),
+    Io(String),
 
     #[error("Parse error: {0}")]
     Parse(String),

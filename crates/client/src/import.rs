@@ -64,7 +64,7 @@ pub async fn run_import(config: ImportConfig) -> Result<()> {
     }
 
     // Resolve the execution plan
-    let plan = resolver::resolve(&source, &program, &vars)
+    let plan = resolver::resolve(&config.config_path, &program, &vars)
         .map_err(|e| anyhow::anyhow!("Resolution failed: {}", e))?;
 
     info!(
