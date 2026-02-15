@@ -57,10 +57,10 @@ var <name>: <type> = <default_value>
 ### Examples
 
 ```
-# Required variable (must be provided at runtime)
+// Required variable (must be provided at runtime)
 var base_url: string
 
-# Variable with default value
+// Variable with default value
 var admin_email: string = "admin@local.test"
 var debug_mode: bool = false
 var order_limit: int = 100
@@ -129,7 +129,7 @@ All types are automatically converted to strings when interpolated:
 var order_limit: int = 100
 var debug: bool = true
 
-# Results in: "Importing 100 orders"
+// Results in: "Importing 100 orders"
 set core_config_data {
     match path = "import/status/message", scope = "default", scope_id = 0
     value = "Importing {$order_limit} orders"
@@ -144,7 +144,7 @@ Interpolation supports full expressions including arithmetic and comparisons:
 var base_port: int = 8000
 var instance: int = 1
 
-# Results in: "http://localhost:8001/"
+// Results in: "http://localhost:8001/"
 set core_config_data {
     match path = "web/unsecure/base_url", scope = "default", scope_id = 0
     value = "http://localhost:{$base_port + $instance}/"
@@ -155,7 +155,7 @@ set core_config_data {
 var env: string = "staging"
 var version: int = 2
 
-# Build dynamic paths
+// Build dynamic paths
 set core_config_data {
     match path = "api/endpoint", scope = "default", scope_id = 0
     value = "https://api-{$env}.example.com/v{$version}/"
@@ -207,8 +207,8 @@ aggregate products {
 var use_ssl: bool = true
 var domain: string = "example.com"
 
-# If ternary is supported:
-# value = "{$use_ssl ? "https" : "http"}://{$domain}/"
+// If ternary is supported:
+// value = "{$use_ssl ? "https" : "http"}://{$domain}/"
 ```
 
 ### Escaping
@@ -217,7 +217,7 @@ To include a literal `{` in a string, escape it with a backslash:
 
 ```
 value = "Use \{$variable} for interpolation"
-# Results in: "Use {$variable} for interpolation"
+// Results in: "Use {$variable} for interpolation"
 ```
 
 ### Where Interpolation Works
@@ -252,13 +252,13 @@ import "<path>"
 ### Examples
 
 ```
-# Import from same directory
+// Import from same directory
 import "anonymization-rules.dsl"
 
-# Import from subdirectory
+// Import from subdirectory
 import "magento/base.dsl"
 
-# Import shared configuration (resolved via include path)
+// Import shared configuration (resolved via include path)
 import "common/gdpr-anonymization.dsl"
 ```
 
@@ -275,8 +275,8 @@ anonymize customer_entity {
     lastname  -> names
 }
 
-ignore report_event
-ignore sales_bestsellers_aggregated_daily
+ignore_table report_event
+ignore_table sales_bestsellers_aggregated_daily
 ```
 
 **shop-specific.dsl:**
@@ -291,6 +291,29 @@ aggregate orders {
     limit $order_limit
 }
 ```
+
+### Import Resolution
+
+- **Circular imports are detected**: If file A imports B which imports A, an error is raised
+- **Diamond imports are allowed**: If A imports B and C, and both B and C import D, D is only processed once
+- **Resolution is depth-first**: Each import is fully resolved (including its nested imports) before proceeding to the next import statement
+
+### Statement Ordering
+
+When multiple files are involved via imports, statements are collected in depth-first order:
+
+1. First import's statements (including its nested imports, depth-first)
+2. Second import's statements (including its nested imports, depth-first)
+3. ... and so on for each import in the file
+4. Current file's statements (top to bottom)
+
+This ordering affects:
+- **Variable declarations**: Later declarations can override earlier ones
+- **Faker definitions**: Later definitions with the same name override earlier ones
+- **Relation definitions**: All relations are collected and merged
+- **Anonymization rules**: Later rules for the same table override earlier ones
+- **Table handling** (`ignore_table`, `exclude_data`): Later rules override earlier ones
+- **After blocks**: Executed in collection order (see After Transformations section)
 
 ---
 
@@ -336,13 +359,13 @@ relation <table>.<column> -> <referenced_table>.<referenced_column>
 ### Examples
 
 ```
-# Customer group reference (not a formal FK in Magento)
+// Customer group reference (not a formal FK in Magento)
 relation customer_entity.group_id -> customer_group.customer_group_id
 
-# Order to customer reference
+// Order to customer reference
 relation sales_order.customer_id -> customer_entity.entity_id
 
-# Product to category (through junction table)
+// Product to category (through junction table)
 relation catalog_category_product.product_id -> catalog_product_entity.entity_id
 relation catalog_category_product.category_id -> catalog_category_entity.entity_id
 ```
@@ -408,46 +431,46 @@ anonymize newsletter_subscriber {
 
 Control how tables are handled during import.
 
-### Exclude
+### Exclude Data
 
 Import table structure but no data. Creates an empty table locally.
 
 ```
-exclude <table>
+exclude_data <table>
 ```
 
 **Examples:**
 ```
-exclude sales_order_payment
-exclude customer_log
-exclude persistent_session
+exclude_data sales_order_payment
+exclude_data customer_log
+exclude_data persistent_session
 ```
 
-### Ignore
+### Ignore Table
 
 Completely ignore the table. Don't create structure, don't import data, don't touch existing local table.
 
 ```
-ignore <table>
+ignore_table <table>
 ```
 
 **Examples:**
 ```
-ignore report_event
-ignore report_viewed_product_index
-ignore sales_bestsellers_aggregated_daily
-ignore sales_bestsellers_aggregated_monthly
-ignore sales_bestsellers_aggregated_yearly
+ignore_table report_event
+ignore_table report_viewed_product_index
+ignore_table sales_bestsellers_aggregated_daily
+ignore_table sales_bestsellers_aggregated_monthly
+ignore_table sales_bestsellers_aggregated_yearly
 ```
 
 ### Use Cases
 
 | Scenario | Use |
 |----------|-----|
-| Sensitive data (payments, tokens) | `exclude` - keep structure for app compatibility |
-| Report/analytics tables | `ignore` - not needed locally, may be huge |
-| Cache tables | `exclude` - keep structure, data regenerates |
-| Log tables | `exclude` or `ignore` depending on need |
+| Sensitive data (payments, tokens) | `exclude_data` - keep structure for app compatibility |
+| Report/analytics tables | `ignore_table` - not needed locally, may be huge |
+| Cache tables | `exclude_data` - keep structure, data regenerates |
+| Log tables | `exclude_data` or `ignore_table` depending on need |
 
 ---
 
@@ -543,7 +566,7 @@ include <aggregate_name> where "<sql_condition>"
 ### Examples
 
 ```
-# First, define the aggregate
+// First, define the aggregate
 aggregate products {
     root catalog_product_entity
     where "entity_id IN (
@@ -551,7 +574,7 @@ aggregate products {
     )"
 }
 
-# Later, add specific products
+// Later, add specific products
 include products where "sku = 'HERO-PRODUCT'"
 include products where "sku IN ('PROMO-2024-A', 'PROMO-2024-B')"
 include products where "entity_id = 12345"
@@ -563,7 +586,7 @@ aggregate orders {
     limit 100
 }
 
-# Add a specific order that a developer needs
+// Add a specific order that a developer needs
 include orders where "increment_id = '100000999'"
 ```
 
@@ -589,10 +612,10 @@ preserve <table> where "<sql_condition>"
 ### Examples
 
 ```
-# Keep local development settings
+// Keep local development settings
 preserve core_config_data where "path LIKE 'dev/%'"
 
-# Keep local URLs
+// Keep local URLs
 preserve core_config_data where "path IN (
     'web/secure/base_url',
     'web/unsecure/base_url',
@@ -600,10 +623,10 @@ preserve core_config_data where "path IN (
     'web/unsecure/base_link_url'
 )"
 
-# Keep local admin settings
+// Keep local admin settings
 preserve admin_user where "username = 'localadmin'"
 
-# Keep local API keys
+// Keep local API keys
 preserve core_config_data where "path LIKE 'payment/%/api_key'"
 ```
 
@@ -752,9 +775,40 @@ after {
 
 ### Behavior
 
-- Statements execute in order after all imports complete
+- Statements execute in order after all data imports complete
 - Each statement is executed as a separate query
 - Errors stop execution (transaction rollback behavior TBD)
+
+### Execution Order with Imports
+
+When using imports, `after` blocks are collected and executed in depth-first order based on import position:
+
+1. First import's `after` statements (including its nested imports, depth-first)
+2. Second import's `after` statements (including its nested imports, depth-first)
+3. ... and so on for each import in the file
+4. Current file's `after` statements (top to bottom)
+
+**Example:**
+
+Given this structure:
+```
+// root.jibs
+import "a.jibs"
+import "b.jibs"
+after { """SELECT 'root'""" }
+
+// a.jibs
+import "c.jibs"
+after { """SELECT 'a'""" }
+
+// b.jibs
+after { """SELECT 'b'""" }
+
+// c.jibs
+after { """SELECT 'c'""" }
+```
+
+The execution order is: `c`, `a`, `b`, `root`
 
 ---
 
@@ -784,7 +838,7 @@ Apply configuration conditionally based on variable values using Rust-like attri
 var skip_payments: bool = true
 
 #[when($skip_payments)]
-exclude sales_order_payment
+exclude_data sales_order_payment
 ```
 
 **Comparison:**
@@ -831,7 +885,7 @@ after {
 }
 
 #[when($env == "staging" || $env == "development")]
-exclude sales_order_payment
+exclude_data sales_order_payment
 ```
 
 **Grouped expressions:**
@@ -846,8 +900,8 @@ set core_config_data {
 ### Applicable Statements
 
 Conditionals can be applied to:
-- `exclude`
-- `ignore`
+- `exclude_data`
+- `ignore_table`
 - `aggregate`
 - `include`
 - `preserve`
@@ -859,32 +913,32 @@ Conditionals can be applied to:
 
 ## Comments
 
-Single-line comments start with `#`.
+Single-line comments start with `//`.
 
 ### Syntax
 
 ```
-# This is a comment
+// This is a comment
 ```
 
 ### Examples
 
 ```
-# === VARIABLES ===
-var base_url: string  # Required: no default
+// === VARIABLES ===
+var base_url: string  // Required: no default
 
-# Import base configuration
+// Import base configuration
 import "magento-base.dsl"
 
-# Skip payment data in non-production environments
+// Skip payment data in non-production environments
 #[when($env != "production")]
-exclude sales_order_payment
+exclude_data sales_order_payment
 
 aggregate orders {
     root sales_order
-    # Only import recent orders to keep database small
+    // Only import recent orders to keep database small
     where "created_at > DATE_SUB(NOW(), INTERVAL 90 DAY)"
-    limit 100  # Adjust as needed
+    limit 100  // Adjust as needed
 }
 ```
 
@@ -968,18 +1022,18 @@ tax_rate = 0.21
 - Strings must be quoted
 - Booleans: `true` or `false`
 - Numbers: integer or floating point
-- Comments with `#`
+- Comments with `//`
 
 **Example with comments:**
 ```
-# Local development settings
+// Local development settings
 base_domain = "local.dev"
 base_port = 8080
 admin_email = "admin@local.test"
 
-# Import settings
-skip_payments = true    # Don't import payment data
-order_limit = 100       # Only import 100 most recent orders
+// Import settings
+skip_payments = true    // Don't import payment data
+order_limit = 100       // Only import 100 most recent orders
 ```
 
 ### JSON Format (.vars.json)
@@ -1009,11 +1063,11 @@ Later sources override earlier ones.
 
 **magento-shop.dsl:**
 ```
-# Base configuration for Magento shop import
+// Base configuration for Magento shop import
 
 import "magento-anonymization.dsl"
 
-# === VARIABLES ===
+// === VARIABLES ===
 var base_domain: string
 var base_port: int = 80
 var admin_email: string = "admin@local.test"
@@ -1023,27 +1077,27 @@ var skip_logs: bool = true
 var order_limit: int = 100
 var product_category: int = 42
 
-# === SOFT RELATIONS ===
+// === SOFT RELATIONS ===
 relation customer_entity.group_id -> customer_group.customer_group_id
 relation sales_order.customer_id -> customer_entity.entity_id
 
-# === TABLE HANDLING ===
-# Always ignore reporting tables
-ignore report_event
-ignore report_viewed_product_index
-ignore sales_bestsellers_aggregated_daily
-ignore sales_bestsellers_aggregated_monthly
-ignore sales_bestsellers_aggregated_yearly
+// === TABLE HANDLING ===
+// Always ignore reporting tables
+ignore_table report_event
+ignore_table report_viewed_product_index
+ignore_table sales_bestsellers_aggregated_daily
+ignore_table sales_bestsellers_aggregated_monthly
+ignore_table sales_bestsellers_aggregated_yearly
 
-# Conditionally handle payment data
+// Conditionally handle payment data
 #[when($skip_payments)]
-exclude sales_order_payment
+exclude_data sales_order_payment
 
 #[when($skip_logs)]
-exclude customer_log
-exclude visitor_log
+exclude_data customer_log
+exclude_data visitor_log
 
-# === AGGREGATES ===
+// === AGGREGATES ===
 aggregate orders {
     root sales_order
     where "created_at > DATE_SUB(NOW(), INTERVAL 90 DAY)"
@@ -1066,14 +1120,14 @@ aggregate customers {
     limit 500
 }
 
-# === INCREMENTAL ===
+// === INCREMENTAL ===
 include products where "sku = 'HERO-PRODUCT'"
 
-# === PRESERVE LOCAL VALUES ===
+// === PRESERVE LOCAL VALUES ===
 preserve core_config_data where "path LIKE 'dev/%'"
 preserve core_config_data where "path LIKE 'web/%base_url%'"
 
-# === SET VALUES (using string interpolation) ===
+// === SET VALUES (using string interpolation) ===
 set core_config_data {
     match path = "web/secure/base_url", scope = "default", scope_id = 0
     value = "https://{$base_domain}/"
@@ -1094,7 +1148,7 @@ set core_config_data {
     value = ".{$base_domain}"
 }
 
-# === POST-IMPORT ===
+// === POST-IMPORT ===
 #[when($env == "development")]
 after {
     """
@@ -1107,7 +1161,7 @@ after {
 
 **magento-anonymization.dsl:**
 ```
-# Shared anonymization rules for Magento
+// Shared anonymization rules for Magento
 
 faker names ["John", "Jane", "Bob", "Alice", "Charlie", "Diana", "Eve", "Frank"]
 faker emails ["user1@example.test", "user2@example.test", "user3@example.test"]

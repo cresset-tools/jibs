@@ -30,8 +30,8 @@ statement = import_stmt
           | faker_decl
           | relation_decl
           | anonymize_block
-          | exclude_stmt
-          | ignore_stmt
+          | exclude_data_stmt
+          | ignore_table_stmt
           | aggregate_block
           | include_stmt
           | preserve_stmt
@@ -128,28 +128,28 @@ anonymize customer_entity {
 }
 ```
 
-### Exclude Statement
+### Exclude Data Statement
 
 ```ebnf
-exclude_stmt = "exclude" identifier ;
+exclude_data_stmt = "exclude_data" identifier ;
 ```
 
 **Examples:**
 ```
-exclude sales_order_payment
-exclude customer_log
+exclude_data sales_order_payment
+exclude_data customer_log
 ```
 
-### Ignore Statement
+### Ignore Table Statement
 
 ```ebnf
-ignore_stmt = "ignore" identifier ;
+ignore_table_stmt = "ignore_table" identifier ;
 ```
 
 **Examples:**
 ```
-ignore report_event
-ignore sales_bestsellers_aggregated_daily
+ignore_table report_event
+ignore_table sales_bestsellers_aggregated_daily
 ```
 
 ### Aggregate Block
@@ -358,7 +358,7 @@ string_literal = '"' { string_char } '"' ;
 
 variable_ref = "$" identifier ;
 
-comment = "#" { < any character except newline > } newline ;
+comment = "//" { < any character except newline > } newline ;
 
 whitespace = " " | "\t" | "\n" | "\r" ;
 ```
@@ -368,11 +368,11 @@ whitespace = " " | "\t" | "\n" | "\r" ;
 The following identifiers are reserved keywords and cannot be used as user-defined names:
 
 ```
-aggregate    after       anonymize   asc         bool
-by           desc        exclude     faker       false
-float        ignore      import      include     int
-limit        match       null        order       preserve
-relation     root        set         string      true
+aggregate    after       anonymize       asc           bool
+by           desc        exclude_data    faker         false
+float        ignore_table import         include       int
+limit        match       null            order         preserve
+relation     root        set             string        true
 var          when        where
 ```
 
@@ -391,8 +391,8 @@ statement = import_stmt
           | faker_decl
           | relation_decl
           | anonymize_block
-          | exclude_stmt
-          | ignore_stmt
+          | exclude_data_stmt
+          | ignore_table_stmt
           | aggregate_block
           | include_stmt
           | preserve_stmt
@@ -411,9 +411,9 @@ relation_decl = "relation" column_ref "->" column_ref ;
 
 anonymize_block = "anonymize" identifier "{" { anonymize_rule } "}" ;
 
-exclude_stmt = "exclude" identifier ;
+exclude_data_stmt = "exclude_data" identifier ;
 
-ignore_stmt = "ignore" identifier ;
+ignore_table_stmt = "ignore_table" identifier ;
 
 aggregate_block = "aggregate" identifier "{" aggregate_body "}" ;
 
@@ -507,7 +507,7 @@ string_literal = interpolated_string ;
 
 multiline_string = '"""' { < any character > } '"""' ;
 
-comment = "#" { < any character except newline > } ;
+comment = "//" { < any character except newline > } ;
 
 whitespace = " " | "\t" | "\n" | "\r" ;
 ```
@@ -555,6 +555,6 @@ Statements can appear in any order in the file, with these exceptions:
 ### Whitespace and Comments
 
 - Whitespace is ignored except as token separator
-- Comments start with `#` and extend to end of line
+- Comments start with `//` and extend to end of line
 - Comments can appear on their own line or after a statement
 - Comments inside strings are not treated as comments
