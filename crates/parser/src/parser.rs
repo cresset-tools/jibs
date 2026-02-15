@@ -202,24 +202,24 @@ where
         })
 }
 
-/// Parse: exclude table
+/// Parse: exclude_data table
 fn exclude_parser<'tokens, 'src: 'tokens, I>(
 ) -> impl Parser<'tokens, I, StatementKind<'src>, extra::Err<Rich<'tokens, Token<'src>, Span>>> + Clone
 where
     I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
 {
-    just(Token::Exclude)
+    just(Token::ExcludeData)
         .ignore_then(ident())
         .map(StatementKind::Exclude)
 }
 
-/// Parse: ignore table
+/// Parse: ignore_table table
 fn ignore_parser<'tokens, 'src: 'tokens, I>(
 ) -> impl Parser<'tokens, I, StatementKind<'src>, extra::Err<Rich<'tokens, Token<'src>, Span>>> + Clone
 where
     I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
 {
-    just(Token::Ignore)
+    just(Token::IgnoreTable)
         .ignore_then(ident())
         .map(StatementKind::Ignore)
 }
@@ -655,7 +655,7 @@ mod tests {
 
     #[test]
     fn test_exclude_ignore() {
-        let program = parse("exclude payments\nignore logs");
+        let program = parse("exclude_data payments\nignore_table logs");
         assert_eq!(program.statements.len(), 2);
         match &program.statements[0].0.kind {
             StatementKind::Exclude((table, _)) => assert_eq!(*table, "payments"),
@@ -753,7 +753,7 @@ mod tests {
     fn test_attribute() {
         let program = parse(r#"
             #[when($skip_payments)]
-            exclude payments
+            exclude_data payments
         "#);
         assert_eq!(program.statements.len(), 1);
         assert!(program.statements[0].0.attribute.is_some());
@@ -763,7 +763,7 @@ mod tests {
     fn test_complex_expression() {
         let program = parse(r#"
             #[when($debug && $env != "production")]
-            exclude payments
+            exclude_data payments
         "#);
         assert_eq!(program.statements.len(), 1);
         let attr = program.statements[0].0.attribute.as_ref().unwrap();

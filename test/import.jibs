@@ -4,10 +4,10 @@
 // Database connection is passed via --remote-mysql CLI argument
 
 // Exclude audit_log table (data only, structure will be created)
-exclude audit_log
+exclude_data audit_log
 
 // Ignore sessions table entirely (no structure, no data)
-ignore sessions
+ignore_table sessions
 
 // Define relations between tables
 relation orders.user_id -> users.id

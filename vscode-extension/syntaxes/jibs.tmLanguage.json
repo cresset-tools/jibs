@@ -159,11 +159,11 @@
         },
         {
           "name": "keyword.control.exclude.jibs",
-          "match": "\\bexclude\\b"
+          "match": "\\bexclude_data\\b"
         },
         {
           "name": "keyword.control.ignore.jibs",
-          "match": "\\bignore\\b"
+          "match": "\\bignore_table\\b"
         },
         {
           "name": "keyword.declaration.aggregate.jibs",
