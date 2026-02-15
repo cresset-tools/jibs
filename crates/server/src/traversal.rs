@@ -6,7 +6,7 @@ use std::io::Write;
 use mysql::{Row, Value as MySqlValue};
 
 use jibs_protocol::{
-    framing::write_message, Checkpoint, CompressionMode, ExecutionPlan, Relation,
+    framing::write_message, Checkpoint, ColumnDef, CompressionMode, ExecutionPlan, Relation,
     ResolvedAggregate, ServerMessage, SortDirection,
 };
 
@@ -18,6 +18,122 @@ use crate::tsv::TsvWriter;
 const CHUNK_ROW_LIMIT: usize = 10_000;
 /// Maximum bytes per chunk
 const CHUNK_BYTE_LIMIT: usize = 10 * 1024 * 1024; // 10MB
+
+// ============================================================================
+// Table Streamer - generates chunks for a single table
+// ============================================================================
+
+/// Generates data chunks for a single table
+struct TableStreamer {
+    table: String,
+    columns: Vec<ColumnDef>,
+    rows: std::vec::IntoIter<Row>,
+    tsv_writer: TsvWriter,
+    total_rows: u64,
+    done: bool,
+}
+
+impl TableStreamer {
+    /// Create a new table streamer
+    fn new(
+        table: String,
+        columns: Vec<ColumnDef>,
+        rows: Vec<Row>,
+        anonymization: Vec<jibs_protocol::AnonymizeRule>,
+        fakers: HashMap<String, Vec<String>>,
+    ) -> Self {
+        let column_names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
+        let tsv_writer = TsvWriter::new(column_names, anonymization, fakers);
+
+        Self {
+            table,
+            columns,
+            rows: rows.into_iter(),
+            tsv_writer,
+            total_rows: 0,
+            done: false,
+        }
+    }
+
+    /// Get the schema message for this table
+    fn schema_message(&self) -> ServerMessage {
+        ServerMessage::Schema {
+            table: self.table.clone(),
+            columns: self.columns.clone(),
+        }
+    }
+
+    /// Generate the next chunk, returns None when done
+    fn next_chunk(&mut self, compression: CompressionMode) -> Result<Option<(ServerMessage, u64)>> {
+        if self.done {
+            return Ok(None);
+        }
+
+        let mut chunk_row_count = 0u32;
+
+        loop {
+            // Check if we should flush current buffer
+            if chunk_row_count >= CHUNK_ROW_LIMIT as u32
+                || self.tsv_writer.buffer_size() >= CHUNK_BYTE_LIMIT
+            {
+                let tsv_data = self.tsv_writer.take_buffer();
+                let bytes = tsv_data.len() as u64;
+                let msg = ServerMessage::Data {
+                    table: self.table.clone(),
+                    row_count: chunk_row_count,
+                    tsv_data: maybe_compress(tsv_data, compression),
+                    checkpoint: Checkpoint::default(), // Will be updated by caller
+                };
+                return Ok(Some((msg, bytes)));
+            }
+
+            // Try to get next row
+            match self.rows.next() {
+                Some(row) => {
+                    self.tsv_writer.write_row(&row)?;
+                    chunk_row_count += 1;
+                    self.total_rows += 1;
+                }
+                None => {
+                    // No more rows
+                    self.done = true;
+
+                    // Flush any remaining data
+                    if !self.tsv_writer.is_empty() {
+                        let tsv_data = self.tsv_writer.take_buffer();
+                        let bytes = tsv_data.len() as u64;
+                        let msg = ServerMessage::Data {
+                            table: self.table.clone(),
+                            row_count: chunk_row_count,
+                            tsv_data: maybe_compress(tsv_data, compression),
+                            checkpoint: Checkpoint::default(),
+                        };
+                        return Ok(Some((msg, bytes)));
+                    }
+
+                    return Ok(None);
+                }
+            }
+        }
+    }
+
+    /// Get the TableDone message
+    fn done_message(&self) -> ServerMessage {
+        ServerMessage::TableDone {
+            table: self.table.clone(),
+            row_count: self.total_rows,
+        }
+    }
+
+    /// Check if this streamer is done
+    fn is_done(&self) -> bool {
+        self.done
+    }
+}
+
+// ============================================================================
+// Dependency Traverser
+// ============================================================================
 
 /// Dependency graph traverser
 pub struct DependencyTraverser<'a> {
@@ -54,13 +170,19 @@ impl<'a> DependencyTraverser<'a> {
         })
     }
 
-    /// Stream all tables, with aggregates providing filtered subsets
+    /// Stream all tables with interleaved chunks for parallel client loading
     ///
     /// Logic:
     /// 1. Tables touched by aggregates: only include rows reachable from aggregate
     /// 2. Tables NOT touched by aggregates: include ALL rows
     /// 3. Excluded tables: skip data (structure only)
     /// 4. Ignored tables: skip entirely
+    ///
+    /// Streaming strategy:
+    /// 1. Prepare all table data and create streamers
+    /// 2. Send all Schema messages upfront
+    /// 3. Round-robin data chunks across tables
+    /// 4. Send TableDone as each table completes
     ///
     /// If `resume_from` is provided, skip tables already completed.
     pub fn stream_all_tables<W: Write>(
@@ -73,12 +195,14 @@ impl<'a> DependencyTraverser<'a> {
         let mut checkpoint = resume_from.unwrap_or_default();
 
         // First, collect rows from all aggregates
-        let (aggregate_rows, aggregate_tables) = self.collect_aggregate_rows()?;
+        let (mut aggregate_rows, aggregate_tables) = self.collect_aggregate_rows()?;
 
         // Get all tables in the database
         let all_tables: Vec<String> = self.conn.get_all_table_names()?;
 
-        // Stream tables
+        // Build list of tables to stream with their rows
+        let mut streamers: Vec<TableStreamer> = Vec::new();
+
         for table in all_tables {
             // Skip ignored tables
             if self.plan.ignored_tables.contains(&table) {
@@ -95,21 +219,82 @@ impl<'a> DependencyTraverser<'a> {
                 continue;
             }
 
-            checkpoint.start_table(&table);
-
-            if aggregate_tables.contains(&table) {
+            // Get rows for this table
+            let rows = if aggregate_tables.contains(&table) {
                 // This table is filtered by an aggregate - use collected rows
-                if let Some(rows) = aggregate_rows.get(&table) {
-                    if !rows.is_empty() {
-                        self.stream_table_data(&table, rows.clone(), &mut checkpoint, compression, writer)?;
-                    }
-                }
+                aggregate_rows.remove(&table).unwrap_or_default()
             } else {
-                // This table is not filtered - stream ALL rows
-                self.stream_full_table(&table, &mut checkpoint, compression, writer)?;
+                // This table is not filtered - query ALL rows
+                let query = format!("SELECT * FROM `{}`", table);
+                self.conn.query_rows(&query)?
+            };
+
+            // Skip empty tables
+            if rows.is_empty() {
+                continue;
             }
 
-            checkpoint.complete_table(&table);
+            // Get schema and anonymization rules
+            let columns = self.conn.get_column_defs(&table)?;
+            let anonymization = self
+                .plan
+                .anonymization
+                .get(&table)
+                .cloned()
+                .unwrap_or_default();
+
+            // Create streamer
+            let streamer = TableStreamer::new(
+                table,
+                columns,
+                rows,
+                anonymization,
+                self.plan.fakers.clone(),
+            );
+            streamers.push(streamer);
+        }
+
+        // Phase 1: Send all Schema messages upfront
+        for streamer in &streamers {
+            write_message(writer, &streamer.schema_message())?;
+        }
+
+        // Phase 2: Interleaved data streaming (round-robin)
+        loop {
+            let mut any_progress = false;
+
+            for streamer in &mut streamers {
+                if streamer.is_done() {
+                    continue;
+                }
+
+                // Get next chunk from this table
+                if let Some((mut msg, bytes)) = streamer.next_chunk(compression)? {
+                    // Update checkpoint in the message
+                    checkpoint.bytes_transferred += bytes;
+                    checkpoint.rows_transferred += match &msg {
+                        ServerMessage::Data { row_count, .. } => *row_count as u64,
+                        _ => 0,
+                    };
+
+                    if let ServerMessage::Data { checkpoint: ref mut cp, .. } = msg {
+                        *cp = checkpoint.clone();
+                    }
+
+                    write_message(writer, &msg)?;
+                    any_progress = true;
+                }
+
+                // Check if this table just finished
+                if streamer.is_done() {
+                    write_message(writer, &streamer.done_message())?;
+                }
+            }
+
+            // If no streamer made progress, we're done
+            if !any_progress {
+                break;
+            }
         }
 
         Ok(())
@@ -230,25 +415,6 @@ impl<'a> DependencyTraverser<'a> {
         }
 
         Ok((collected_rows, aggregate_tables))
-    }
-
-    /// Stream an entire table (no filtering)
-    fn stream_full_table<W: Write>(
-        &mut self,
-        table: &str,
-        checkpoint: &mut Checkpoint,
-        compression: CompressionMode,
-        writer: &mut W,
-    ) -> Result<()> {
-        // Query all rows from the table
-        let query = format!("SELECT * FROM `{}`", table);
-        let rows = self.conn.query_rows(&query)?;
-
-        if !rows.is_empty() {
-            self.stream_table_data(table, rows, checkpoint, compression, writer)?;
-        }
-
-        Ok(())
     }
 
     /// Queue related tables based on FK values in the given rows
@@ -502,94 +668,6 @@ impl<'a> DependencyTraverser<'a> {
         // Convert values to params
         let params: Vec<MySqlValue> = values.to_vec();
         self.conn.query_rows_with_params(&query, mysql::Params::Positional(params))
-    }
-
-    /// Stream table data to the writer
-    fn stream_table_data<W: Write>(
-        &mut self,
-        table: &str,
-        rows: Vec<Row>,
-        checkpoint: &mut Checkpoint,
-        compression: CompressionMode,
-        writer: &mut W,
-    ) -> Result<()> {
-        if rows.is_empty() {
-            return Ok(());
-        }
-
-        // Get schema and send it
-        let columns = self.conn.get_column_defs(table)?;
-        let column_names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
-
-        let schema_msg = ServerMessage::Schema {
-            table: table.to_string(),
-            columns: columns.clone(),
-        };
-        write_message(writer, &schema_msg)?;
-
-        // Get anonymization rules for this table
-        let anonymization = self
-            .plan
-            .anonymization
-            .get(table)
-            .cloned()
-            .unwrap_or_default();
-
-        // Create TSV writer
-        let mut tsv_writer = TsvWriter::new(
-            column_names,
-            anonymization,
-            self.plan.fakers.clone(),
-        );
-
-        // Write rows in chunks
-        let mut chunk_row_count = 0u32;
-        let mut table_row_count = 0u64;
-
-        for row in rows {
-            tsv_writer.write_row(&row)?;
-            chunk_row_count += 1;
-            table_row_count += 1;
-            checkpoint.rows_transferred += 1;
-
-            // Check if we should flush a chunk
-            if chunk_row_count >= CHUNK_ROW_LIMIT as u32 || tsv_writer.buffer_size() >= CHUNK_BYTE_LIMIT {
-                let tsv_data = tsv_writer.take_buffer();
-                checkpoint.bytes_transferred += tsv_data.len() as u64;
-
-                let data_msg = ServerMessage::Data {
-                    table: table.to_string(),
-                    row_count: chunk_row_count,
-                    tsv_data: maybe_compress(tsv_data, compression),
-                    checkpoint: checkpoint.clone(),
-                };
-                write_message(writer, &data_msg)?;
-                chunk_row_count = 0;
-            }
-        }
-
-        // Flush remaining data
-        if !tsv_writer.is_empty() {
-            let tsv_data = tsv_writer.take_buffer();
-            checkpoint.bytes_transferred += tsv_data.len() as u64;
-
-            let data_msg = ServerMessage::Data {
-                table: table.to_string(),
-                row_count: chunk_row_count,
-                tsv_data: maybe_compress(tsv_data, compression),
-                checkpoint: checkpoint.clone(),
-            };
-            write_message(writer, &data_msg)?;
-        }
-
-        // Send TableDone
-        let done_msg = ServerMessage::TableDone {
-            table: table.to_string(),
-            row_count: table_row_count,
-        };
-        write_message(writer, &done_msg)?;
-
-        Ok(())
     }
 }
 

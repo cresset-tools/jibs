@@ -596,14 +596,15 @@ async fn run_protocol_inner(
     // Track tables with preserved backups
     let mut tables_with_preserves: Vec<String> = Vec::new();
 
-    // Track which table is being skipped (already completed)
-    let mut skipping_table: Option<String> = None;
+    // Track skipped tables (already completed in previous run)
+    let mut skipped_tables: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    // Current table schema for data loading
-    let mut current_schema: Arc<Vec<ColumnDef>> = Arc::new(Vec::new());
+    // Track schemas per table (for interleaved streaming)
+    let mut table_schemas: HashMap<String, Arc<Vec<ColumnDef>>> = HashMap::new();
 
-    // Track pending load results when using parallel loading
-    let mut pending_loads: Vec<std::sync::mpsc::Receiver<Result<u64>>> = Vec::new();
+    // Track pending load results per table (for interleaved streaming)
+    let mut pending_loads_by_table: HashMap<String, Vec<std::sync::mpsc::Receiver<Result<u64>>>> =
+        HashMap::new();
 
     loop {
         let msg: ServerMessage = recv_message(server).await?;
@@ -613,7 +614,7 @@ async fn run_protocol_inner(
                 // Check if this table was already completed in a previous run
                 if completed_tables.contains(&table) {
                     progress.skip_table(&table);
-                    skipping_table = Some(table.clone());
+                    skipped_tables.insert(table.clone());
                     continue;
                 }
 
@@ -621,8 +622,8 @@ async fn run_protocol_inner(
                 let estimated_rows = table_info.get(&table).copied().unwrap_or(0);
                 progress.start_table(&table, estimated_rows);
 
-                skipping_table = None;
-                current_schema = Arc::new(columns.clone());
+                // Store schema for this table
+                table_schemas.insert(table.clone(), Arc::new(columns.clone()));
 
                 // Backup preserved rows BEFORE dropping the table
                 let table_preserves: Vec<&PreserveRule> = plan
@@ -651,7 +652,7 @@ async fn run_protocol_inner(
                 checkpoint,
             } => {
                 // Skip data for already-completed tables
-                if skipping_table.as_ref() == Some(&table) {
+                if skipped_tables.contains(&table) {
                     debug!("Skipping data chunk for {} (already completed)", table);
                     // Still need to send ack
                     let ack_msg = ClientMessage::Ack { checkpoint };
@@ -667,18 +668,23 @@ async fn run_protocol_inner(
                     row_count, bytes_received, table
                 );
 
+                // Get schema for this table
+                let schema = table_schemas
+                    .get(&table)
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("No schema for table {}", table))?;
+
                 // Load data into MySQL - use pool if available
                 if let Some(pool) = loader_pool {
                     // Submit to loader pool for parallel processing
-                    let result_rx = pool.submit(
-                        table.clone(),
-                        Arc::clone(&current_schema),
-                        decompressed,
-                    )?;
-                    pending_loads.push(result_rx);
+                    let result_rx = pool.submit(table.clone(), schema, decompressed)?;
+                    pending_loads_by_table
+                        .entry(table.clone())
+                        .or_default()
+                        .push(result_rx);
                 } else {
                     // Load directly (sequential)
-                    let loaded = load_tsv_data(local_conn, &table, &current_schema, &decompressed)?;
+                    let loaded = load_tsv_data(local_conn, &table, &schema, &decompressed)?;
                     stats.rows_imported += loaded;
                 }
 
@@ -692,27 +698,28 @@ async fn run_protocol_inner(
 
             ServerMessage::TableDone { table, row_count } => {
                 // Skip marking complete for already-completed tables
-                if skipping_table.as_ref() == Some(&table) {
+                if skipped_tables.contains(&table) {
                     debug!("Table {} was already complete", table);
-                    skipping_table = None;
                     continue;
                 }
 
-                // Wait for all pending loads to complete before marking table done
-                if !pending_loads.is_empty() {
-                    debug!(
-                        "Waiting for {} pending loads for table {}",
-                        pending_loads.len(),
-                        table
-                    );
-                    for rx in pending_loads.drain(..) {
-                        match rx.recv() {
-                            Ok(Ok(loaded)) => stats.rows_imported += loaded,
-                            Ok(Err(e)) => {
-                                return Err(anyhow::anyhow!("Loader error: {}", e));
-                            }
-                            Err(_) => {
-                                return Err(anyhow::anyhow!("Loader worker died"));
+                // Wait for this table's pending loads to complete
+                if let Some(pending_loads) = pending_loads_by_table.remove(&table) {
+                    if !pending_loads.is_empty() {
+                        debug!(
+                            "Waiting for {} pending loads for table {}",
+                            pending_loads.len(),
+                            table
+                        );
+                        for rx in pending_loads {
+                            match rx.recv() {
+                                Ok(Ok(loaded)) => stats.rows_imported += loaded,
+                                Ok(Err(e)) => {
+                                    return Err(anyhow::anyhow!("Loader error for {}: {}", table, e));
+                                }
+                                Err(_) => {
+                                    return Err(anyhow::anyhow!("Loader worker died for {}", table));
+                                }
                             }
                         }
                     }
@@ -720,6 +727,9 @@ async fn run_protocol_inner(
 
                 progress.finish_table(&table, row_count);
                 stats.tables_imported += 1;
+
+                // Clean up schema for this table
+                table_schemas.remove(&table);
 
                 // Mark table as complete in checkpoint
                 mark_table_complete(local_conn, &table, row_count)?;
