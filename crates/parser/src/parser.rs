@@ -350,15 +350,18 @@ where
         })
 }
 
-/// Parse: after { """sql""" """sql""" }
+/// Parse: after { """sql""" "sql" ... }
+/// Accepts both multiline strings (""") and regular strings ("")
 fn after_parser<'tokens, 'src: 'tokens, I>(
 ) -> impl Parser<'tokens, I, StatementKind<'src>, extra::Err<Rich<'tokens, Token<'src>, Span>>> + Clone
 where
     I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
 {
+    let sql_string = multiline_string().or(string_literal_raw());
+
     just(Token::After)
         .ignore_then(
-            multiline_string()
+            sql_string
                 .repeated()
                 .collect()
                 .delimited_by(just(Token::LBrace), just(Token::RBrace))
@@ -744,6 +747,43 @@ mod tests {
         match &program.statements[0].0.kind {
             StatementKind::After(block) => {
                 assert_eq!(block.statements.len(), 1);
+            }
+            _ => panic!("Expected After"),
+        }
+    }
+
+    #[test]
+    fn test_after_with_regular_string() {
+        let program = parse(r#"
+            after {
+                "UPDATE orders SET status = 'active'"
+            }
+        "#);
+        assert_eq!(program.statements.len(), 1);
+        match &program.statements[0].0.kind {
+            StatementKind::After(block) => {
+                assert_eq!(block.statements.len(), 1);
+                assert_eq!(block.statements[0].0, "UPDATE orders SET status = 'active'");
+            }
+            _ => panic!("Expected After"),
+        }
+    }
+
+    #[test]
+    fn test_after_mixed_strings() {
+        let program = parse(r#"
+            after {
+                """
+                UPDATE orders
+                SET date = NOW()
+                """
+                "DELETE FROM temp_table"
+            }
+        "#);
+        assert_eq!(program.statements.len(), 1);
+        match &program.statements[0].0.kind {
+            StatementKind::After(block) => {
+                assert_eq!(block.statements.len(), 2);
             }
             _ => panic!("Expected After"),
         }

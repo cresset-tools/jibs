@@ -250,10 +250,14 @@ set core_config_data {
 ### After Block
 
 ```ebnf
-after_block = "after" "{" { multiline_string } "}" ;
+after_block = "after" "{" { sql_string } "}" ;
+
+sql_string = multiline_string | string_literal ;
 
 multiline_string = '"""' < any characters except """ > '"""' ;
 ```
+
+Both multiline strings (`"""..."""`) and regular strings (`"..."`) are accepted.
 
 **Examples:**
 ```
@@ -263,9 +267,8 @@ after {
     SET created_at = DATE_ADD(created_at, INTERVAL 10 YEAR)
     """
 
-    """
-    UPDATE customer_entity SET password_hash = NULL
-    """
+    "UPDATE customer_entity SET password_hash = NULL"
+    "TRUNCATE TABLE sessions"
 }
 ```
 
@@ -423,7 +426,9 @@ preserve_stmt = "preserve" identifier "where" string_literal ;
 
 set_block = "set" identifier "{" match_clause { assignment } "}" ;
 
-after_block = "after" "{" { multiline_string } "}" ;
+after_block = "after" "{" { sql_string } "}" ;
+
+sql_string = multiline_string | string_literal ;
 
 (* Aggregate Clauses *)
 aggregate_body = root_clause [ where_clause ] [ order_by_clause ] [ limit_clause ] ;

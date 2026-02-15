@@ -719,14 +719,12 @@ Execute arbitrary SQL after import completes.
 
 ```
 after {
-    """
-    <sql_statement>
-    """
-    """
-    <sql_statement>
-    """
+    """<multiline_sql_statement>"""
+    "<single_line_sql_statement>"
 }
 ```
+
+Both multiline strings (`"""..."""`) and regular strings (`"..."`) are supported. Use multiline strings for complex queries spanning multiple lines, and regular strings for simple one-liners.
 
 ### Examples
 
@@ -746,7 +744,16 @@ after {
 }
 ```
 
-**Enable all products locally:**
+**Simple single-line statements:**
+```
+after {
+    "TRUNCATE TABLE cache"
+    "UPDATE users SET active = 1"
+    "DELETE FROM sessions WHERE expired_at < NOW()"
+}
+```
+
+**Mixed multiline and single-line:**
 ```
 after {
     """
@@ -757,19 +764,7 @@ after {
         WHERE attribute_code = 'status' AND entity_type_id = 4
     )
     """
-}
-```
-
-**Clear sensitive data missed by anonymization:**
-```
-after {
-    """
-    UPDATE customer_entity SET password_hash = NULL, rp_token = NULL
-    """
-
-    """
-    TRUNCATE table customer_log
-    """
+    "TRUNCATE TABLE customer_log"
 }
 ```
 
