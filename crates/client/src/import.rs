@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::Result;
 use mysql::prelude::*;
@@ -17,6 +18,180 @@ use crate::progress::ImportProgress;
 use crate::resolver;
 use crate::server_binary;
 use crate::ssh::{get_server_path, RemoteProcess, SshConfig, SshSession};
+
+// ============================================================================
+// Loader Pool - manages parallel MySQL connections for data loading
+// ============================================================================
+
+/// Work item for loader workers
+struct LoadWork {
+    table: String,
+    columns: Arc<Vec<ColumnDef>>,
+    data: Vec<u8>,
+    result_tx: std::sync::mpsc::Sender<Result<u64>>,
+}
+
+/// Pool of loader workers for parallel data loading
+struct LoaderPool {
+    work_tx: std::sync::mpsc::Sender<LoadWork>,
+    worker_handles: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl LoaderPool {
+    /// Create a new loader pool with N workers
+    fn new(mysql_url: &str, num_workers: usize) -> Result<Self> {
+        // Use std sync channel for thread workers
+        let (work_tx, work_rx) = std::sync::mpsc::channel::<LoadWork>();
+        let work_rx = Arc::new(std::sync::Mutex::new(work_rx));
+
+        let mut worker_handles = Vec::with_capacity(num_workers);
+
+        for worker_id in 0..num_workers {
+            let url = mysql_url.to_string();
+            let rx = Arc::clone(&work_rx);
+
+            let handle = std::thread::spawn(move || {
+                // Connect to MySQL
+                let opts = match Opts::from_url(&url) {
+                    Ok(o) => o,
+                    Err(e) => {
+                        tracing::error!("Worker {} invalid URL: {}", worker_id, e);
+                        return;
+                    }
+                };
+
+                let mut conn = match Conn::new(opts) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::error!("Worker {} failed to connect: {}", worker_id, e);
+                        return;
+                    }
+                };
+
+                // Disable FK checks for this connection
+                if let Err(e) = conn.query_drop("SET FOREIGN_KEY_CHECKS = 0") {
+                    tracing::error!("Worker {} failed to disable FK checks: {}", worker_id, e);
+                    return;
+                }
+                if let Err(e) = conn.query_drop("SET UNIQUE_CHECKS = 0") {
+                    tracing::error!("Worker {} failed to disable unique checks: {}", worker_id, e);
+                    return;
+                }
+
+                debug!("Loader worker {} connected", worker_id);
+
+                // Process work items
+                loop {
+                    let work = {
+                        let rx_guard = rx.lock().unwrap();
+                        rx_guard.recv()
+                    };
+
+                    let work = match work {
+                        Ok(w) => w,
+                        Err(_) => break, // Channel closed
+                    };
+
+                    let LoadWork {
+                        table,
+                        columns,
+                        data,
+                        result_tx,
+                    } = work;
+
+                    // Load data
+                    let result = load_tsv_data_with_conn(&mut conn, &table, &columns, &data);
+                    let _ = result_tx.send(result);
+                }
+
+                debug!("Loader worker {} shutting down", worker_id);
+            });
+
+            worker_handles.push(handle);
+        }
+
+        Ok(Self {
+            work_tx,
+            worker_handles,
+        })
+    }
+
+    /// Submit data for loading, returns a receiver for the result
+    fn submit(
+        &self,
+        table: String,
+        columns: Arc<Vec<ColumnDef>>,
+        data: Vec<u8>,
+    ) -> Result<std::sync::mpsc::Receiver<Result<u64>>> {
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+
+        self.work_tx
+            .send(LoadWork {
+                table,
+                columns,
+                data,
+                result_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("Loader pool shut down"))?;
+
+        Ok(result_rx)
+    }
+
+    /// Wait for all workers to finish and shut down
+    fn shutdown(self) {
+        // Drop the sender to signal workers to stop
+        drop(self.work_tx);
+
+        // Wait for all workers
+        for handle in self.worker_handles {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// Load TSV data with a provided connection (for worker pool)
+fn load_tsv_data_with_conn(
+    conn: &mut Conn,
+    table: &str,
+    columns: &[ColumnDef],
+    tsv_data: &[u8],
+) -> Result<u64> {
+    use std::io::Write;
+
+    if tsv_data.is_empty() {
+        return Ok(0);
+    }
+
+    // Set up the local infile handler
+    let data = tsv_data.to_vec();
+
+    let handler = LocalInfileHandler::new(move |_file_name, local_infile| {
+        local_infile.write_all(&data)?;
+        Ok(())
+    });
+
+    conn.set_local_infile_handler(Some(handler));
+
+    // Build column list
+    let col_list: Vec<String> = columns.iter().map(|c| format!("`{}`", c.name)).collect();
+
+    // Execute LOAD DATA LOCAL INFILE
+    let load_sql = format!(
+        r"LOAD DATA LOCAL INFILE 'data.tsv' INTO TABLE `{}` FIELDS TERMINATED BY '\t' ESCAPED BY '\\' LINES TERMINATED BY '\n' ({})",
+        table,
+        col_list.join(", ")
+    );
+
+    debug!("LOAD DATA SQL (worker): {}", load_sql);
+    let result = conn.query_iter(&load_sql)?;
+    let affected = result.affected_rows();
+
+    Ok(affected)
+}
+
+// ============================================================================
+// Import Configuration and Main Entry Point
+// ============================================================================
 
 /// Configuration for an import operation
 pub struct ImportConfig {
@@ -151,6 +326,14 @@ pub async fn run_import(config: ImportConfig) -> Result<()> {
     local_conn.query_drop("SET FOREIGN_KEY_CHECKS = 0")?;
     local_conn.query_drop("SET UNIQUE_CHECKS = 0")?;
 
+    // Create loader pool for parallel loading (if parallel > 1)
+    let loader_pool = if config.parallel > 1 {
+        info!("Creating loader pool with {} workers", config.parallel);
+        Some(LoaderPool::new(&config.local_mysql, config.parallel)?)
+    } else {
+        None
+    };
+
     // Start the remote server with MySQL URL
     let server_cmd = format!("JIBS_MYSQL_URL='{}' {}", config.remote_mysql, server_path);
     info!("Starting remote server: {}", server_path);
@@ -160,6 +343,7 @@ pub async fn run_import(config: ImportConfig) -> Result<()> {
     let result = run_protocol(
         &mut server,
         &mut local_conn,
+        loader_pool,
         plan,
         config.compression,
         config.resume,
@@ -176,14 +360,23 @@ pub async fn run_import(config: ImportConfig) -> Result<()> {
 
     // Handle result
     match result {
-        Ok(stats) => {
+        Ok((stats, pool)) => {
+            // Shutdown loader pool if used
+            if let Some(pool) = pool {
+                debug!("Shutting down loader pool");
+                pool.shutdown();
+            }
             info!(
                 "Import complete: {} tables, {} rows",
                 stats.tables_imported, stats.rows_imported
             );
             Ok(())
         }
-        Err(e) => {
+        Err((e, pool)) => {
+            // Shutdown loader pool if used
+            if let Some(pool) = pool {
+                pool.shutdown();
+            }
             // Try to send shutdown
             let _ = send_message(&mut server, &ClientMessage::Shutdown).await;
             Err(e)
@@ -313,6 +506,34 @@ fn cleanup_checkpoint(conn: &mut Conn) -> Result<()> {
 async fn run_protocol(
     server: &mut RemoteProcess,
     local_conn: &mut Conn,
+    loader_pool: Option<LoaderPool>,
+    plan: ExecutionPlan,
+    compression: CompressionMode,
+    is_resume: bool,
+    fail_after_tables: Option<usize>,
+) -> std::result::Result<(ImportStats, Option<LoaderPool>), (anyhow::Error, Option<LoaderPool>)> {
+    // Wrap the inner logic to handle errors while preserving the loader pool
+    match run_protocol_inner(
+        server,
+        local_conn,
+        &loader_pool,
+        plan,
+        compression,
+        is_resume,
+        fail_after_tables,
+    )
+    .await
+    {
+        Ok(stats) => Ok((stats, loader_pool)),
+        Err(e) => Err((e, loader_pool)),
+    }
+}
+
+/// Inner protocol implementation
+async fn run_protocol_inner(
+    server: &mut RemoteProcess,
+    local_conn: &mut Conn,
+    loader_pool: &Option<LoaderPool>,
     plan: ExecutionPlan,
     compression: CompressionMode,
     is_resume: bool,
@@ -380,7 +601,10 @@ async fn run_protocol(
 
     // Process incoming messages
     let mut current_table: Option<String> = None;
-    let mut current_schema: Vec<ColumnDef> = Vec::new();
+    let mut current_schema: Arc<Vec<ColumnDef>> = Arc::new(Vec::new());
+
+    // Track pending load results when using parallel loading
+    let mut pending_loads: Vec<std::sync::mpsc::Receiver<Result<u64>>> = Vec::new();
 
     loop {
         let msg: ServerMessage = recv_message(server).await?;
@@ -400,7 +624,7 @@ async fn run_protocol(
 
                 skipping_table = None;
                 current_table = Some(table.clone());
-                current_schema = columns.clone();
+                current_schema = Arc::new(columns.clone());
 
                 // Backup preserved rows BEFORE dropping the table
                 let table_preserves: Vec<&PreserveRule> = plan
@@ -445,9 +669,20 @@ async fn run_protocol(
                     row_count, bytes_received, table
                 );
 
-                // Load data into MySQL
-                let loaded = load_tsv_data(local_conn, &table, &current_schema, &decompressed)?;
-                stats.rows_imported += loaded;
+                // Load data into MySQL - use pool if available
+                if let Some(pool) = loader_pool {
+                    // Submit to loader pool for parallel processing
+                    let result_rx = pool.submit(
+                        table.clone(),
+                        Arc::clone(&current_schema),
+                        decompressed,
+                    )?;
+                    pending_loads.push(result_rx);
+                } else {
+                    // Load directly (sequential)
+                    let loaded = load_tsv_data(local_conn, &table, &current_schema, &decompressed)?;
+                    stats.rows_imported += loaded;
+                }
 
                 // Update progress
                 progress.update_table(row_count, bytes_received);
@@ -463,6 +698,26 @@ async fn run_protocol(
                     debug!("Table {} was already complete", table);
                     skipping_table = None;
                     continue;
+                }
+
+                // Wait for all pending loads to complete before marking table done
+                if !pending_loads.is_empty() {
+                    debug!(
+                        "Waiting for {} pending loads for table {}",
+                        pending_loads.len(),
+                        table
+                    );
+                    for rx in pending_loads.drain(..) {
+                        match rx.recv() {
+                            Ok(Ok(loaded)) => stats.rows_imported += loaded,
+                            Ok(Err(e)) => {
+                                return Err(anyhow::anyhow!("Loader error: {}", e));
+                            }
+                            Err(_) => {
+                                return Err(anyhow::anyhow!("Loader worker died"));
+                            }
+                        }
+                    }
                 }
 
                 progress.finish_table(&table, row_count);
