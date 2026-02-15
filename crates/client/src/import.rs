@@ -350,29 +350,6 @@ async fn deploy_server(session: &SshSession) -> Result<String> {
         return Ok(server_path);
     }
 
-    // No embedded binary - check for existing server
-    let (code, stdout, _) = session
-        .exec("which jibs-server")
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to check for server: {}", e))?;
-
-    if code == 0 {
-        let path = stdout.trim().to_string();
-        info!("Using existing server: {}", path);
-        return Ok(path);
-    }
-
-    // Check for server in /tmp
-    let (code, _, _) = session
-        .exec("test -x /tmp/jibs-server")
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to check for server: {}", e))?;
-
-    if code == 0 {
-        info!("Using existing server: /tmp/jibs-server");
-        return Ok("/tmp/jibs-server".to_string());
-    }
-
     // No server available
     let available = server_binary::available_architectures();
     if available.is_empty() {

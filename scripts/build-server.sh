@@ -2,7 +2,9 @@
 # Build the server binary for Linux targets
 #
 # Prerequisites:
-#   cargo install cross
+#   brew install zig
+#   cargo install cargo-zigbuild
+#   rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
 #
 # Usage:
 #   ./scripts/build-server.sh          # Build for x86_64
@@ -31,7 +33,7 @@ esac
 
 for TARGET in $TARGETS; do
     echo "Building jibs-server for $TARGET..."
-    cross build -p jibs_server --release --target "$TARGET"
+    cargo zigbuild -p jibs_server --release --target "$TARGET"
 
     BINARY="target/$TARGET/release/jibs-server"
     SIZE=$(ls -lh "$BINARY" | awk '{print $5}')
