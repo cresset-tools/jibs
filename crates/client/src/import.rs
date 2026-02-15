@@ -22,6 +22,7 @@ use crate::ssh::{compute_hash, get_server_path, RemoteProcess, SshConfig, SshSes
 pub struct ImportConfig {
     pub config_path: PathBuf,
     pub remote_host: String,
+    pub remote_mysql: String,
     pub local_mysql: String,
     pub vars: HashMap<String, String>,
     pub var_file: Option<PathBuf>,
@@ -95,9 +96,10 @@ pub async fn run_import(config: ImportConfig) -> Result<()> {
     local_conn.query_drop("SET FOREIGN_KEY_CHECKS = 0")?;
     local_conn.query_drop("SET UNIQUE_CHECKS = 0")?;
 
-    // Start the remote server
+    // Start the remote server with MySQL URL
+    let server_cmd = format!("JIBS_MYSQL_URL='{}' {}", config.remote_mysql, server_path);
     info!("Starting remote server: {}", server_path);
-    let mut server = session.start_process(&server_path).await?;
+    let mut server = session.start_process(&server_cmd).await?;
 
     // Run the import protocol
     let result = run_protocol(&mut server, &mut local_conn, plan, config.compression).await;
@@ -193,8 +195,11 @@ async fn run_protocol(
                 current_table = Some(table.clone());
                 current_schema = columns.clone();
 
+                // Get anonymization rules for this table
+                let anon_rules = plan.anonymization.get(&table);
+
                 // Create table in local MySQL
-                create_table(local_conn, &table, &columns)?;
+                create_table(local_conn, &table, &columns, anon_rules)?;
             }
 
             ServerMessage::Data {
@@ -370,26 +375,35 @@ async fn deploy_server(session: &SshSession) -> Result<String> {
 }
 
 /// Create a table in local MySQL based on schema
-fn create_table(conn: &mut Conn, table: &str, columns: &[ColumnDef]) -> Result<()> {
+fn create_table(
+    conn: &mut Conn,
+    table: &str,
+    columns: &[ColumnDef],
+    anon_rules: Option<&Vec<jibs_protocol::AnonymizeRule>>,
+) -> Result<()> {
+    use jibs_protocol::AnonymizeTarget;
+
     // Drop existing table
     conn.query_drop(format!("DROP TABLE IF EXISTS `{}`", table))?;
 
     let mut column_defs = Vec::new();
 
     for col in columns {
-        let mut def = format!("`{}` {}", col.name, col.type_name);
+        // Use full_type which includes the complete type definition
+        // (e.g., "enum('a','b')", "varchar(255)", "int unsigned")
+        let mut def = format!("`{}` {}", col.name, col.full_type);
 
-        if let Some(len) = col.max_length {
-            if col.type_name == "VARCHAR" || col.type_name == "CHAR" {
-                def.push_str(&format!("({})", len));
-            }
-        }
+        // Check if this column is being anonymized to NULL
+        let is_anonymized_to_null = anon_rules
+            .map(|rules| {
+                rules
+                    .iter()
+                    .any(|r| r.column == col.name && matches!(r.target, AnonymizeTarget::Null))
+            })
+            .unwrap_or(false);
 
-        if col.flags.unsigned {
-            def.push_str(" UNSIGNED");
-        }
-
-        if !col.nullable {
+        // Make column nullable if not already or if being anonymized to NULL
+        if !col.nullable && !is_anonymized_to_null {
             def.push_str(" NOT NULL");
         }
 
@@ -456,15 +470,14 @@ fn load_tsv_data(
     let col_list: Vec<String> = columns.iter().map(|c| format!("`{}`", c.name)).collect();
 
     // Execute LOAD DATA LOCAL INFILE
+    // ESCAPED BY '\\' tells MySQL to interpret \N as NULL
     let load_sql = format!(
-        "LOAD DATA LOCAL INFILE 'data.tsv' INTO TABLE `{}` \
-         FIELDS TERMINATED BY '\\t' \
-         LINES TERMINATED BY '\\n' \
-         ({})",
+        r"LOAD DATA LOCAL INFILE 'data.tsv' INTO TABLE `{}` FIELDS TERMINATED BY '\t' ESCAPED BY '\\' LINES TERMINATED BY '\n' ({})",
         table,
         col_list.join(", ")
     );
 
+    debug!("LOAD DATA SQL: {}", load_sql);
     let result = conn.query_iter(&load_sql)?;
     let affected = result.affected_rows();
 

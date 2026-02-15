@@ -221,6 +221,8 @@ pub struct ColumnDef {
     pub name: String,
     /// MySQL type name (e.g., "VARCHAR", "INT", "DATETIME")
     pub type_name: String,
+    /// Full column type (e.g., "varchar(255)", "enum('a','b')", "int unsigned")
+    pub full_type: String,
     /// Maximum length (for string types)
     pub max_length: Option<u64>,
     /// Whether the column is nullable

@@ -50,6 +50,10 @@ struct ImportArgs {
     #[arg(long)]
     host: String,
 
+    /// Remote MySQL connection URL (on the remote server)
+    #[arg(long, default_value = "mysql://root@localhost:3306")]
+    remote_mysql: String,
+
     /// Local MySQL connection URL
     #[arg(long, default_value = "mysql://root@localhost:3306")]
     local_mysql: String,
@@ -145,6 +149,7 @@ async fn run_import(args: ImportArgs) -> Result<()> {
     let config = ImportConfig {
         config_path: args.config,
         remote_host: args.host,
+        remote_mysql: args.remote_mysql,
         local_mysql: args.local_mysql,
         vars: args.vars.into_iter().collect(),
         var_file: args.var_file,

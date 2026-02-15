@@ -77,17 +77,18 @@ impl MySqlConnection {
     /// Get estimated row count for a table
     fn get_estimated_row_count(&mut self, table: &str) -> Result<u64> {
         // Use SHOW TABLE STATUS for a quick estimate
-        let result: Option<Row> = self
-            .conn
-            .exec_first(
-                "SHOW TABLE STATUS LIKE ?",
-                (table,),
-            )?;
+        // Note: SHOW commands don't support prepared statements, so we escape manually
+        let escaped_table = escape_identifier(table);
+        let query = format!("SHOW TABLE STATUS LIKE '{}'", escaped_table);
+        let result: Option<Row> = self.conn.query_first(&query)?;
 
         if let Some(row) = result {
-            // The 'Rows' column contains the estimate
-            let rows: Option<u64> = row.get("Rows");
-            Ok(rows.unwrap_or(0))
+            // The 'Rows' column contains the estimate (may be NULL for some engines)
+            // Use get_opt to handle NULL values without panicking
+            match row.get_opt::<u64, _>("Rows") {
+                Some(Ok(n)) => Ok(n),
+                _ => Ok(0),
+            }
         } else {
             Ok(0)
         }
@@ -99,15 +100,15 @@ impl MySqlConnection {
             return Ok(pk.clone());
         }
 
-        let rows: Vec<Row> = self.conn.exec(
-            "SHOW KEYS FROM ?? WHERE Key_name = 'PRIMARY'",
-            (table,),
-        )?;
+        // Note: SHOW commands don't support prepared statements
+        let escaped_table = escape_identifier(table);
+        let query = format!("SHOW KEYS FROM `{}` WHERE Key_name = 'PRIMARY'", escaped_table);
+        let rows: Vec<Row> = self.conn.query(&query)?;
 
         let mut pk_columns: Vec<(u32, String)> = Vec::new();
         for row in rows {
-            let seq: u32 = row.get("Seq_in_index").unwrap_or(0);
-            let column: String = row.get("Column_name").unwrap_or_default();
+            let seq: u32 = row.get_opt("Seq_in_index").and_then(|r| r.ok()).unwrap_or(0);
+            let column: String = row.get_opt("Column_name").and_then(|r| r.ok()).unwrap_or_default();
             pk_columns.push((seq, column));
         }
 
@@ -147,14 +148,14 @@ impl MySqlConnection {
 
         let mut columns = Vec::new();
         for row in rows {
-            let name: String = row.get("COLUMN_NAME").unwrap_or_default();
-            let type_name: String = row.get("DATA_TYPE").unwrap_or_default();
-            let max_length: Option<u64> = row.get("CHARACTER_MAXIMUM_LENGTH");
-            let nullable: String = row.get("IS_NULLABLE").unwrap_or_default();
-            let charset: Option<String> = row.get("CHARACTER_SET_NAME");
-            let collation: Option<String> = row.get("COLLATION_NAME");
-            let column_type: String = row.get("COLUMN_TYPE").unwrap_or_default();
-            let extra: String = row.get("EXTRA").unwrap_or_default();
+            let name: String = row.get_opt("COLUMN_NAME").and_then(|r| r.ok()).unwrap_or_default();
+            let type_name: String = row.get_opt("DATA_TYPE").and_then(|r| r.ok()).unwrap_or_default();
+            let max_length: Option<u64> = row.get_opt("CHARACTER_MAXIMUM_LENGTH").and_then(|r| r.ok());
+            let nullable: String = row.get_opt("IS_NULLABLE").and_then(|r| r.ok()).unwrap_or_default();
+            let charset: Option<String> = row.get_opt("CHARACTER_SET_NAME").and_then(|r| r.ok());
+            let collation: Option<String> = row.get_opt("COLLATION_NAME").and_then(|r| r.ok());
+            let column_type: String = row.get_opt("COLUMN_TYPE").and_then(|r| r.ok()).unwrap_or_default();
+            let extra: String = row.get_opt("EXTRA").and_then(|r| r.ok()).unwrap_or_default();
 
             let is_primary_key = pk.contains(&name);
 
@@ -168,6 +169,7 @@ impl MySqlConnection {
             columns.push(ColumnDef {
                 name,
                 type_name: type_name.to_uppercase(),
+                full_type: column_type.clone(),
                 max_length,
                 nullable: nullable == "YES",
                 is_primary_key,
@@ -217,6 +219,12 @@ impl MySqlConnection {
             .map(|c| c.name_str().to_string())
             .collect()
     }
+}
+
+/// Escape a MySQL identifier (table name, column name) for use in queries
+/// This escapes backticks by doubling them
+fn escape_identifier(s: &str) -> String {
+    s.replace('`', "``")
 }
 
 /// Convert a MySQL Value to a TSV-safe string

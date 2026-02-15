@@ -1,0 +1,30 @@
+# Simple import configuration - imports all tables
+# Good for basic end-to-end testing
+#
+# Database connection is passed via --remote-mysql CLI argument
+
+# Exclude audit_log table (creates structure but no data)
+exclude audit_log
+
+# Ignore sessions table entirely (no structure, no data)
+ignore sessions
+
+# Anonymize sensitive user data
+anonymize users {
+    email -> emails
+    password_hash -> null
+}
+
+# Faker pool for email anonymization
+faker emails [
+    "user1@test.local",
+    "user2@test.local",
+    "user3@test.local",
+    "user4@test.local",
+    "user5@test.local"
+]
+
+# Post-import: set a default password for all users
+after {
+    """UPDATE users SET password_hash = '$2b$10$testpasswordhash' WHERE password_hash IS NULL"""
+}

@@ -139,8 +139,11 @@ impl SshSession {
 
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        let mut exit_code = 0;
+        let mut exit_code: Option<i32> = None;
+        let mut got_eof = false;
 
+        // SSH protocol sends: Data* -> Eof -> ExitStatus -> Close
+        // We need to wait for ExitStatus, not just Eof
         loop {
             match channel.wait().await {
                 Some(ChannelMsg::Data { data }) => {
@@ -153,15 +156,26 @@ impl SshSession {
                     }
                 }
                 Some(ChannelMsg::ExitStatus { exit_status }) => {
-                    exit_code = exit_status as i32;
+                    exit_code = Some(exit_status as i32);
+                    // If we already got Eof, we're done
+                    if got_eof {
+                        break;
+                    }
                 }
-                Some(ChannelMsg::Eof) | None => break,
+                Some(ChannelMsg::Eof) => {
+                    got_eof = true;
+                    // If we already have exit code, we're done
+                    if exit_code.is_some() {
+                        break;
+                    }
+                }
+                None => break,
                 _ => {}
             }
         }
 
         Ok((
-            exit_code,
+            exit_code.unwrap_or(0),
             String::from_utf8_lossy(&stdout).to_string(),
             String::from_utf8_lossy(&stderr).to_string(),
         ))
@@ -285,9 +299,9 @@ impl RemoteProcess {
                 }
                 Some(ChannelMsg::ExtendedData { data, ext }) => {
                     if ext == 1 {
-                        // stderr - log it
+                        // stderr - log it as warning so we can see errors
                         let msg = String::from_utf8_lossy(&data);
-                        tracing::debug!("Remote stderr: {}", msg);
+                        tracing::warn!("Remote stderr: {}", msg);
                     }
                 }
                 Some(ChannelMsg::ExitStatus { exit_status }) => {

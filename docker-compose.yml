@@ -1,0 +1,74 @@
+version: "3.8"
+
+services:
+  # Simulates the "remote" production database
+  mysql-remote:
+    image: mysql:8.0
+    container_name: jibs-remote
+    environment:
+      MYSQL_ROOT_PASSWORD: remote_root_pass
+      MYSQL_DATABASE: production
+      MYSQL_USER: jibs
+      MYSQL_PASSWORD: jibs_pass
+    ports:
+      - "3307:3306"
+    volumes:
+      - ./test/seed:/docker-entrypoint-initdb.d:ro
+      - mysql-remote-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-premote_root_pass"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Local database where we import data to
+  mysql-local:
+    image: mysql:8.0
+    container_name: jibs-local
+    environment:
+      MYSQL_ROOT_PASSWORD: local_root_pass
+      MYSQL_DATABASE: imported
+      MYSQL_USER: jibs
+      MYSQL_PASSWORD: jibs_pass
+    ports:
+      - "3308:3306"
+    volumes:
+      - mysql-local-data:/var/lib/mysql
+    command:
+      - --local-infile=1
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-plocal_root_pass"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # SSH server for E2E testing (simulates remote host)
+  ssh-server:
+    image: lscr.io/linuxserver/openssh-server:latest
+    container_name: jibs-ssh
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=UTC
+      - USER_NAME=testuser
+      - PUBLIC_KEY_FILE=/tmp/authorized_keys
+      - SUDO_ACCESS=true
+      - PASSWORD_ACCESS=false
+    ports:
+      - "2222:2222"
+    volumes:
+      - ./test/ssh-keys/authorized_keys:/tmp/authorized_keys:ro
+      - ssh-server-config:/config
+    depends_on:
+      mysql-remote:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "2222"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  mysql-remote-data:
+  mysql-local-data:
+  ssh-server-config:
