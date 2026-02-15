@@ -9,14 +9,13 @@ use mysql::{Conn, LocalInfileHandler, Opts};
 use tracing::{debug, info, warn};
 
 use jibs_protocol::{
-    framing::{read_message, write_message},
-    Checkpoint, ClientMessage, ColumnDef, CompressionMode, ExecutionPlan, ServerMessage,
+    framing::write_message, ClientMessage, ColumnDef, CompressionMode, ExecutionPlan,
+    ServerMessage, SetRule, Value,
 };
 
-use crate::error::ClientError;
 use crate::resolver;
 use crate::server_binary;
-use crate::ssh::{compute_hash, get_server_path, RemoteProcess, SshConfig, SshSession};
+use crate::ssh::{get_server_path, RemoteProcess, SshConfig, SshSession};
 
 /// Configuration for an import operation
 pub struct ImportConfig {
@@ -251,6 +250,14 @@ async fn run_protocol(
             ServerMessage::Ready { .. } => {
                 return Err(anyhow::anyhow!("Unexpected Ready message"));
             }
+        }
+    }
+
+    // Run set (upsert) blocks
+    if !plan.sets.is_empty() {
+        info!("Executing {} set blocks", plan.sets.len());
+        for set_rule in &plan.sets {
+            execute_set_block(local_conn, set_rule)?;
         }
     }
 
@@ -505,5 +512,97 @@ fn maybe_decompress(data: Vec<u8>, compression: CompressionMode) -> Result<Vec<u
 
             Ok(decompressed)
         }
+    }
+}
+
+/// Execute a set (upsert) block
+///
+/// Logic:
+/// 1. Check if a row matching the match_clause exists
+/// 2. If found: UPDATE with the assignments
+/// 3. If not found: INSERT with match_clause + assignments
+fn execute_set_block(conn: &mut Conn, set_rule: &SetRule) -> Result<()> {
+    // Build WHERE clause from match conditions
+    let where_parts: Vec<String> = set_rule
+        .match_clause
+        .iter()
+        .map(|a| format!("`{}` = {}", a.column, value_to_sql(&a.value)))
+        .collect();
+    let where_clause = where_parts.join(" AND ");
+
+    // Check if row exists
+    let select_sql = format!(
+        "SELECT 1 FROM `{}` WHERE {} LIMIT 1",
+        set_rule.table, where_clause
+    );
+    debug!("Set block check: {}", select_sql);
+
+    let exists: Option<u8> = conn.query_first(&select_sql)?;
+
+    if exists.is_some() {
+        // Row exists - UPDATE
+        if !set_rule.assignments.is_empty() {
+            let set_parts: Vec<String> = set_rule
+                .assignments
+                .iter()
+                .map(|a| format!("`{}` = {}", a.column, value_to_sql(&a.value)))
+                .collect();
+
+            let update_sql = format!(
+                "UPDATE `{}` SET {} WHERE {}",
+                set_rule.table,
+                set_parts.join(", "),
+                where_clause
+            );
+            debug!("Set block update: {}", update_sql);
+            conn.query_drop(&update_sql)?;
+            info!(
+                "Updated row in {} where {}",
+                set_rule.table, where_clause
+            );
+        }
+    } else {
+        // Row doesn't exist - INSERT
+        let mut all_assignments: Vec<_> = set_rule.match_clause.iter().collect();
+        all_assignments.extend(set_rule.assignments.iter());
+
+        let columns: Vec<String> = all_assignments
+            .iter()
+            .map(|a| format!("`{}`", a.column))
+            .collect();
+        let values: Vec<String> = all_assignments
+            .iter()
+            .map(|a| value_to_sql(&a.value))
+            .collect();
+
+        let insert_sql = format!(
+            "INSERT INTO `{}` ({}) VALUES ({})",
+            set_rule.table,
+            columns.join(", "),
+            values.join(", ")
+        );
+        debug!("Set block insert: {}", insert_sql);
+        conn.query_drop(&insert_sql)?;
+        info!(
+            "Inserted row into {} with {}",
+            set_rule.table, where_clause
+        );
+    }
+
+    Ok(())
+}
+
+/// Convert a Value to SQL literal
+fn value_to_sql(value: &Value) -> String {
+    match value {
+        Value::String(s) => {
+            // Escape single quotes
+            let escaped = s.replace('\'', "''");
+            format!("'{}'", escaped)
+        }
+        Value::Int(i) => i.to_string(),
+        Value::Float(f) => f.to_string(),
+        Value::Bool(b) => if *b { "1" } else { "0" }.to_string(),
+        Value::Null => "NULL".to_string(),
     }
 }
