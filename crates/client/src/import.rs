@@ -10,7 +10,7 @@ use tracing::{debug, info, warn};
 
 use jibs_protocol::{
     framing::write_message, ClientMessage, ColumnDef, CompressionMode, ExecutionPlan,
-    ServerMessage, SetRule, Value,
+    PreserveRule, ServerMessage, SetRule, Value,
 };
 
 use crate::resolver;
@@ -130,6 +130,13 @@ struct ImportStats {
     rows_imported: u64,
 }
 
+/// Preserved row data - table name, column names, and rows of values
+struct PreservedData {
+    table: String,
+    columns: Vec<String>,
+    rows: Vec<Vec<mysql::Value>>,
+}
+
 /// Run the import protocol with the remote server
 async fn run_protocol(
     server: &mut RemoteProcess,
@@ -181,6 +188,9 @@ async fn run_protocol(
     let start_msg = ClientMessage::Start { resume_from: None };
     send_message(server, &start_msg).await?;
 
+    // Track preserved rows to restore after import
+    let mut preserved_data: Vec<PreservedData> = Vec::new();
+
     // Process incoming messages
     let mut current_table: Option<String> = None;
     let mut current_schema: Vec<ColumnDef> = Vec::new();
@@ -194,10 +204,23 @@ async fn run_protocol(
                 current_table = Some(table.clone());
                 current_schema = columns.clone();
 
+                // Backup preserved rows BEFORE dropping the table
+                let table_preserves: Vec<&PreserveRule> = plan
+                    .preserves
+                    .iter()
+                    .filter(|p| p.table == table)
+                    .collect();
+
+                if !table_preserves.is_empty() {
+                    if let Some(data) = backup_preserved_rows(local_conn, &table, &table_preserves)? {
+                        preserved_data.push(data);
+                    }
+                }
+
                 // Get anonymization rules for this table
                 let anon_rules = plan.anonymization.get(&table);
 
-                // Create table in local MySQL
+                // Create table in local MySQL (drops existing table)
                 create_table(local_conn, &table, &columns, anon_rules)?;
             }
 
@@ -250,6 +273,14 @@ async fn run_protocol(
             ServerMessage::Ready { .. } => {
                 return Err(anyhow::anyhow!("Unexpected Ready message"));
             }
+        }
+    }
+
+    // Restore preserved rows
+    if !preserved_data.is_empty() {
+        info!("Restoring {} preserved row sets", preserved_data.len());
+        for data in &preserved_data {
+            restore_preserved_rows(local_conn, data)?;
         }
     }
 
@@ -604,5 +635,161 @@ fn value_to_sql(value: &Value) -> String {
         Value::Float(f) => f.to_string(),
         Value::Bool(b) => if *b { "1" } else { "0" }.to_string(),
         Value::Null => "NULL".to_string(),
+    }
+}
+
+/// Backup rows matching preserve rules before the table is dropped
+fn backup_preserved_rows(
+    conn: &mut Conn,
+    table: &str,
+    preserve_rules: &[&PreserveRule],
+) -> Result<Option<PreservedData>> {
+    // Check if the table exists
+    let table_exists: Option<String> = conn.query_first(format!(
+        "SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = '{}'",
+        table
+    ))?;
+
+    if table_exists.is_none() {
+        debug!("Table {} doesn't exist locally, nothing to preserve", table);
+        return Ok(None);
+    }
+
+    // Build combined WHERE clause from all preserve rules for this table
+    let where_clauses: Vec<String> = preserve_rules
+        .iter()
+        .map(|p| format!("({})", p.where_clause))
+        .collect();
+    let combined_where = where_clauses.join(" OR ");
+
+    // Get column names
+    let columns: Vec<String> = conn
+        .query_map(
+            format!("SHOW COLUMNS FROM `{}`", table),
+            |row: mysql::Row| {
+                let field: String = row.get(0).unwrap();
+                field
+            },
+        )?;
+
+    if columns.is_empty() {
+        return Ok(None);
+    }
+
+    // Select matching rows
+    let select_sql = format!(
+        "SELECT {} FROM `{}` WHERE {}",
+        columns.iter().map(|c| format!("`{}`", c)).collect::<Vec<_>>().join(", "),
+        table,
+        combined_where
+    );
+    debug!("Backup preserve query: {}", select_sql);
+
+    let rows: Vec<Vec<mysql::Value>> = conn.query_map(&select_sql, |row: mysql::Row| {
+        let mut values = Vec::new();
+        for i in 0..columns.len() {
+            values.push(row.get::<mysql::Value, _>(i).unwrap_or(mysql::Value::NULL));
+        }
+        values
+    })?;
+
+    if rows.is_empty() {
+        debug!("No rows to preserve in {}", table);
+        return Ok(None);
+    }
+
+    info!("Backed up {} preserved rows from {}", rows.len(), table);
+
+    Ok(Some(PreservedData {
+        table: table.to_string(),
+        columns,
+        rows,
+    }))
+}
+
+/// Restore previously preserved rows after import
+fn restore_preserved_rows(conn: &mut Conn, data: &PreservedData) -> Result<()> {
+    if data.rows.is_empty() {
+        return Ok(());
+    }
+
+    let col_list = data
+        .columns
+        .iter()
+        .map(|c| format!("`{}`", c))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    for row_values in &data.rows {
+        let values: Vec<String> = row_values
+            .iter()
+            .map(|v| mysql_value_to_sql(v))
+            .collect();
+
+        // Use REPLACE INTO to handle both insert and update cases
+        // (works if table has a PRIMARY KEY or UNIQUE index)
+        let sql = format!(
+            "REPLACE INTO `{}` ({}) VALUES ({})",
+            data.table,
+            col_list,
+            values.join(", ")
+        );
+        debug!("Restore preserve: {}", sql);
+        conn.query_drop(&sql)?;
+    }
+
+    info!(
+        "Restored {} preserved rows to {}",
+        data.rows.len(),
+        data.table
+    );
+
+    Ok(())
+}
+
+/// Convert a mysql::Value to SQL literal
+fn mysql_value_to_sql(value: &mysql::Value) -> String {
+    match value {
+        mysql::Value::NULL => "NULL".to_string(),
+        mysql::Value::Bytes(b) => {
+            // Try to interpret as UTF-8 string, otherwise use hex
+            if let Ok(s) = std::str::from_utf8(b) {
+                let escaped = s.replace('\'', "''").replace('\\', "\\\\");
+                format!("'{}'", escaped)
+            } else {
+                format!("X'{}'", hex::encode(b))
+            }
+        }
+        mysql::Value::Int(i) => i.to_string(),
+        mysql::Value::UInt(u) => u.to_string(),
+        mysql::Value::Float(f) => f.to_string(),
+        mysql::Value::Double(d) => d.to_string(),
+        mysql::Value::Date(year, month, day, hour, min, sec, micro) => {
+            if *hour == 0 && *min == 0 && *sec == 0 && *micro == 0 {
+                format!("'{:04}-{:02}-{:02}'", year, month, day)
+            } else if *micro == 0 {
+                format!(
+                    "'{:04}-{:02}-{:02} {:02}:{:02}:{:02}'",
+                    year, month, day, hour, min, sec
+                )
+            } else {
+                format!(
+                    "'{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:06}'",
+                    year, month, day, hour, min, sec, micro
+                )
+            }
+        }
+        mysql::Value::Time(negative, days, hours, mins, secs, micros) => {
+            let sign = if *negative { "-" } else { "" };
+            let total_hours = (*days as u32) * 24 + (*hours as u32);
+            if *micros == 0 {
+                format!("'{}{}:{:02}:{:02}'", sign, total_hours, mins, secs)
+            } else {
+                format!(
+                    "'{}{}:{:02}:{:02}.{:06}'",
+                    sign, total_hours, mins, secs, micros
+                )
+            }
+        }
     }
 }
