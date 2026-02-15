@@ -1,0 +1,27 @@
+// Test config for resume functionality
+// Tests preserve rules and --fail-after-tables
+
+// Exclude audit_log, ignore sessions
+exclude_data audit_log
+ignore_table sessions
+
+// Relations
+relation orders.user_id -> users.id
+relation order_items.order_id -> orders.id
+relation order_items.product_id -> products.id
+
+// Preserve some config that might exist locally
+// (We'll seed this before running the import)
+preserve users where "email = 'local-admin@test.local'"
+
+// Anonymize sensitive data
+anonymize users {
+    email -> emails
+    password_hash -> null
+}
+
+faker emails [
+    "anon1@test.local",
+    "anon2@test.local",
+    "anon3@test.local"
+]

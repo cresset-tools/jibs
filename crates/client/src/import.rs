@@ -31,6 +31,8 @@ pub struct ImportConfig {
     pub compression: CompressionMode,
     pub identity_file: Option<PathBuf>,
     pub ssh_port: u16,
+    /// Debug: simulate crash after N tables (for testing resume)
+    pub fail_after_tables: Option<usize>,
 }
 
 /// Run the import process
@@ -126,7 +128,14 @@ pub async fn run_import(config: ImportConfig) -> Result<()> {
     let mut server = session.start_process(&server_cmd).await?;
 
     // Run the import protocol
-    let result = run_protocol(&mut server, &mut local_conn, plan, config.compression).await;
+    let result = run_protocol(
+        &mut server,
+        &mut local_conn,
+        plan,
+        config.compression,
+        config.fail_after_tables,
+    )
+    .await;
 
     // Re-enable checks
     local_conn.query_drop("SET FOREIGN_KEY_CHECKS = 1")?;
@@ -182,6 +191,7 @@ async fn run_protocol(
     local_conn: &mut Conn,
     plan: ExecutionPlan,
     compression: CompressionMode,
+    fail_after_tables: Option<usize>,
 ) -> Result<ImportStats> {
     let mut stats = ImportStats {
         tables_imported: 0,
@@ -291,6 +301,16 @@ async fn run_protocol(
                 info!("Table {} complete: {} rows", table, row_count);
                 stats.tables_imported += 1;
                 current_table = None;
+
+                // Debug: simulate crash for testing resume
+                if let Some(fail_after) = fail_after_tables {
+                    if stats.tables_imported >= fail_after {
+                        return Err(anyhow::anyhow!(
+                            "[DEBUG] Simulated crash after {} tables (--fail-after-tables)",
+                            fail_after
+                        ));
+                    }
+                }
             }
 
             ServerMessage::Done => {

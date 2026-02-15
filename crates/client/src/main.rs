@@ -93,6 +93,10 @@ struct ImportArgs {
     /// SSH port (default: 22)
     #[arg(long, default_value = "22")]
     port: u16,
+
+    /// [DEBUG] Simulate crash after N tables imported (for testing resume)
+    #[arg(long, hide = true)]
+    fail_after_tables: Option<usize>,
 }
 
 #[derive(Args)]
@@ -163,6 +167,7 @@ async fn run_import(args: ImportArgs) -> Result<()> {
         compression,
         identity_file: args.identity,
         ssh_port: args.port,
+        fail_after_tables: args.fail_after_tables,
     };
 
     import::run_import(config).await
