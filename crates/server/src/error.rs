@@ -6,6 +6,7 @@ use thiserror::Error;
 pub type Result<T> = std::result::Result<T, ServerError>;
 
 #[derive(Debug, Error)]
+#[allow(dead_code)]
 pub enum ServerError {
     #[error("IO error: {0}")]
     Io(#[from] io::Error),

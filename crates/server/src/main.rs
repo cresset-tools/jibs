@@ -12,7 +12,7 @@ mod mysql;
 mod traversal;
 mod tsv;
 
-use std::io::{self, BufReader, BufWriter, Write};
+use std::io::{self, BufReader, BufWriter};
 
 use jibs_protocol::{
     framing::{read_message, write_message},

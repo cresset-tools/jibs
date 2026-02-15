@@ -36,6 +36,7 @@ pub fn get_server_binary(arch: &str) -> Option<&'static [u8]> {
 }
 
 /// Check if any server binary is available
+#[allow(dead_code)]
 pub fn has_embedded_server() -> bool {
     !SERVER_X86_64.is_empty() || !SERVER_AARCH64.is_empty()
 }

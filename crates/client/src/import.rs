@@ -599,8 +599,7 @@ async fn run_protocol_inner(
     // Track which table is being skipped (already completed)
     let mut skipping_table: Option<String> = None;
 
-    // Process incoming messages
-    let mut current_table: Option<String> = None;
+    // Current table schema for data loading
     let mut current_schema: Arc<Vec<ColumnDef>> = Arc::new(Vec::new());
 
     // Track pending load results when using parallel loading
@@ -623,7 +622,6 @@ async fn run_protocol_inner(
                 progress.start_table(&table, estimated_rows);
 
                 skipping_table = None;
-                current_table = Some(table.clone());
                 current_schema = Arc::new(columns.clone());
 
                 // Backup preserved rows BEFORE dropping the table
@@ -722,7 +720,6 @@ async fn run_protocol_inner(
 
                 progress.finish_table(&table, row_count);
                 stats.tables_imported += 1;
-                current_table = None;
 
                 // Mark table as complete in checkpoint
                 mark_table_complete(local_conn, &table, row_count)?;

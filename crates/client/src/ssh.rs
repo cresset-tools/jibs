@@ -182,6 +182,7 @@ impl SshSession {
     }
 
     /// Check if a file exists on the remote host
+    #[allow(dead_code)]
     pub async fn file_exists(&self, path: &str) -> Result<bool> {
         let (code, _, _) = self.exec(&format!("test -f {}", path)).await?;
         Ok(code == 0)
@@ -248,7 +249,7 @@ pub struct RemoteProcess {
 }
 
 impl RemoteProcess {
-    async fn new(mut channel: Channel<Msg>, command: &str) -> Result<Self> {
+    async fn new(channel: Channel<Msg>, command: &str) -> Result<Self> {
         channel
             .exec(true, command)
             .await
@@ -330,6 +331,7 @@ impl RemoteProcess {
     }
 
     /// Close stdin (signal EOF to the process)
+    #[allow(dead_code)]
     pub async fn close_stdin(&mut self) -> Result<()> {
         self.channel
             .eof()
@@ -339,11 +341,13 @@ impl RemoteProcess {
     }
 
     /// Check if the process has exited
+    #[allow(dead_code)]
     pub fn has_exited(&self) -> bool {
         self.exited
     }
 
     /// Get exit code (if process has exited)
+    #[allow(dead_code)]
     pub fn exit_code(&self) -> Option<i32> {
         self.exit_code
     }
