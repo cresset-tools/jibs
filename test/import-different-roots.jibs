@@ -1,0 +1,47 @@
+// Test aggregates with different root tables
+// One aggregate starts from orders, one from users
+
+// Define relations between tables
+relation orders.user_id -> users.id
+relation order_items.order_id -> orders.id
+relation order_items.product_id -> products.id
+
+// Aggregate 1: Orders for user 1 (root: orders)
+// This will traverse: orders -> users, orders <- order_items -> products
+aggregate user1_orders {
+    root orders
+    where "user_id = 1"
+}
+
+// Aggregate 2: User 3 directly (root: users)
+// This will traverse: users <- orders <- order_items -> products
+aggregate user3_data {
+    root users
+    where "id = 3"
+}
+
+// Expected result (union):
+// From user1_orders: orders 1,2 + user 1 + order_items 1,2,3 + products 1,2,5
+// From user3_data: user 3 + orders 5 + order_items 7 + product 3
+// Total:
+// - orders: 3 (1, 2, 5)
+// - order_items: 4 (1, 2, 3, 7)
+// - products: 4 (1, 2, 3, 5)
+// - users: 2 (1, 3)
+
+exclude_data audit_log
+ignore_table sessions
+
+anonymize users {
+    email -> emails
+    password_hash -> null
+}
+
+faker emails [
+    "anon1@test.local",
+    "anon2@test.local"
+]
+
+after {
+    """UPDATE users SET password_hash = '$2b$10$testpasswordhash' WHERE password_hash IS NULL"""
+}

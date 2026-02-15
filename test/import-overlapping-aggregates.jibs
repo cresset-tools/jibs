@@ -1,0 +1,52 @@
+// Test overlapping aggregate traversal
+// Two aggregates that both depend on common tables (products)
+
+// Define relations between tables
+relation orders.user_id -> users.id
+relation order_items.order_id -> orders.id
+relation order_items.product_id -> products.id
+
+// Aggregate 1: Orders for user 1
+// Orders 1, 2 -> order_items 1, 2, 3 -> products 1, 2, 5
+aggregate user1_orders {
+    root orders
+    where "user_id = 1"
+}
+
+// Aggregate 2: Orders for user 2
+// Orders 3, 4 -> order_items 4, 5, 6 -> products 1, 4, 7
+// Note: product 1 is shared with user1_orders!
+aggregate user2_orders {
+    root orders
+    where "user_id = 2"
+}
+
+// Expected result (union of both):
+// - orders: 4 (orders 1, 2, 3, 4)
+// - order_items: 6 (items 1-6, item 7 is for order 5 which is user 3)
+// - products: 5 (products 1, 2, 4, 5, 7 - union, no duplicates)
+// - users: 2 (users 1 and 2)
+
+// Exclude audit_log (no data)
+exclude_data audit_log
+
+// Ignore sessions entirely
+ignore_table sessions
+
+// Anonymize user emails
+anonymize users {
+    email -> emails
+    password_hash -> null
+}
+
+// Faker pool for emails
+faker emails [
+    "anon1@test.local",
+    "anon2@test.local",
+    "anon3@test.local"
+]
+
+// Set password after import
+after {
+    """UPDATE users SET password_hash = '$2b$10$testpasswordhash' WHERE password_hash IS NULL"""
+}

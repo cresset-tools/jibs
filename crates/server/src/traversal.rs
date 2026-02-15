@@ -116,6 +116,14 @@ impl<'a> DependencyTraverser<'a> {
     }
 
     /// Collect all rows reachable from aggregates via relations
+    ///
+    /// Traversal strategy:
+    /// - From root table: follow BOTH forward (FKs we reference) and backward (tables that reference us)
+    /// - From tables reached via BACKWARD traversal: continue bidirectional (follow ownership chain)
+    /// - From tables reached via FORWARD traversal: forward only (don't reverse direction)
+    ///
+    /// This prevents cycles where e.g. products -> order_items -> orders pulls in unrelated orders,
+    /// while still allowing proper traversal when rooted at parent tables like users.
     fn collect_aggregate_rows(&mut self) -> Result<(HashMap<String, Vec<Row>>, HashSet<String>)> {
         // Track visited rows per table to avoid duplicates
         let mut visited: HashMap<String, HashSet<Vec<u8>>> = HashMap::new();
@@ -130,8 +138,9 @@ impl<'a> DependencyTraverser<'a> {
         for aggregate in &self.plan.aggregates.clone() {
             aggregate_tables.insert(aggregate.root_table.clone());
 
-            // BFS queue: (table_name, fk_column, fk_values to fetch by)
-            let mut queue: VecDeque<(String, String, Vec<MySqlValue>)> = VecDeque::new();
+            // BFS queue: (table_name, fk_column, fk_values, reached_via_backward)
+            // reached_via_backward=true means we can continue bidirectional traversal
+            let mut queue: VecDeque<(String, String, Vec<MySqlValue>, bool)> = VecDeque::new();
 
             // Start with root table query
             let root_rows = self.query_root_table(aggregate)?;
@@ -147,8 +156,13 @@ impl<'a> DependencyTraverser<'a> {
                         .insert(pk_bytes);
                 }
 
-                // Queue related tables based on FK values in root rows
-                self.queue_related_tables(&aggregate.root_table, &root_rows, &mut queue)?;
+                // Queue related tables - from root, do BIDIRECTIONAL traversal
+                self.queue_related_tables_directional(
+                    &aggregate.root_table,
+                    &root_rows,
+                    &mut queue,
+                    true, // bidirectional for root
+                )?;
 
                 // Store root rows
                 collected_rows
@@ -158,7 +172,7 @@ impl<'a> DependencyTraverser<'a> {
             }
 
             // BFS traversal for this aggregate
-            while let Some((table, column, fk_values)) = queue.pop_front() {
+            while let Some((table, column, fk_values, reached_via_backward)) = queue.pop_front() {
                 // Mark this table as aggregate-touched
                 aggregate_tables.insert(table.clone());
 
@@ -197,8 +211,15 @@ impl<'a> DependencyTraverser<'a> {
                     continue;
                 }
 
-                // Queue related tables from these new rows
-                self.queue_related_tables(&table, &new_rows, &mut queue)?;
+                // Queue related tables based on how we reached this table:
+                // - If reached via backward traversal: continue bidirectional (following ownership)
+                // - If reached via forward traversal: forward only (don't reverse direction)
+                self.queue_related_tables_directional(
+                    &table,
+                    &new_rows,
+                    &mut queue,
+                    reached_via_backward,
+                )?;
 
                 // Collect rows
                 collected_rows
@@ -231,12 +252,30 @@ impl<'a> DependencyTraverser<'a> {
     }
 
     /// Queue related tables based on FK values in the given rows
-    fn queue_related_tables(
+    ///
+    /// If `bidirectional` is true:
+    /// 1. Forward: Follow FKs from current table to referenced tables
+    ///    e.g., orders.user_id -> users.id: from orders, find users
+    /// 2. Backward: Find tables that reference current table
+    ///    e.g., order_items.order_id -> orders.id: from orders, find order_items
+    ///
+    /// If `bidirectional` is false, only forward traversal is done.
+    /// This prevents cycles where following backward from a "leaf" table
+    /// pulls in unrelated rows through a common parent.
+    ///
+    /// The `reached_via_backward` flag in queued items indicates whether the
+    /// target table should continue with bidirectional traversal (true) or
+    /// forward-only (false).
+    fn queue_related_tables_directional(
         &mut self,
         source_table: &str,
         rows: &[Row],
-        queue: &mut VecDeque<(String, String, Vec<MySqlValue>)>,
+        queue: &mut VecDeque<(String, String, Vec<MySqlValue>, bool)>,
+        bidirectional: bool,
     ) -> Result<()> {
+        // Forward traversal: follow FKs FROM this table TO other tables
+        // e.g., orders.user_id -> users.id: extract user_id values, find users by id
+        // Tables reached via forward should NOT continue bidirectional (forward-only)
         if let Some(relations) = self.relations_by_source.get(source_table).cloned() {
             for relation in relations {
                 // Extract FK column values from source rows
@@ -256,10 +295,43 @@ impl<'a> DependencyTraverser<'a> {
                         relation.to_table.clone(),
                         relation.to_column.clone(),
                         unique_fks,
+                        false, // reached via forward -> forward-only from here
                     ));
                 }
             }
         }
+
+        // Backward traversal: find tables that reference THIS table
+        // Only done when bidirectional=true (root or tables reached via backward)
+        // Tables reached via backward should continue bidirectional (follow ownership chain)
+        if bidirectional {
+            if let Some(relations) = self.relations_by_target.get(source_table).cloned() {
+                for relation in relations {
+                    // Extract PK/referenced column values from source rows
+                    let pk_values: Vec<MySqlValue> = rows
+                        .iter()
+                        .filter_map(|row| {
+                            row.get_opt::<MySqlValue, _>(relation.to_column.as_str())
+                                .and_then(|r| r.ok())
+                                .filter(|v| !matches!(v, MySqlValue::NULL))
+                        })
+                        .collect();
+
+                    if !pk_values.is_empty() {
+                        // Deduplicate values
+                        let unique_pks = self.dedupe_values(pk_values);
+                        // Look up the referencing table by its FK column
+                        queue.push_back((
+                            relation.from_table.clone(),
+                            relation.from_column.clone(),
+                            unique_pks,
+                            true, // reached via backward -> continue bidirectional
+                        ));
+                    }
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -331,11 +403,36 @@ impl<'a> DependencyTraverser<'a> {
         Ok(pks)
     }
 
+    /// Normalize a MySQL value to a canonical form for comparison
+    /// This handles the case where MySQL returns the same value as different types
+    /// (e.g., INT(1) vs Bytes("1") depending on the query)
+    fn normalize_value(&self, value: &MySqlValue) -> MySqlValue {
+        match value {
+            // Try to parse bytes as an integer if possible
+            MySqlValue::Bytes(b) => {
+                if let Ok(s) = std::str::from_utf8(b) {
+                    if let Ok(i) = s.parse::<i64>() {
+                        return MySqlValue::Int(i);
+                    }
+                    if let Ok(u) = s.parse::<u64>() {
+                        return MySqlValue::UInt(u);
+                    }
+                }
+                value.clone()
+            }
+            // UInt can be normalized to Int if it fits
+            MySqlValue::UInt(u) if *u <= i64::MAX as u64 => MySqlValue::Int(*u as i64),
+            _ => value.clone(),
+        }
+    }
+
     /// Serialize a primary key to bytes for deduplication
     fn serialize_pk(&self, pk: &[MySqlValue]) -> Vec<u8> {
         let mut bytes = Vec::new();
         for value in pk {
-            match value {
+            // Normalize value before serialization to handle type mismatches
+            let normalized = self.normalize_value(value);
+            match normalized {
                 MySqlValue::NULL => bytes.push(0),
                 MySqlValue::Int(i) => {
                     bytes.push(1);
@@ -345,7 +442,7 @@ impl<'a> DependencyTraverser<'a> {
                     bytes.push(2);
                     bytes.extend_from_slice(&u.to_le_bytes());
                 }
-                MySqlValue::Bytes(b) => {
+                MySqlValue::Bytes(ref b) => {
                     bytes.push(3);
                     bytes.extend_from_slice(&(b.len() as u32).to_le_bytes());
                     bytes.extend_from_slice(b);
@@ -361,20 +458,20 @@ impl<'a> DependencyTraverser<'a> {
                 MySqlValue::Date(y, m, d, h, mi, s, us) => {
                     bytes.push(6);
                     bytes.extend_from_slice(&y.to_le_bytes());
-                    bytes.push(*m);
-                    bytes.push(*d);
-                    bytes.push(*h);
-                    bytes.push(*mi);
-                    bytes.push(*s);
+                    bytes.push(m);
+                    bytes.push(d);
+                    bytes.push(h);
+                    bytes.push(mi);
+                    bytes.push(s);
                     bytes.extend_from_slice(&us.to_le_bytes());
                 }
                 MySqlValue::Time(neg, d, h, m, s, us) => {
                     bytes.push(7);
-                    bytes.push(if *neg { 1 } else { 0 });
+                    bytes.push(if neg { 1 } else { 0 });
                     bytes.extend_from_slice(&d.to_le_bytes());
-                    bytes.push(*h);
-                    bytes.push(*m);
-                    bytes.push(*s);
+                    bytes.push(h);
+                    bytes.push(m);
+                    bytes.push(s);
                     bytes.extend_from_slice(&us.to_le_bytes());
                 }
             }

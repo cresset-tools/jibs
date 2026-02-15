@@ -1,0 +1,36 @@
+// Test aggregate traversal
+// This should only import orders for user_id=1 and their related data
+
+// Define relations between tables
+relation orders.user_id -> users.id
+relation order_items.order_id -> orders.id
+relation order_items.product_id -> products.id
+
+// Import only orders for user 1, plus all related data
+aggregate user1_orders {
+    root orders
+    where "user_id = 1"
+}
+
+// Exclude audit_log (no data)
+exclude_data audit_log
+
+// Ignore sessions entirely
+ignore_table sessions
+
+// Anonymize user emails
+anonymize users {
+    email -> emails
+    password_hash -> null
+}
+
+// Faker pool for emails
+faker emails [
+    "anon1@test.local",
+    "anon2@test.local"
+]
+
+// Set password after import
+after {
+    """UPDATE users SET password_hash = '$2b$10$testpasswordhash' WHERE password_hash IS NULL"""
+}

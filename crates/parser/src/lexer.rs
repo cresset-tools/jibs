@@ -227,8 +227,13 @@ pub fn lexer<'src>(
     let hash = just('#').to(Token::Hash);
     let dollar = just('$').to(Token::Dollar);
 
-    // Identifiers and keywords
-    let ident = text::ascii::ident().map(|ident: &str| match ident {
+    // Identifiers and keywords (allow digits after first char)
+    let ident_start = any().filter(|c: &char| c.is_ascii_alphabetic() || *c == '_');
+    let ident_cont = any().filter(|c: &char| c.is_ascii_alphanumeric() || *c == '_');
+    let ident = ident_start
+        .then(ident_cont.repeated())
+        .to_slice()
+        .map(|ident: &str| match ident {
         "import" => Token::Import,
         "var" => Token::Var,
         "faker" => Token::Faker,
