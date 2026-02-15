@@ -94,8 +94,10 @@ struct ImportArgs {
     #[arg(long, default_value = "22")]
     port: u16,
 
-    /// [DEBUG] Simulate crash after N tables imported (for testing resume)
-    #[arg(long, hide = true)]
+    /// [TEST] Simulate crash after N tables imported (for testing resume)
+    /// Only available with --features test-utils
+    #[cfg(feature = "test-utils")]
+    #[arg(long)]
     fail_after_tables: Option<usize>,
 }
 
@@ -167,7 +169,10 @@ async fn run_import(args: ImportArgs) -> Result<()> {
         compression,
         identity_file: args.identity,
         ssh_port: args.port,
+        #[cfg(feature = "test-utils")]
         fail_after_tables: args.fail_after_tables,
+        #[cfg(not(feature = "test-utils"))]
+        fail_after_tables: None,
     };
 
     import::run_import(config).await

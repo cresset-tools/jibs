@@ -9,6 +9,10 @@ description = "CLI client for Jibs database imports"
 name = "jibs"
 path = "src/main.rs"
 
+[features]
+default = []
+test-utils = []  # Enables --fail-after-tables for testing resume
+
 [dependencies]
 jibs_parser = { path = "../parser" }
 jibs_protocol = { path = "../protocol", features = ["serde"] }

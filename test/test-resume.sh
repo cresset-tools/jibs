@@ -8,9 +8,10 @@ cd "$(dirname "$0")/.."
 echo "=== Resume Test ==="
 echo ""
 
-# Build
-echo "Building..."
+# Build with test-utils feature for --fail-after-tables
+echo "Building with test-utils feature..."
 ./scripts/build.sh 2>&1 | tail -3
+cargo build -p jibs_client --features test-utils 2>&1 | tail -1
 
 # Ensure local database is clean and has a preserved row
 echo ""
