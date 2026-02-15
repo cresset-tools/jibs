@@ -35,3 +35,4 @@ async-trait.workspace = true
 futures.workspace = true
 hex.workspace = true
 home.workspace = true
+indicatif.workspace = true

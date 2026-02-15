@@ -13,6 +13,7 @@ use jibs_protocol::{
     PreserveRule, ServerMessage, SetRule, Value,
 };
 
+use crate::progress::ImportProgress;
 use crate::resolver;
 use crate::server_binary;
 use crate::ssh::{get_server_path, RemoteProcess, SshConfig, SshSession};
@@ -331,7 +332,7 @@ async fn run_protocol(
     };
 
     // Send Init message
-    info!("Sending execution plan to server");
+    debug!("Sending execution plan to server");
     let init_msg = ClientMessage::Init {
         plan: plan.clone(),
         compression,
@@ -345,7 +346,7 @@ async fn run_protocol(
             tables,
             compression,
         } => {
-            info!("Server ready: {} tables discovered", tables.len());
+            debug!("Server ready: {} tables discovered", tables.len());
             (tables, compression)
         }
         ServerMessage::Error { message, .. } => {
@@ -356,21 +357,18 @@ async fn run_protocol(
         }
     };
 
-    // Log discovered tables
-    for table in &tables {
-        let status = if completed_tables.contains(&table.name) {
-            " (already completed)"
-        } else {
-            ""
-        };
-        debug!(
-            "  {} (~{} rows){}",
-            table.name, table.estimated_rows, status
-        );
-    }
+    // Create table info map for estimated rows lookup
+    let table_info: std::collections::HashMap<String, u64> = tables
+        .iter()
+        .map(|t| (t.name.clone(), t.estimated_rows))
+        .collect();
+
+    // Initialize progress tracking
+    let skipped_count = completed_tables.len();
+    let mut progress = ImportProgress::new(&tables, skipped_count);
 
     // Send Start message
-    info!("Starting data transfer");
+    debug!("Starting data transfer");
     let start_msg = ClientMessage::Start { resume_from: None };
     send_message(server, &start_msg).await?;
 
@@ -391,12 +389,15 @@ async fn run_protocol(
             ServerMessage::Schema { table, columns } => {
                 // Check if this table was already completed in a previous run
                 if completed_tables.contains(&table) {
-                    info!("Skipping table {} (already completed)", table);
+                    progress.skip_table(&table);
                     skipping_table = Some(table.clone());
                     continue;
                 }
 
-                info!("Receiving table: {}", table);
+                // Get estimated rows for progress tracking
+                let estimated_rows = table_info.get(&table).copied().unwrap_or(0);
+                progress.start_table(&table, estimated_rows);
+
                 skipping_table = None;
                 current_table = Some(table.clone());
                 current_schema = columns.clone();
@@ -437,17 +438,19 @@ async fn run_protocol(
                 }
 
                 let decompressed = maybe_decompress(tsv_data, negotiated_compression)?;
+                let bytes_received = decompressed.len();
 
                 debug!(
                     "Data chunk: {} rows, {} bytes for {}",
-                    row_count,
-                    decompressed.len(),
-                    table
+                    row_count, bytes_received, table
                 );
 
                 // Load data into MySQL
                 let loaded = load_tsv_data(local_conn, &table, &current_schema, &decompressed)?;
                 stats.rows_imported += loaded;
+
+                // Update progress
+                progress.update_table(row_count, bytes_received);
 
                 // Send ack
                 let ack_msg = ClientMessage::Ack { checkpoint };
@@ -462,7 +465,7 @@ async fn run_protocol(
                     continue;
                 }
 
-                info!("Table {} complete: {} rows", table, row_count);
+                progress.finish_table(&table, row_count);
                 stats.tables_imported += 1;
                 current_table = None;
 
@@ -481,7 +484,7 @@ async fn run_protocol(
             }
 
             ServerMessage::Done => {
-                info!("All tables transferred");
+                progress.finish();
                 break;
             }
 
@@ -490,7 +493,7 @@ async fn run_protocol(
                 recoverable,
             } => {
                 if recoverable {
-                    warn!("Recoverable server error: {}", message);
+                    progress.suspend(|| warn!("Recoverable server error: {}", message));
                 } else {
                     return Err(anyhow::anyhow!("Server error: {}", message));
                 }

@@ -44,6 +44,7 @@ home = "0.5"
 
 # Shared
 hex = "0.4"
+indicatif = "0.17"
 
 # Use vendored mysql implementation
 [patch.crates-io]

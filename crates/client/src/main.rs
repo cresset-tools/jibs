@@ -10,6 +10,7 @@
 
 mod error;
 mod import;
+mod progress;
 mod resolver;
 mod server_binary;
 mod ssh;
