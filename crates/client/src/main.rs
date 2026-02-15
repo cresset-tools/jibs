@@ -35,17 +35,17 @@ struct Cli {
 enum Commands {
     /// Import data from a remote database
     Import(ImportArgs),
+    /// Fetch specific aggregates with custom where clauses
+    Get(GetArgs),
     /// Parse and validate a .jibs file
     Check(CheckArgs),
     /// Show resolved execution plan (for debugging)
     Plan(PlanArgs),
 }
 
+/// Common connection arguments shared between import and get
 #[derive(Args)]
-struct ImportArgs {
-    /// Path to the .jibs configuration file
-    config: PathBuf,
-
+struct ConnectionArgs {
     /// Remote host in format user@host[:port]
     #[arg(long)]
     host: String,
@@ -66,14 +66,6 @@ struct ImportArgs {
     #[arg(long = "var-file")]
     var_file: Option<PathBuf>,
 
-    /// Resume a previously interrupted import
-    #[arg(long, conflicts_with = "clean")]
-    resume: bool,
-
-    /// Clean up backup tables from a previous interrupted import and start fresh
-    #[arg(long, conflicts_with = "resume")]
-    clean: bool,
-
     /// Number of parallel SSH sessions
     #[arg(long, default_value = "1")]
     parallel: usize,
@@ -93,12 +85,42 @@ struct ImportArgs {
     /// SSH port (default: 22)
     #[arg(long, default_value = "22")]
     port: u16,
+}
+
+#[derive(Args)]
+struct ImportArgs {
+    /// Path to the .jibs configuration file
+    config: PathBuf,
+
+    #[command(flatten)]
+    connection: ConnectionArgs,
+
+    /// Resume a previously interrupted import
+    #[arg(long, conflicts_with = "clean")]
+    resume: bool,
+
+    /// Clean up backup tables from a previous interrupted import and start fresh
+    #[arg(long, conflicts_with = "resume")]
+    clean: bool,
 
     /// [TEST] Simulate crash after N tables imported (for testing resume)
     /// Only available with --features test-utils
     #[cfg(feature = "test-utils")]
     #[arg(long)]
     fail_after_tables: Option<usize>,
+}
+
+#[derive(Args)]
+struct GetArgs {
+    /// Path to the .jibs configuration file
+    config: PathBuf,
+
+    #[command(flatten)]
+    connection: ConnectionArgs,
+
+    /// Aggregate/where pairs: aggregate1 'where clause1' aggregate2 'where clause2' ...
+    #[arg(last = true, required = true)]
+    queries: Vec<String>,
 }
 
 #[derive(Args)]
@@ -140,6 +162,7 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Import(args) => run_import(args).await,
+        Commands::Get(args) => run_get(args).await,
         Commands::Check(args) => run_check(args),
         Commands::Plan(args) => run_plan(args),
     }
@@ -148,9 +171,9 @@ async fn main() -> Result<()> {
 async fn run_import(args: ImportArgs) -> Result<()> {
     use jibs_protocol::CompressionMode;
 
-    let compression = if args.compress {
+    let compression = if args.connection.compress {
         CompressionMode::Zstd
-    } else if args.no_compress {
+    } else if args.connection.no_compress {
         CompressionMode::None
     } else {
         CompressionMode::Auto
@@ -158,17 +181,18 @@ async fn run_import(args: ImportArgs) -> Result<()> {
 
     let config = ImportConfig {
         config_path: args.config,
-        remote_host: args.host,
-        remote_mysql: args.remote_mysql,
-        local_mysql: args.local_mysql,
-        vars: args.vars.into_iter().collect(),
-        var_file: args.var_file,
+        remote_host: args.connection.host,
+        remote_mysql: args.connection.remote_mysql,
+        local_mysql: args.connection.local_mysql,
+        vars: args.connection.vars.into_iter().collect(),
+        var_file: args.connection.var_file,
         resume: args.resume,
         clean: args.clean,
-        parallel: args.parallel,
+        parallel: args.connection.parallel,
         compression,
-        identity_file: args.identity,
-        ssh_port: args.port,
+        identity_file: args.connection.identity,
+        ssh_port: args.connection.port,
+        aggregate_overrides: None,
         #[cfg(feature = "test-utils")]
         fail_after_tables: args.fail_after_tables,
         #[cfg(not(feature = "test-utils"))]
@@ -176,6 +200,71 @@ async fn run_import(args: ImportArgs) -> Result<()> {
     };
 
     import::run_import(config).await
+}
+
+async fn run_get(args: GetArgs) -> Result<()> {
+    use jibs_protocol::CompressionMode;
+
+    // Parse aggregate/where pairs from trailing args
+    let aggregate_overrides = parse_aggregate_queries(&args.queries)?;
+
+    let compression = if args.connection.compress {
+        CompressionMode::Zstd
+    } else if args.connection.no_compress {
+        CompressionMode::None
+    } else {
+        CompressionMode::Auto
+    };
+
+    let config = ImportConfig {
+        config_path: args.config,
+        remote_host: args.connection.host,
+        remote_mysql: args.connection.remote_mysql,
+        local_mysql: args.connection.local_mysql,
+        vars: args.connection.vars.into_iter().collect(),
+        var_file: args.connection.var_file,
+        resume: false,
+        clean: false,
+        parallel: args.connection.parallel,
+        compression,
+        identity_file: args.connection.identity,
+        ssh_port: args.connection.port,
+        aggregate_overrides: Some(aggregate_overrides),
+        #[cfg(feature = "test-utils")]
+        fail_after_tables: None,
+        #[cfg(not(feature = "test-utils"))]
+        fail_after_tables: None,
+    };
+
+    import::run_import(config).await
+}
+
+/// Parse aggregate/where pairs from command line args
+/// Expected format: ["aggregate1", "where clause1", "aggregate2", "where clause2", ...]
+fn parse_aggregate_queries(args: &[String]) -> Result<Vec<(String, String)>> {
+    if args.len() % 2 != 0 {
+        anyhow::bail!(
+            "Expected pairs of aggregate name and where clause, got {} arguments",
+            args.len()
+        );
+    }
+
+    let mut pairs = Vec::new();
+    for chunk in args.chunks(2) {
+        let aggregate = chunk[0].clone();
+        let where_clause = chunk[1].clone();
+
+        // Strip leading "where " if present (user might write 'where x = 1' or just 'x = 1')
+        let where_clause = where_clause
+            .strip_prefix("where ")
+            .or_else(|| where_clause.strip_prefix("WHERE "))
+            .map(|s| s.to_string())
+            .unwrap_or(where_clause);
+
+        pairs.push((aggregate, where_clause));
+    }
+
+    Ok(pairs)
 }
 
 fn run_check(args: CheckArgs) -> Result<()> {

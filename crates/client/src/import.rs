@@ -31,6 +31,9 @@ pub struct ImportConfig {
     pub compression: CompressionMode,
     pub identity_file: Option<PathBuf>,
     pub ssh_port: u16,
+    /// For `get` command: filter to specific aggregates with custom where clauses
+    /// Each pair is (aggregate_name, where_clause)
+    pub aggregate_overrides: Option<Vec<(String, String)>>,
     /// Debug: simulate crash after N tables (for testing resume)
     pub fail_after_tables: Option<usize>,
 }
@@ -66,8 +69,13 @@ pub async fn run_import(config: ImportConfig) -> Result<()> {
     }
 
     // Resolve the execution plan
-    let plan = resolver::resolve(&config.config_path, &program, &vars)
+    let mut plan = resolver::resolve(&config.config_path, &program, &vars)
         .map_err(|e| anyhow::anyhow!("Resolution failed: {}", e))?;
+
+    // Apply aggregate overrides if this is a `get` command
+    if let Some(overrides) = &config.aggregate_overrides {
+        plan = apply_aggregate_overrides(plan, overrides)?;
+    }
 
     info!(
         "Resolved plan: {} aggregates, {} relations, {} excluded tables",
@@ -182,6 +190,44 @@ pub async fn run_import(config: ImportConfig) -> Result<()> {
 struct ImportStats {
     tables_imported: usize,
     rows_imported: u64,
+}
+
+/// Apply aggregate overrides for the `get` command
+///
+/// Filters the plan to only include the specified aggregates, and replaces
+/// their where clauses with the provided overrides.
+fn apply_aggregate_overrides(
+    mut plan: ExecutionPlan,
+    overrides: &[(String, String)],
+) -> Result<ExecutionPlan> {
+    let mut new_aggregates = Vec::new();
+
+    for (agg_name, where_clause) in overrides {
+        // Find the aggregate by name
+        let original = plan
+            .aggregates
+            .iter()
+            .find(|a| a.name == *agg_name)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Aggregate '{}' not found in config. Available aggregates: {}",
+                    agg_name,
+                    plan.aggregates
+                        .iter()
+                        .map(|a| a.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })?;
+
+        // Clone and override the where clause
+        let mut modified = original.clone();
+        modified.where_clause = Some(where_clause.clone());
+        new_aggregates.push(modified);
+    }
+
+    plan.aggregates = new_aggregates;
+    Ok(plan)
 }
 
 /// Prefix for backup tables
