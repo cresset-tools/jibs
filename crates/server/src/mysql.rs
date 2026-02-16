@@ -201,6 +201,25 @@ impl MySqlConnection {
         Ok(self.conn.query(query)?)
     }
 
+    /// Execute a query and return a streaming iterator over rows.
+    /// This avoids loading all rows into memory at once.
+    pub fn query_iter(
+        &mut self,
+        query: &str,
+    ) -> Result<mysql::QueryResult<'_, '_, '_, mysql::Text>> {
+        Ok(self.conn.query_iter(query)?)
+    }
+
+    /// Execute a parameterized query and return a streaming iterator over rows.
+    /// This avoids loading all rows into memory at once.
+    pub fn exec_iter<P: Into<mysql::Params>>(
+        &mut self,
+        query: &str,
+        params: P,
+    ) -> Result<mysql::QueryResult<'_, '_, '_, mysql::Binary>> {
+        Ok(self.conn.exec_iter(query, params)?)
+    }
+
     /// Execute a parameterized query and return rows
     #[allow(dead_code)]
     pub fn query_rows_with_params<P: Into<mysql::Params>>(

@@ -10,7 +10,7 @@ use jibs_protocol::{
     ResolvedAggregate, ServerMessage, SortDirection,
 };
 
-use crate::error::{Result, ServerError};
+use crate::error::Result;
 use crate::mysql::MySqlConnection;
 use crate::tsv::TsvWriter;
 
@@ -20,115 +20,48 @@ const CHUNK_ROW_LIMIT: usize = 10_000;
 const CHUNK_BYTE_LIMIT: usize = 10 * 1024 * 1024; // 10MB
 
 // ============================================================================
-// Table Streamer - generates chunks for a single table
+// Streaming helpers
 // ============================================================================
 
-/// Generates data chunks for a single table
-struct TableStreamer {
-    table: String,
-    columns: Vec<ColumnDef>,
-    rows: std::vec::IntoIter<Row>,
-    tsv_writer: TsvWriter,
-    total_rows: u64,
-    done: bool,
+/// Flush a TSV buffer as a Data message if non-empty.
+/// Returns the number of bytes flushed.
+fn flush_chunk<W: Write>(
+    table: &str,
+    tsv_writer: &mut TsvWriter,
+    chunk_row_count: u32,
+    compression: CompressionMode,
+    checkpoint: &mut Checkpoint,
+    writer: &mut W,
+) -> Result<()> {
+    if tsv_writer.is_empty() {
+        return Ok(());
+    }
+
+    let tsv_data = tsv_writer.take_buffer();
+    let bytes = tsv_data.len() as u64;
+    checkpoint.bytes_transferred += bytes;
+    checkpoint.rows_transferred += chunk_row_count as u64;
+
+    let msg = ServerMessage::Data {
+        table: table.to_string(),
+        row_count: chunk_row_count,
+        tsv_data: maybe_compress(tsv_data, compression),
+        checkpoint: checkpoint.clone(),
+    };
+    write_message(writer, &msg)?;
+    Ok(())
 }
 
-impl TableStreamer {
-    /// Create a new table streamer
-    fn new(
-        table: String,
-        columns: Vec<ColumnDef>,
-        rows: Vec<Row>,
-        anonymization: Vec<jibs_protocol::AnonymizeRule>,
-        fakers: HashMap<String, Vec<String>>,
-    ) -> Self {
-        let column_names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
-        let tsv_writer = TsvWriter::new(column_names, anonymization, fakers);
-
-        Self {
-            table,
-            columns,
-            rows: rows.into_iter(),
-            tsv_writer,
-            total_rows: 0,
-            done: false,
-        }
-    }
-
-    /// Get the schema message for this table
-    fn schema_message(&self) -> ServerMessage {
-        ServerMessage::Schema {
-            table: self.table.clone(),
-            columns: self.columns.clone(),
-        }
-    }
-
-    /// Generate the next chunk, returns None when done
-    fn next_chunk(&mut self, compression: CompressionMode) -> Result<Option<(ServerMessage, u64)>> {
-        if self.done {
-            return Ok(None);
-        }
-
-        let mut chunk_row_count = 0u32;
-
-        loop {
-            // Check if we should flush current buffer
-            if chunk_row_count >= CHUNK_ROW_LIMIT as u32
-                || self.tsv_writer.buffer_size() >= CHUNK_BYTE_LIMIT
-            {
-                let tsv_data = self.tsv_writer.take_buffer();
-                let bytes = tsv_data.len() as u64;
-                let msg = ServerMessage::Data {
-                    table: self.table.clone(),
-                    row_count: chunk_row_count,
-                    tsv_data: maybe_compress(tsv_data, compression),
-                    checkpoint: Checkpoint::default(), // Will be updated by caller
-                };
-                return Ok(Some((msg, bytes)));
-            }
-
-            // Try to get next row
-            match self.rows.next() {
-                Some(row) => {
-                    self.tsv_writer.write_row(&row)?;
-                    chunk_row_count += 1;
-                    self.total_rows += 1;
-                }
-                None => {
-                    // No more rows
-                    self.done = true;
-
-                    // Flush any remaining data
-                    if !self.tsv_writer.is_empty() {
-                        let tsv_data = self.tsv_writer.take_buffer();
-                        let bytes = tsv_data.len() as u64;
-                        let msg = ServerMessage::Data {
-                            table: self.table.clone(),
-                            row_count: chunk_row_count,
-                            tsv_data: maybe_compress(tsv_data, compression),
-                            checkpoint: Checkpoint::default(),
-                        };
-                        return Ok(Some((msg, bytes)));
-                    }
-
-                    return Ok(None);
-                }
-            }
-        }
-    }
-
-    /// Get the TableDone message
-    fn done_message(&self) -> ServerMessage {
-        ServerMessage::TableDone {
-            table: self.table.clone(),
-            row_count: self.total_rows,
-        }
-    }
-
-    /// Check if this streamer is done
-    fn is_done(&self) -> bool {
-        self.done
-    }
+/// Extract a primary key from a single row given the PK column names
+fn extract_pk_from_row(row: &Row, pk_columns: &[String]) -> Vec<MySqlValue> {
+    pk_columns
+        .iter()
+        .map(|col| {
+            row.get_opt::<MySqlValue, _>(col as &str)
+                .and_then(|r| r.ok())
+                .unwrap_or(MySqlValue::NULL)
+        })
+        .collect()
 }
 
 // ============================================================================
@@ -170,19 +103,13 @@ impl<'a> DependencyTraverser<'a> {
         })
     }
 
-    /// Stream all tables with interleaved chunks for parallel client loading
+    /// Stream all tables, processing one table at a time to avoid loading all rows into memory.
     ///
     /// Logic:
-    /// 1. Tables touched by aggregates: only include rows reachable from aggregate
-    /// 2. Tables NOT touched by aggregates: include ALL rows
+    /// 1. Tables touched by aggregates: only include rows reachable from aggregate (streamed during BFS)
+    /// 2. Tables NOT touched by aggregates: include ALL rows (streamed directly from query)
     /// 3. Excluded tables: skip data (structure only)
     /// 4. Ignored tables: skip entirely
-    ///
-    /// Streaming strategy:
-    /// 1. Prepare all table data and create streamers
-    /// 2. Send all Schema messages upfront
-    /// 3. Round-robin data chunks across tables
-    /// 4. Send TableDone as each table completes
     ///
     /// If `resume_from` is provided, skip tables already completed.
     pub fn stream_all_tables<W: Write>(
@@ -191,50 +118,30 @@ impl<'a> DependencyTraverser<'a> {
         compression: CompressionMode,
         writer: &mut W,
     ) -> Result<()> {
-        // Initialize checkpoint (either from resume or fresh)
         let mut checkpoint = resume_from.unwrap_or_default();
 
-        // First, collect rows from all aggregates
-        let (mut aggregate_rows, aggregate_tables) = self.collect_aggregate_rows()?;
+        // Phase 1: Stream aggregate tables via BFS traversal.
+        // This streams rows directly during traversal, only keeping PKs and FK values in memory.
+        // Returns the set of tables that were touched by aggregates.
+        let aggregate_tables = self.stream_aggregate_tables(compression, &mut checkpoint, writer)?;
 
-        // Get all tables in the database
+        // Phase 2: Stream non-aggregate tables one at a time.
         let all_tables: Vec<String> = self.conn.get_all_table_names()?;
 
-        // Build list of tables to stream with their rows
-        let mut streamers: Vec<TableStreamer> = Vec::new();
-
         for table in all_tables {
-            // Skip ignored tables
             if self.plan.ignored_tables.contains(&table) {
                 continue;
             }
-
-            // Skip excluded tables (structure only, handled elsewhere)
             if self.plan.excluded_tables.contains(&table) {
                 continue;
             }
-
-            // Skip already completed tables (on resume)
+            if aggregate_tables.contains(&table) {
+                continue;
+            }
             if checkpoint.should_skip_table(&table) {
                 continue;
             }
 
-            // Get rows for this table
-            let rows = if aggregate_tables.contains(&table) {
-                // This table is filtered by an aggregate - use collected rows
-                aggregate_rows.remove(&table).unwrap_or_default()
-            } else {
-                // This table is not filtered - query ALL rows
-                let query = format!("SELECT * FROM `{}`", table);
-                self.conn.query_rows(&query)?
-            };
-
-            // Skip empty tables
-            if rows.is_empty() {
-                continue;
-            }
-
-            // Get schema and anonymization rules
             let columns = self.conn.get_column_defs(&table)?;
             let anonymization = self
                 .plan
@@ -243,278 +150,471 @@ impl<'a> DependencyTraverser<'a> {
                 .cloned()
                 .unwrap_or_default();
 
-            // Create streamer
-            let streamer = TableStreamer::new(
-                table,
-                columns,
-                rows,
+            let total_rows = self.stream_full_table(
+                &table,
+                &columns,
                 anonymization,
-                self.plan.fakers.clone(),
-            );
-            streamers.push(streamer);
-        }
+                compression,
+                &mut checkpoint,
+                writer,
+            )?;
 
-        // Phase 1: Send all Schema messages upfront
-        for streamer in &streamers {
-            write_message(writer, &streamer.schema_message())?;
-        }
-
-        // Phase 2: Interleaved data streaming (round-robin)
-        loop {
-            let mut any_progress = false;
-
-            for streamer in &mut streamers {
-                if streamer.is_done() {
-                    continue;
-                }
-
-                // Get next chunk from this table
-                if let Some((mut msg, bytes)) = streamer.next_chunk(compression)? {
-                    // Update checkpoint in the message
-                    checkpoint.bytes_transferred += bytes;
-                    checkpoint.rows_transferred += match &msg {
-                        ServerMessage::Data { row_count, .. } => *row_count as u64,
-                        _ => 0,
-                    };
-
-                    if let ServerMessage::Data { checkpoint: ref mut cp, .. } = msg {
-                        *cp = checkpoint.clone();
-                    }
-
-                    write_message(writer, &msg)?;
-                    any_progress = true;
-                }
-
-                // Check if this table just finished
-                if streamer.is_done() {
-                    write_message(writer, &streamer.done_message())?;
-                }
-            }
-
-            // If no streamer made progress, we're done
-            if !any_progress {
-                break;
+            if total_rows > 0 {
+                write_message(
+                    writer,
+                    &ServerMessage::TableDone {
+                        table: table.clone(),
+                        row_count: total_rows,
+                    },
+                )?;
             }
         }
 
         Ok(())
     }
 
-    /// Collect all rows reachable from aggregates via relations
+    /// Stream all rows from a non-aggregate table directly from a MySQL query.
+    /// Returns the total number of rows streamed.
+    fn stream_full_table<W: Write>(
+        &mut self,
+        table: &str,
+        columns: &[ColumnDef],
+        anonymization: Vec<jibs_protocol::AnonymizeRule>,
+        compression: CompressionMode,
+        checkpoint: &mut Checkpoint,
+        writer: &mut W,
+    ) -> Result<u64> {
+        let column_names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
+        let mut tsv_writer =
+            TsvWriter::new(column_names, anonymization, self.plan.fakers.clone());
+        let mut total_rows: u64 = 0;
+        let mut chunk_row_count: u32 = 0;
+        let mut schema_sent = false;
+
+        let query = format!("SELECT * FROM `{}`", table);
+        let result = self.conn.query_iter(&query)?;
+
+        for row_result in result {
+            let row: Row = row_result?;
+
+            // Send schema before first row
+            if !schema_sent {
+                write_message(
+                    writer,
+                    &ServerMessage::Schema {
+                        table: table.to_string(),
+                        columns: columns.to_vec(),
+                    },
+                )?;
+                schema_sent = true;
+            }
+
+            tsv_writer.write_row(&row)?;
+            chunk_row_count += 1;
+            total_rows += 1;
+
+            if chunk_row_count >= CHUNK_ROW_LIMIT as u32
+                || tsv_writer.buffer_size() >= CHUNK_BYTE_LIMIT
+            {
+                flush_chunk(
+                    table,
+                    &mut tsv_writer,
+                    chunk_row_count,
+                    compression,
+                    checkpoint,
+                    writer,
+                )?;
+                chunk_row_count = 0;
+            }
+        }
+
+        // Flush remaining data
+        if chunk_row_count > 0 {
+            flush_chunk(
+                table,
+                &mut tsv_writer,
+                chunk_row_count,
+                compression,
+                checkpoint,
+                writer,
+            )?;
+        }
+
+        Ok(total_rows)
+    }
+
+    /// Stream all rows reachable from aggregates via BFS relation traversal.
+    ///
+    /// Instead of collecting all rows in memory, this streams rows directly during
+    /// BFS traversal. Only PKs (for deduplication) and FK values (for next BFS level)
+    /// are kept in memory.
     ///
     /// Traversal strategy:
-    /// - From root table: follow BOTH forward (FKs we reference) and backward (tables that reference us)
-    /// - From tables reached via BACKWARD traversal: continue bidirectional (follow ownership chain)
-    /// - From tables reached via FORWARD traversal: forward only (don't reverse direction)
-    ///
-    /// This prevents cycles where e.g. products -> order_items -> orders pulls in unrelated orders,
-    /// while still allowing proper traversal when rooted at parent tables like users.
-    fn collect_aggregate_rows(&mut self) -> Result<(HashMap<String, Vec<Row>>, HashSet<String>)> {
-        // Track visited rows per table to avoid duplicates
+    /// - From root table: follow BOTH forward and backward relations
+    /// - From tables reached via BACKWARD traversal: continue bidirectional
+    /// - From tables reached via FORWARD traversal: forward only
+    fn stream_aggregate_tables<W: Write>(
+        &mut self,
+        compression: CompressionMode,
+        checkpoint: &mut Checkpoint,
+        writer: &mut W,
+    ) -> Result<HashSet<String>> {
+        // Track visited rows per table (only PKs, not full rows)
         let mut visited: HashMap<String, HashSet<Vec<u8>>> = HashMap::new();
 
-        // Rows collected, grouped by table
-        let mut collected_rows: HashMap<String, Vec<Row>> = HashMap::new();
-
-        // Tables that are touched by aggregates (will be filtered)
+        // Tables touched by aggregates
         let mut aggregate_tables: HashSet<String> = HashSet::new();
 
-        // Process each aggregate
-        for aggregate in &self.plan.aggregates.clone() {
+        // Track which tables have had Schema sent and their total row counts
+        let mut schemas_sent: HashSet<String> = HashSet::new();
+        let mut table_row_counts: HashMap<String, u64> = HashMap::new();
+
+        // Pre-cache schemas and PK columns for all tables that might be touched
+        // (needed before we start streaming since we can't query metadata during iteration)
+        let all_table_names = self.conn.get_all_table_names()?;
+        for table_name in &all_table_names {
+            self.conn.get_column_defs(table_name)?;
+        }
+
+        let aggregates = self.plan.aggregates.clone();
+        for aggregate in &aggregates {
             aggregate_tables.insert(aggregate.root_table.clone());
 
             // BFS queue: (table_name, fk_column, fk_values, reached_via_backward)
-            // reached_via_backward=true means we can continue bidirectional traversal
             let mut queue: VecDeque<(String, String, Vec<MySqlValue>, bool)> = VecDeque::new();
 
-            // Start with root table query
-            let root_rows = self.query_root_table(aggregate)?;
+            // Stream root table
+            let root_table = &aggregate.root_table;
+            let root_query = Self::build_root_query(aggregate);
+            let pk_columns = self
+                .conn
+                .get_cached_primary_key(root_table)
+                .cloned()
+                .unwrap_or_default();
+            let columns = self
+                .conn
+                .get_column_defs(root_table)?;
+            let anonymization = self
+                .plan
+                .anonymization
+                .get(root_table.as_str())
+                .cloned()
+                .unwrap_or_default();
 
-            if !root_rows.is_empty() {
-                // Mark root rows as visited
-                let root_pks = self.extract_primary_keys(&aggregate.root_table, &root_rows)?;
-                for pk in root_pks.iter() {
-                    let pk_bytes = self.serialize_pk(pk);
-                    visited
-                        .entry(aggregate.root_table.clone())
+            // Prepare FK extraction info for the root table
+            let forward_relations: Vec<_> = self
+                .relations_by_source
+                .get(root_table.as_str())
+                .cloned()
+                .unwrap_or_default();
+            let backward_relations: Vec<_> = self
+                .relations_by_target
+                .get(root_table.as_str())
+                .cloned()
+                .unwrap_or_default();
+
+            let column_names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
+            let mut tsv_writer = TsvWriter::new(
+                column_names,
+                anonymization,
+                self.plan.fakers.clone(),
+            );
+            let mut chunk_row_count: u32 = 0;
+
+            // Accumulators for FK values to queue after streaming
+            let mut fk_accumulator: HashMap<(String, String, bool), Vec<MySqlValue>> =
+                HashMap::new();
+
+            // Stream root table rows
+            {
+                let result = self.conn.query_iter(&root_query)?;
+
+                for row_result in result {
+                    let row: Row = row_result?;
+
+                    // Send schema on first row
+                    if schemas_sent.insert(root_table.clone()) {
+                        write_message(
+                            writer,
+                            &ServerMessage::Schema {
+                                table: root_table.clone(),
+                                columns: columns.clone(),
+                            },
+                        )?;
+                    }
+
+                    // Dedup check
+                    let pk = extract_pk_from_row(&row, &pk_columns);
+                    let pk_bytes = serialize_pk(&pk);
+                    if !visited
+                        .entry(root_table.clone())
                         .or_default()
-                        .insert(pk_bytes);
+                        .insert(pk_bytes)
+                    {
+                        continue; // Already visited
+                    }
+
+                    // Extract FK values for forward relations
+                    for relation in &forward_relations {
+                        if let Some(Ok(v)) =
+                            row.get_opt::<MySqlValue, _>(relation.from_column.as_str())
+                        {
+                            if !matches!(v, MySqlValue::NULL) {
+                                fk_accumulator
+                                    .entry((
+                                        relation.to_table.clone(),
+                                        relation.to_column.clone(),
+                                        false,
+                                    ))
+                                    .or_default()
+                                    .push(v);
+                            }
+                        }
+                    }
+
+                    // Extract FK values for backward relations (bidirectional from root)
+                    for relation in &backward_relations {
+                        if let Some(Ok(v)) =
+                            row.get_opt::<MySqlValue, _>(relation.to_column.as_str())
+                        {
+                            if !matches!(v, MySqlValue::NULL) {
+                                fk_accumulator
+                                    .entry((
+                                        relation.from_table.clone(),
+                                        relation.from_column.clone(),
+                                        true,
+                                    ))
+                                    .or_default()
+                                    .push(v);
+                            }
+                        }
+                    }
+
+                    // Write TSV
+                    tsv_writer.write_row(&row)?;
+                    chunk_row_count += 1;
+                    *table_row_counts.entry(root_table.clone()).or_default() += 1;
+
+                    if chunk_row_count >= CHUNK_ROW_LIMIT as u32
+                        || tsv_writer.buffer_size() >= CHUNK_BYTE_LIMIT
+                    {
+                        flush_chunk(
+                            root_table,
+                            &mut tsv_writer,
+                            chunk_row_count,
+                            compression,
+                            checkpoint,
+                            writer,
+                        )?;
+                        chunk_row_count = 0;
+                    }
                 }
+            }
+            // QueryResult dropped here, conn is free
 
-                // Queue related tables - from root, do BIDIRECTIONAL traversal
-                self.queue_related_tables_directional(
-                    &aggregate.root_table,
-                    &root_rows,
-                    &mut queue,
-                    true, // bidirectional for root
+            // Flush remaining root table data
+            if chunk_row_count > 0 {
+                flush_chunk(
+                    root_table,
+                    &mut tsv_writer,
+                    chunk_row_count,
+                    compression,
+                    checkpoint,
+                    writer,
                 )?;
-
-                // Store root rows
-                collected_rows
-                    .entry(aggregate.root_table.clone())
-                    .or_default()
-                    .extend(root_rows);
             }
 
-            // BFS traversal for this aggregate
+            // Queue accumulated FK values
+            for ((to_table, to_column, via_backward), values) in fk_accumulator.drain() {
+                let unique = dedupe_values(values);
+                if !unique.is_empty() {
+                    queue.push_back((to_table, to_column, unique, via_backward));
+                }
+            }
+
+            // BFS traversal
             while let Some((table, column, fk_values, reached_via_backward)) = queue.pop_front() {
-                // Mark this table as aggregate-touched
                 aggregate_tables.insert(table.clone());
 
-                // Skip excluded tables
                 if self.plan.excluded_tables.contains(&table) {
                     continue;
                 }
 
-                // Fetch rows matching the FK values
-                let rows = self.fetch_by_column(&table, &column, &fk_values)?;
+                // Get cached metadata (pre-cached above)
+                let pk_columns = self
+                    .conn
+                    .get_cached_primary_key(&table)
+                    .cloned()
+                    .unwrap_or_default();
+                let columns = self.conn.get_column_defs(&table)?;
+                let anonymization = self
+                    .plan
+                    .anonymization
+                    .get(&table)
+                    .cloned()
+                    .unwrap_or_default();
 
-                if rows.is_empty() {
-                    continue;
-                }
+                // Prepare FK extraction info
+                let forward_relations: Vec<_> = self
+                    .relations_by_source
+                    .get(table.as_str())
+                    .cloned()
+                    .unwrap_or_default();
+                let backward_relations: Vec<_> = if reached_via_backward {
+                    self.relations_by_target
+                        .get(table.as_str())
+                        .cloned()
+                        .unwrap_or_default()
+                } else {
+                    vec![]
+                };
 
-                // Filter out already visited rows
-                let pks = self.extract_primary_keys(&table, &rows)?;
-                let visited_set = visited.entry(table.clone()).or_default();
+                let column_names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
+                let mut tsv_writer = TsvWriter::new(
+                    column_names,
+                    anonymization,
+                    self.plan.fakers.clone(),
+                );
+                let mut chunk_row_count: u32 = 0;
+                let mut fk_accumulator: HashMap<(String, String, bool), Vec<MySqlValue>> =
+                    HashMap::new();
 
-                let new_rows: Vec<Row> = rows
-                    .into_iter()
-                    .zip(pks.iter())
-                    .filter(|(_, pk)| {
-                        let pk_bytes = self.serialize_pk(pk);
-                        if visited_set.contains(&pk_bytes) {
-                            false
-                        } else {
-                            visited_set.insert(pk_bytes);
-                            true
+                // Build and execute the IN query with streaming
+                {
+                    let placeholders: Vec<&str> = (0..fk_values.len()).map(|_| "?").collect();
+                    let query = format!(
+                        "SELECT * FROM `{}` WHERE `{}` IN ({})",
+                        table,
+                        column,
+                        placeholders.join(", ")
+                    );
+                    let params: Vec<MySqlValue> = fk_values;
+
+                    let result =
+                        self.conn
+                            .exec_iter(&query, mysql::Params::Positional(params))?;
+
+                    for row_result in result {
+                        let row: Row = row_result?;
+
+                        // Dedup check
+                        let pk = extract_pk_from_row(&row, &pk_columns);
+                        let pk_bytes = serialize_pk(&pk);
+                        if !visited
+                            .entry(table.clone())
+                            .or_default()
+                            .insert(pk_bytes)
+                        {
+                            continue; // Already visited
                         }
-                    })
-                    .map(|(row, _)| row)
-                    .collect();
 
-                if new_rows.is_empty() {
-                    continue;
+                        // Send schema on first new row for this table
+                        if schemas_sent.insert(table.clone()) {
+                            write_message(
+                                writer,
+                                &ServerMessage::Schema {
+                                    table: table.clone(),
+                                    columns: columns.clone(),
+                                },
+                            )?;
+                        }
+
+                        // Extract FK values for forward relations
+                        for relation in &forward_relations {
+                            if let Some(Ok(v)) =
+                                row.get_opt::<MySqlValue, _>(relation.from_column.as_str())
+                            {
+                                if !matches!(v, MySqlValue::NULL) {
+                                    fk_accumulator
+                                        .entry((
+                                            relation.to_table.clone(),
+                                            relation.to_column.clone(),
+                                            false,
+                                        ))
+                                        .or_default()
+                                        .push(v);
+                                }
+                            }
+                        }
+
+                        // Extract FK values for backward relations
+                        for relation in &backward_relations {
+                            if let Some(Ok(v)) =
+                                row.get_opt::<MySqlValue, _>(relation.to_column.as_str())
+                            {
+                                if !matches!(v, MySqlValue::NULL) {
+                                    fk_accumulator
+                                        .entry((
+                                            relation.from_table.clone(),
+                                            relation.from_column.clone(),
+                                            true,
+                                        ))
+                                        .or_default()
+                                        .push(v);
+                                }
+                            }
+                        }
+
+                        // Write TSV
+                        tsv_writer.write_row(&row)?;
+                        chunk_row_count += 1;
+                        *table_row_counts.entry(table.clone()).or_default() += 1;
+
+                        if chunk_row_count >= CHUNK_ROW_LIMIT as u32
+                            || tsv_writer.buffer_size() >= CHUNK_BYTE_LIMIT
+                        {
+                            flush_chunk(
+                                &table,
+                                &mut tsv_writer,
+                                chunk_row_count,
+                                compression,
+                                checkpoint,
+                                writer,
+                            )?;
+                            chunk_row_count = 0;
+                        }
+                    }
+                }
+                // QueryResult dropped, conn is free
+
+                // Flush remaining data for this BFS step
+                if chunk_row_count > 0 {
+                    flush_chunk(
+                        &table,
+                        &mut tsv_writer,
+                        chunk_row_count,
+                        compression,
+                        checkpoint,
+                        writer,
+                    )?;
                 }
 
-                // Queue related tables based on how we reached this table:
-                // - If reached via backward traversal: continue bidirectional (following ownership)
-                // - If reached via forward traversal: forward only (don't reverse direction)
-                self.queue_related_tables_directional(
-                    &table,
-                    &new_rows,
-                    &mut queue,
-                    reached_via_backward,
-                )?;
-
-                // Collect rows
-                collected_rows
-                    .entry(table)
-                    .or_default()
-                    .extend(new_rows);
-            }
-        }
-
-        Ok((collected_rows, aggregate_tables))
-    }
-
-    /// Queue related tables based on FK values in the given rows
-    ///
-    /// If `bidirectional` is true:
-    /// 1. Forward: Follow FKs from current table to referenced tables
-    ///    e.g., orders.user_id -> users.id: from orders, find users
-    /// 2. Backward: Find tables that reference current table
-    ///    e.g., order_items.order_id -> orders.id: from orders, find order_items
-    ///
-    /// If `bidirectional` is false, only forward traversal is done.
-    /// This prevents cycles where following backward from a "leaf" table
-    /// pulls in unrelated rows through a common parent.
-    ///
-    /// The `reached_via_backward` flag in queued items indicates whether the
-    /// target table should continue with bidirectional traversal (true) or
-    /// forward-only (false).
-    fn queue_related_tables_directional(
-        &mut self,
-        source_table: &str,
-        rows: &[Row],
-        queue: &mut VecDeque<(String, String, Vec<MySqlValue>, bool)>,
-        bidirectional: bool,
-    ) -> Result<()> {
-        // Forward traversal: follow FKs FROM this table TO other tables
-        // e.g., orders.user_id -> users.id: extract user_id values, find users by id
-        // Tables reached via forward should NOT continue bidirectional (forward-only)
-        if let Some(relations) = self.relations_by_source.get(source_table).cloned() {
-            for relation in relations {
-                // Extract FK column values from source rows
-                let fk_values: Vec<MySqlValue> = rows
-                    .iter()
-                    .filter_map(|row| {
-                        row.get_opt::<MySqlValue, _>(relation.from_column.as_str())
-                            .and_then(|r| r.ok())
-                            .filter(|v| !matches!(v, MySqlValue::NULL))
-                    })
-                    .collect();
-
-                if !fk_values.is_empty() {
-                    // Deduplicate FK values
-                    let unique_fks = self.dedupe_values(fk_values);
-                    queue.push_back((
-                        relation.to_table.clone(),
-                        relation.to_column.clone(),
-                        unique_fks,
-                        false, // reached via forward -> forward-only from here
-                    ));
-                }
-            }
-        }
-
-        // Backward traversal: find tables that reference THIS table
-        // Only done when bidirectional=true (root or tables reached via backward)
-        // Tables reached via backward should continue bidirectional (follow ownership chain)
-        if bidirectional {
-            if let Some(relations) = self.relations_by_target.get(source_table).cloned() {
-                for relation in relations {
-                    // Extract PK/referenced column values from source rows
-                    let pk_values: Vec<MySqlValue> = rows
-                        .iter()
-                        .filter_map(|row| {
-                            row.get_opt::<MySqlValue, _>(relation.to_column.as_str())
-                                .and_then(|r| r.ok())
-                                .filter(|v| !matches!(v, MySqlValue::NULL))
-                        })
-                        .collect();
-
-                    if !pk_values.is_empty() {
-                        // Deduplicate values
-                        let unique_pks = self.dedupe_values(pk_values);
-                        // Look up the referencing table by its FK column
-                        queue.push_back((
-                            relation.from_table.clone(),
-                            relation.from_column.clone(),
-                            unique_pks,
-                            true, // reached via backward -> continue bidirectional
-                        ));
+                // Queue accumulated FK values
+                for ((to_table, to_column, via_backward), values) in fk_accumulator.drain() {
+                    let unique = dedupe_values(values);
+                    if !unique.is_empty() {
+                        queue.push_back((to_table, to_column, unique, via_backward));
                     }
                 }
             }
         }
 
-        Ok(())
+        // Send TableDone for all aggregate tables that had rows
+        for (table, row_count) in &table_row_counts {
+            write_message(
+                writer,
+                &ServerMessage::TableDone {
+                    table: table.clone(),
+                    row_count: *row_count,
+                },
+            )?;
+        }
+
+        Ok(aggregate_tables)
     }
 
-    /// Deduplicate MySQL values
-    fn dedupe_values(&self, values: Vec<MySqlValue>) -> Vec<MySqlValue> {
-        let mut seen = HashSet::new();
-        values
-            .into_iter()
-            .filter(|v| {
-                let bytes = self.serialize_pk(&[v.clone()]);
-                seen.insert(bytes)
-            })
-            .collect()
-    }
-
-    /// Query the root table with WHERE, ORDER BY, and LIMIT
-    fn query_root_table(&mut self, aggregate: &ResolvedAggregate) -> Result<Vec<Row>> {
+    /// Build the root table query string with WHERE, ORDER BY, and LIMIT
+    fn build_root_query(aggregate: &ResolvedAggregate) -> String {
         let mut query = format!("SELECT * FROM `{}`", aggregate.root_table);
 
         if let Some(where_clause) = &aggregate.where_clause {
@@ -538,137 +638,97 @@ impl<'a> DependencyTraverser<'a> {
             query.push_str(&format!(" LIMIT {}", limit));
         }
 
-        self.conn.query_rows(&query)
+        query
     }
 
-    /// Get primary key column names for a table
-    fn get_pk_columns(&mut self, table: &str) -> Result<Vec<String>> {
-        self.conn
-            .get_cached_primary_key(table)
-            .cloned()
-            .ok_or_else(|| ServerError::NotFound(format!("Primary key for table '{}'", table)))
-    }
+}
 
-    /// Extract primary key values from rows
-    fn extract_primary_keys(&mut self, table: &str, rows: &[Row]) -> Result<Vec<Vec<MySqlValue>>> {
-        let pk_columns = self.get_pk_columns(table)?;
-        let mut pks = Vec::with_capacity(rows.len());
+/// Deduplicate MySQL values
+fn dedupe_values(values: Vec<MySqlValue>) -> Vec<MySqlValue> {
+    let mut seen = HashSet::new();
+    values
+        .into_iter()
+        .filter(|v| {
+            let bytes = serialize_pk(&[v.clone()]);
+            seen.insert(bytes)
+        })
+        .collect()
+}
 
-        for row in rows {
-            let mut pk_values = Vec::with_capacity(pk_columns.len());
-            for col in &pk_columns {
-                let value: MySqlValue = row
-                    .get_opt(col as &str)
-                    .and_then(|r| r.ok())
-                    .unwrap_or(MySqlValue::NULL);
-                pk_values.push(value);
-            }
-            pks.push(pk_values);
-        }
-
-        Ok(pks)
-    }
-
-    /// Normalize a MySQL value to a canonical form for comparison
-    /// This handles the case where MySQL returns the same value as different types
-    /// (e.g., INT(1) vs Bytes("1") depending on the query)
-    fn normalize_value(&self, value: &MySqlValue) -> MySqlValue {
-        match value {
-            // Try to parse bytes as an integer if possible
-            MySqlValue::Bytes(b) => {
-                if let Ok(s) = std::str::from_utf8(b) {
-                    if let Ok(i) = s.parse::<i64>() {
-                        return MySqlValue::Int(i);
-                    }
-                    if let Ok(u) = s.parse::<u64>() {
-                        return MySqlValue::UInt(u);
-                    }
+/// Normalize a MySQL value to a canonical form for comparison
+/// This handles the case where MySQL returns the same value as different types
+/// (e.g., INT(1) vs Bytes("1") depending on the query)
+fn normalize_value(value: &MySqlValue) -> MySqlValue {
+    match value {
+        // Try to parse bytes as an integer if possible
+        MySqlValue::Bytes(b) => {
+            if let Ok(s) = std::str::from_utf8(b) {
+                if let Ok(i) = s.parse::<i64>() {
+                    return MySqlValue::Int(i);
                 }
-                value.clone()
-            }
-            // UInt can be normalized to Int if it fits
-            MySqlValue::UInt(u) if *u <= i64::MAX as u64 => MySqlValue::Int(*u as i64),
-            _ => value.clone(),
-        }
-    }
-
-    /// Serialize a primary key to bytes for deduplication
-    fn serialize_pk(&self, pk: &[MySqlValue]) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        for value in pk {
-            // Normalize value before serialization to handle type mismatches
-            let normalized = self.normalize_value(value);
-            match normalized {
-                MySqlValue::NULL => bytes.push(0),
-                MySqlValue::Int(i) => {
-                    bytes.push(1);
-                    bytes.extend_from_slice(&i.to_le_bytes());
-                }
-                MySqlValue::UInt(u) => {
-                    bytes.push(2);
-                    bytes.extend_from_slice(&u.to_le_bytes());
-                }
-                MySqlValue::Bytes(ref b) => {
-                    bytes.push(3);
-                    bytes.extend_from_slice(&(b.len() as u32).to_le_bytes());
-                    bytes.extend_from_slice(b);
-                }
-                MySqlValue::Float(f) => {
-                    bytes.push(4);
-                    bytes.extend_from_slice(&f.to_le_bytes());
-                }
-                MySqlValue::Double(d) => {
-                    bytes.push(5);
-                    bytes.extend_from_slice(&d.to_le_bytes());
-                }
-                MySqlValue::Date(y, m, d, h, mi, s, us) => {
-                    bytes.push(6);
-                    bytes.extend_from_slice(&y.to_le_bytes());
-                    bytes.push(m);
-                    bytes.push(d);
-                    bytes.push(h);
-                    bytes.push(mi);
-                    bytes.push(s);
-                    bytes.extend_from_slice(&us.to_le_bytes());
-                }
-                MySqlValue::Time(neg, d, h, m, s, us) => {
-                    bytes.push(7);
-                    bytes.push(if neg { 1 } else { 0 });
-                    bytes.extend_from_slice(&d.to_le_bytes());
-                    bytes.push(h);
-                    bytes.push(m);
-                    bytes.push(s);
-                    bytes.extend_from_slice(&us.to_le_bytes());
+                if let Ok(u) = s.parse::<u64>() {
+                    return MySqlValue::UInt(u);
                 }
             }
+            value.clone()
         }
-        bytes
+        // UInt can be normalized to Int if it fits
+        MySqlValue::UInt(u) if *u <= i64::MAX as u64 => MySqlValue::Int(*u as i64),
+        _ => value.clone(),
     }
+}
 
-    /// Fetch rows by column values (used for FK lookups)
-    fn fetch_by_column(
-        &mut self,
-        table: &str,
-        column: &str,
-        values: &[MySqlValue],
-    ) -> Result<Vec<Row>> {
-        if values.is_empty() {
-            return Ok(Vec::new());
+/// Serialize a primary key to bytes for deduplication
+fn serialize_pk(pk: &[MySqlValue]) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for value in pk {
+        // Normalize value before serialization to handle type mismatches
+        let normalized = normalize_value(value);
+        match normalized {
+            MySqlValue::NULL => bytes.push(0),
+            MySqlValue::Int(i) => {
+                bytes.push(1);
+                bytes.extend_from_slice(&i.to_le_bytes());
+            }
+            MySqlValue::UInt(u) => {
+                bytes.push(2);
+                bytes.extend_from_slice(&u.to_le_bytes());
+            }
+            MySqlValue::Bytes(ref b) => {
+                bytes.push(3);
+                bytes.extend_from_slice(&(b.len() as u32).to_le_bytes());
+                bytes.extend_from_slice(b);
+            }
+            MySqlValue::Float(f) => {
+                bytes.push(4);
+                bytes.extend_from_slice(&f.to_le_bytes());
+            }
+            MySqlValue::Double(d) => {
+                bytes.push(5);
+                bytes.extend_from_slice(&d.to_le_bytes());
+            }
+            MySqlValue::Date(y, m, d, h, mi, s, us) => {
+                bytes.push(6);
+                bytes.extend_from_slice(&y.to_le_bytes());
+                bytes.push(m);
+                bytes.push(d);
+                bytes.push(h);
+                bytes.push(mi);
+                bytes.push(s);
+                bytes.extend_from_slice(&us.to_le_bytes());
+            }
+            MySqlValue::Time(neg, d, h, m, s, us) => {
+                bytes.push(7);
+                bytes.push(if neg { 1 } else { 0 });
+                bytes.extend_from_slice(&d.to_le_bytes());
+                bytes.push(h);
+                bytes.push(m);
+                bytes.push(s);
+                bytes.extend_from_slice(&us.to_le_bytes());
+            }
         }
-
-        // Build IN clause
-        let placeholders: Vec<&str> = (0..values.len()).map(|_| "?").collect();
-        let query = format!(
-            "SELECT * FROM `{}` WHERE `{}` IN ({})",
-            table,
-            column,
-            placeholders.join(", ")
-        );
-
-        // Convert values to params
-        let params: Vec<MySqlValue> = values.to_vec();
-        self.conn.query_rows_with_params(&query, mysql::Params::Positional(params))
     }
+    bytes
 }
 
 /// Optionally compress data based on compression mode
