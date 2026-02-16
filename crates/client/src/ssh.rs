@@ -1,6 +1,5 @@
 //! SSH session management using russh
 
-use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -8,7 +7,10 @@ use async_trait::async_trait;
 use russh::client::{self, Config, Handle, Msg};
 use russh::keys::key::PublicKey;
 use russh::{Channel, ChannelMsg};
+use russh_sftp::client::SftpSession;
+use russh_sftp::protocol::OpenFlags;
 use sha2::{Digest, Sha256};
+use tokio::io::AsyncWriteExt;
 
 use crate::error::{ClientError, Result};
 
@@ -188,36 +190,42 @@ impl SshSession {
         Ok(code == 0)
     }
 
-    /// Upload a file to the remote host using base64 encoding
+    /// Upload a file to the remote host using SFTP
     pub async fn upload_file(&self, local_data: &[u8], remote_path: &str) -> Result<()> {
-        // Use base64 encoding for safe binary transfer
-        let encoded = base64_encode(local_data);
+        let channel = self
+            .handle
+            .channel_open_session()
+            .await
+            .map_err(|e| ClientError::Ssh(format!("Failed to open SFTP channel: {}", e)))?;
 
-        // Split into chunks to avoid command line length limits
-        const CHUNK_SIZE: usize = 32768;
-        let chunks: Vec<&str> = encoded
-            .as_bytes()
-            .chunks(CHUNK_SIZE)
-            .map(|c| std::str::from_utf8(c).unwrap())
-            .collect();
+        channel
+            .request_subsystem(true, "sftp")
+            .await
+            .map_err(|e| ClientError::Ssh(format!("Failed to request SFTP subsystem: {}", e)))?;
 
-        // Write first chunk (create/truncate file)
-        if let Some(first_chunk) = chunks.first() {
-            self.exec(&format!(
-                "echo '{}' | base64 -d > {}",
-                first_chunk, remote_path
-            ))
-            .await?;
-        }
+        let sftp = SftpSession::new(channel.into_stream())
+            .await
+            .map_err(|e| ClientError::Ssh(format!("Failed to init SFTP session: {}", e)))?;
 
-        // Append remaining chunks
-        for chunk in chunks.iter().skip(1) {
-            self.exec(&format!(
-                "echo '{}' | base64 -d >> {}",
-                chunk, remote_path
-            ))
-            .await?;
-        }
+        let mut file = sftp
+            .open_with_flags(
+                remote_path,
+                OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::WRITE,
+            )
+            .await
+            .map_err(|e| ClientError::Ssh(format!("Failed to open remote file: {}", e)))?;
+
+        file.write_all(local_data)
+            .await
+            .map_err(|e| ClientError::Ssh(format!("Failed to write remote file: {}", e)))?;
+
+        file.shutdown()
+            .await
+            .map_err(|e| ClientError::Ssh(format!("Failed to close remote file: {}", e)))?;
+
+        sftp.close()
+            .await
+            .map_err(|e| ClientError::Ssh(format!("Failed to close SFTP session: {}", e)))?;
 
         // Make executable
         self.exec(&format!("chmod +x {}", remote_path)).await?;
@@ -366,78 +374,3 @@ pub fn get_server_path(server_binary: &[u8]) -> String {
     format!("/tmp/jibs-{}", &hash[0..16])
 }
 
-/// Base64 encode data
-fn base64_encode(data: &[u8]) -> String {
-    let mut buf = Vec::new();
-    {
-        let mut encoder = Base64Encoder {
-            writer: &mut buf,
-            buffer: [0; 3],
-            count: 0,
-        };
-        encoder.write_all(data).unwrap();
-    }
-    String::from_utf8(buf).unwrap()
-}
-
-struct Base64Encoder<W: Write> {
-    writer: W,
-    buffer: [u8; 3],
-    count: usize,
-}
-
-impl<W: Write> Write for Base64Encoder<W> {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        const ALPHABET: &[u8] =
-            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-        for &byte in buf {
-            self.buffer[self.count] = byte;
-            self.count += 1;
-
-            if self.count == 3 {
-                let out = [
-                    ALPHABET[(self.buffer[0] >> 2) as usize],
-                    ALPHABET[(((self.buffer[0] & 0x03) << 4) | (self.buffer[1] >> 4)) as usize],
-                    ALPHABET[(((self.buffer[1] & 0x0f) << 2) | (self.buffer[2] >> 6)) as usize],
-                    ALPHABET[(self.buffer[2] & 0x3f) as usize],
-                ];
-                self.writer.write_all(&out)?;
-                self.count = 0;
-            }
-        }
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        const ALPHABET: &[u8] =
-            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-        if self.count > 0 {
-            let out = match self.count {
-                1 => [
-                    ALPHABET[(self.buffer[0] >> 2) as usize],
-                    ALPHABET[((self.buffer[0] & 0x03) << 4) as usize],
-                    b'=',
-                    b'=',
-                ],
-                2 => [
-                    ALPHABET[(self.buffer[0] >> 2) as usize],
-                    ALPHABET[(((self.buffer[0] & 0x03) << 4) | (self.buffer[1] >> 4)) as usize],
-                    ALPHABET[((self.buffer[1] & 0x0f) << 2) as usize],
-                    b'=',
-                ],
-                _ => unreachable!(),
-            };
-            self.writer.write_all(&out)?;
-            self.count = 0;
-        }
-        self.writer.flush()
-    }
-}
-
-impl<W: Write> Drop for Base64Encoder<W> {
-    fn drop(&mut self) {
-        let _ = self.flush();
-    }
-}
