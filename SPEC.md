@@ -53,6 +53,10 @@ var <name>: <type> = <default_value>
 | `int` | Integer number | `100`, `-5`, `0` |
 | `bool` | Boolean | `true`, `false` |
 | `float` | Floating point | `3.14`, `-0.5` |
+| `string[]` | Array of strings | `["a", "b", "c"]` |
+| `int[]` | Array of integers | `[1, 2, 3]` |
+| `bool[]` | Array of booleans | `[true, false]` |
+| `float[]` | Array of floats | `[1.5, 2.5]` |
 
 ### Examples
 
@@ -65,6 +69,12 @@ var admin_email: string = "admin@local.test"
 var debug_mode: bool = false
 var order_limit: int = 100
 var tax_rate: float = 0.21
+
+// Array variables
+var test_emails: string[] = ["user1@test.com", "user2@test.com", "user3@test.com"]
+var allowed_ids: int[] = [1, 2, 3, 4, 5]
+var feature_flags: bool[] = [true, false, true]
+var discount_rates: float[] = [0.1, 0.15, 0.2]
 ```
 
 ### Usage
@@ -324,10 +334,17 @@ Define lists of fake data to use for anonymization.
 ### Syntax
 
 ```
+// Inline array of values
 faker <name> [<value1>, <value2>, ...]
+
+// Using a string[] variable directly
+faker <name> $<variable>
+
+// Using spread operator to combine values
+faker <name> [...$<variable>, <value>, ...]
 ```
 
-### Examples
+### Basic Examples
 
 ```
 faker names ["John", "Jane", "Bob", "Alice", "Charlie", "Diana"]
@@ -338,11 +355,42 @@ faker cities ["Amsterdam", "Rotterdam", "Utrecht", "Den Haag"]
 faker companies ["Acme Corp", "Globex Inc", "Initech", "Umbrella Co"]
 ```
 
+### Using Variables
+
+You can define faker values in a `string[]` variable and reference it directly:
+
+```
+// Define the values in a variable
+var base_emails: string[] = ["admin@test.com", "user@test.com", "support@test.com"]
+
+// Use the variable directly as faker source
+faker emails $base_emails
+```
+
+### Spread Operator
+
+The spread operator (`...`) allows combining values from variables with inline values:
+
+```
+var team_emails: string[] = ["alice@company.com", "bob@company.com"]
+var support_emails: string[] = ["help@company.com", "info@company.com"]
+
+// Combine variable values with inline values
+faker all_emails [...$team_emails, "extra@test.com", "backup@test.com"]
+
+// Combine multiple variables
+faker combined_emails [...$team_emails, ...$support_emails]
+
+// Mix spreads and inline values
+faker mixed [...$team_emails, "inline@test.com", ...$support_emails, "another@test.com"]
+```
+
 ### Behavior
 
 - Values are selected deterministically based on a hash of the original value
 - The same input always produces the same fake output (for referential consistency)
 - The list wraps around if there are more unique values than faker entries
+- Spread operator only works with `string[]` variables
 
 ---
 
@@ -1158,7 +1206,14 @@ after {
 ```
 // Shared anonymization rules for Magento
 
-faker names ["John", "Jane", "Bob", "Alice", "Charlie", "Diana", "Eve", "Frank"]
+// Array variables for reusable faker data
+var base_names: string[] = ["John", "Jane", "Bob", "Alice"]
+var extra_names: string[] = ["Charlie", "Diana", "Eve", "Frank"]
+
+// Using spread operator to combine arrays
+faker names [...$base_names, ...$extra_names]
+
+// Direct inline array
 faker emails ["user1@example.test", "user2@example.test", "user3@example.test"]
 faker phones ["+31600000001", "+31600000002", "+31600000003"]
 faker streets ["123 Main St", "456 Oak Ave", "789 Pine Rd", "321 Elm Blvd"]

@@ -1210,9 +1210,34 @@ fn value_to_sql(value: &Value) -> String {
             let escaped = s.replace('\'', "''");
             format!("'{}'", escaped)
         }
+        Value::StringArray(arr) => {
+            // Convert array to comma-separated quoted strings
+            arr.iter()
+                .map(|s| {
+                    let escaped = s.replace('\'', "''");
+                    format!("'{}'", escaped)
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
         Value::Int(i) => i.to_string(),
+        Value::IntArray(arr) => arr
+            .iter()
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(", "),
         Value::Float(f) => f.to_string(),
+        Value::FloatArray(arr) => arr
+            .iter()
+            .map(|f| f.to_string())
+            .collect::<Vec<_>>()
+            .join(", "),
         Value::Bool(b) => if *b { "1" } else { "0" }.to_string(),
+        Value::BoolArray(arr) => arr
+            .iter()
+            .map(|b| if *b { "1" } else { "0" })
+            .collect::<Vec<_>>()
+            .join(", "),
         Value::Null => "NULL".to_string(),
     }
 }

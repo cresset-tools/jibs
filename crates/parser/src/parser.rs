@@ -116,32 +116,66 @@ fn var_type<'tokens, 'src: 'tokens, I>(
 where
     I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
 {
+    // Array types must come before scalar types
+    let array_suffix = just(Token::LBracket).then_ignore(just(Token::RBracket));
+
     choice((
+        just(Token::TypeString)
+            .then_ignore(array_suffix.clone())
+            .to(VarType::StringArray),
         just(Token::TypeString).to(VarType::String),
+        just(Token::TypeInt)
+            .then_ignore(array_suffix.clone())
+            .to(VarType::IntArray),
         just(Token::TypeInt).to(VarType::Int),
+        just(Token::TypeFloat)
+            .then_ignore(array_suffix.clone())
+            .to(VarType::FloatArray),
         just(Token::TypeFloat).to(VarType::Float),
+        just(Token::TypeBool)
+            .then_ignore(array_suffix)
+            .to(VarType::BoolArray),
         just(Token::TypeBool).to(VarType::Bool),
     ))
     .map_with(|t, e| (t, e.span()))
 }
 
-/// Parse: faker name ["value1", "value2"]
+/// Parse: faker name ["value1", "value2", ...$var] or faker name $variable
 fn faker_parser<'tokens, 'src: 'tokens, I>(
 ) -> impl Parser<'tokens, I, StatementKind<'src>, extra::Err<Rich<'tokens, Token<'src>, Span>>> + Clone
 where
     I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
 {
+    // A faker value is either a string literal or a spread variable
+    let spread_var = just(Token::Spread)
+        .ignore_then(just(Token::Dollar))
+        .ignore_then(ident_raw())
+        .map(FakerValue::Spread);
+
+    let string_val = string_literal()
+        .map(|(lit, _)| FakerValue::Literal(lit));
+
+    let faker_value = spread_var.or(string_val)
+        .map_with(|v, e| (v, e.span()));
+
+    // Array syntax: ["a", "b", ...$var]
+    let array_source = faker_value
+        .separated_by(just(Token::Comma))
+        .allow_trailing()
+        .collect()
+        .delimited_by(just(Token::LBracket), just(Token::RBracket))
+        .map(FakerSource::Array);
+
+    // Direct variable syntax: $variable
+    let var_source = just(Token::Dollar)
+        .ignore_then(ident_raw())
+        .map(FakerSource::Variable);
+
     just(Token::Faker)
         .ignore_then(ident())
-        .then(
-            string_literal()
-                .separated_by(just(Token::Comma))
-                .allow_trailing()
-                .collect()
-                .delimited_by(just(Token::LBracket), just(Token::RBracket))
-        )
-        .map(|(name, values)| {
-            StatementKind::Faker(FakerDecl { name, values })
+        .then(array_source.or(var_source))
+        .map(|(name, source)| {
+            StatementKind::Faker(FakerDecl { name, source })
         })
 }
 
@@ -529,7 +563,43 @@ fn literal<'tokens, 'src: 'tokens, I>(
 where
     I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
 {
+    // String array literal: ["a", "b", "c"]
+    let string_array = string_literal()
+        .separated_by(just(Token::Comma))
+        .allow_trailing()
+        .collect()
+        .delimited_by(just(Token::LBracket), just(Token::RBracket))
+        .map(Literal::StringArray);
+
+    // Int array literal: [1, 2, 3]
+    let int_array = select! { Token::Int(n) => n }
+        .separated_by(just(Token::Comma))
+        .allow_trailing()
+        .collect()
+        .delimited_by(just(Token::LBracket), just(Token::RBracket))
+        .map(Literal::IntArray);
+
+    // Float array literal: [1.0, 2.5, 3.14]
+    let float_array = select! { Token::Float(n) => n }
+        .separated_by(just(Token::Comma))
+        .allow_trailing()
+        .collect()
+        .delimited_by(just(Token::LBracket), just(Token::RBracket))
+        .map(Literal::FloatArray);
+
+    // Bool array literal: [true, false, true]
+    let bool_array = select! { Token::Bool(b) => b }
+        .separated_by(just(Token::Comma))
+        .allow_trailing()
+        .collect()
+        .delimited_by(just(Token::LBracket), just(Token::RBracket))
+        .map(Literal::BoolArray);
+
     choice((
+        string_array,
+        int_array,
+        float_array,
+        bool_array,
         select! { Token::String(s) => Literal::String(StringLiteral { parts: vec![StringPart::Text(s)] }) },
         select! { Token::Int(n) => Literal::Int(n) },
         select! { Token::Float(n) => Literal::Float(n) },
@@ -617,7 +687,10 @@ mod tests {
         match &program.statements[0].0.kind {
             StatementKind::Faker(decl) => {
                 assert_eq!(decl.name.0, "names");
-                assert_eq!(decl.values.len(), 3);
+                match &decl.source {
+                    FakerSource::Array(values) => assert_eq!(values.len(), 3),
+                    _ => panic!("Expected Array source"),
+                }
             }
             _ => panic!("Expected Faker"),
         }
@@ -870,6 +943,221 @@ mod tests {
                 }
             }
             _ => panic!("Expected Set"),
+        }
+    }
+
+    #[test]
+    fn test_string_array_var() {
+        let program = parse(r#"var emails: string[] = ["a@test.com", "b@test.com"]"#);
+        assert_eq!(program.statements.len(), 1);
+        match &program.statements[0].0.kind {
+            StatementKind::Var(decl) => {
+                assert_eq!(decl.name.0, "emails");
+                assert_eq!(decl.var_type.0, VarType::StringArray);
+                match &decl.default {
+                    Some((Literal::StringArray(arr), _)) => {
+                        assert_eq!(arr.len(), 2);
+                    }
+                    _ => panic!("Expected StringArray literal"),
+                }
+            }
+            _ => panic!("Expected Var"),
+        }
+    }
+
+    #[test]
+    fn test_string_array_var_no_default() {
+        let program = parse("var emails: string[]");
+        assert_eq!(program.statements.len(), 1);
+        match &program.statements[0].0.kind {
+            StatementKind::Var(decl) => {
+                assert_eq!(decl.name.0, "emails");
+                assert_eq!(decl.var_type.0, VarType::StringArray);
+                assert!(decl.default.is_none());
+            }
+            _ => panic!("Expected Var"),
+        }
+    }
+
+    #[test]
+    fn test_faker_with_spread() {
+        let program = parse(r#"faker combined [...$base_emails, "extra@test.com"]"#);
+        assert_eq!(program.statements.len(), 1);
+        match &program.statements[0].0.kind {
+            StatementKind::Faker(decl) => {
+                assert_eq!(decl.name.0, "combined");
+                match &decl.source {
+                    FakerSource::Array(values) => {
+                        assert_eq!(values.len(), 2);
+                        match &values[0].0 {
+                            FakerValue::Spread(var) => assert_eq!(*var, "base_emails"),
+                            _ => panic!("Expected Spread"),
+                        }
+                        match &values[1].0 {
+                            FakerValue::Literal(_) => {}
+                            _ => panic!("Expected Literal"),
+                        }
+                    }
+                    _ => panic!("Expected Array source"),
+                }
+            }
+            _ => panic!("Expected Faker"),
+        }
+    }
+
+    #[test]
+    fn test_faker_spread_only() {
+        let program = parse(r#"faker emails [...$input_emails]"#);
+        assert_eq!(program.statements.len(), 1);
+        match &program.statements[0].0.kind {
+            StatementKind::Faker(decl) => {
+                assert_eq!(decl.name.0, "emails");
+                match &decl.source {
+                    FakerSource::Array(values) => {
+                        assert_eq!(values.len(), 1);
+                        match &values[0].0 {
+                            FakerValue::Spread(var) => assert_eq!(*var, "input_emails"),
+                            _ => panic!("Expected Spread"),
+                        }
+                    }
+                    _ => panic!("Expected Array source"),
+                }
+            }
+            _ => panic!("Expected Faker"),
+        }
+    }
+
+    #[test]
+    fn test_faker_multiple_spreads() {
+        let program = parse(r#"faker all_emails [...$emails1, ...$emails2, "extra@test.com"]"#);
+        assert_eq!(program.statements.len(), 1);
+        match &program.statements[0].0.kind {
+            StatementKind::Faker(decl) => {
+                assert_eq!(decl.name.0, "all_emails");
+                match &decl.source {
+                    FakerSource::Array(values) => {
+                        assert_eq!(values.len(), 3);
+                        match &values[0].0 {
+                            FakerValue::Spread(var) => assert_eq!(*var, "emails1"),
+                            _ => panic!("Expected Spread"),
+                        }
+                        match &values[1].0 {
+                            FakerValue::Spread(var) => assert_eq!(*var, "emails2"),
+                            _ => panic!("Expected Spread"),
+                        }
+                        match &values[2].0 {
+                            FakerValue::Literal(_) => {}
+                            _ => panic!("Expected Literal"),
+                        }
+                    }
+                    _ => panic!("Expected Array source"),
+                }
+            }
+            _ => panic!("Expected Faker"),
+        }
+    }
+
+    #[test]
+    fn test_faker_variable_source() {
+        let program = parse("faker emails $input_emails");
+        assert_eq!(program.statements.len(), 1);
+        match &program.statements[0].0.kind {
+            StatementKind::Faker(decl) => {
+                assert_eq!(decl.name.0, "emails");
+                match &decl.source {
+                    FakerSource::Variable(var) => assert_eq!(*var, "input_emails"),
+                    _ => panic!("Expected Variable source"),
+                }
+            }
+            _ => panic!("Expected Faker"),
+        }
+    }
+
+    #[test]
+    fn test_int_array_var() {
+        let program = parse("var ids: int[] = [1, 2, 3]");
+        assert_eq!(program.statements.len(), 1);
+        match &program.statements[0].0.kind {
+            StatementKind::Var(decl) => {
+                assert_eq!(decl.name.0, "ids");
+                assert_eq!(decl.var_type.0, VarType::IntArray);
+                match &decl.default {
+                    Some((Literal::IntArray(arr), _)) => {
+                        assert_eq!(*arr, vec![1, 2, 3]);
+                    }
+                    _ => panic!("Expected IntArray literal"),
+                }
+            }
+            _ => panic!("Expected Var"),
+        }
+    }
+
+    #[test]
+    fn test_float_array_var() {
+        let program = parse("var prices: float[] = [1.5, 2.75, 3.14]");
+        assert_eq!(program.statements.len(), 1);
+        match &program.statements[0].0.kind {
+            StatementKind::Var(decl) => {
+                assert_eq!(decl.name.0, "prices");
+                assert_eq!(decl.var_type.0, VarType::FloatArray);
+                match &decl.default {
+                    Some((Literal::FloatArray(arr), _)) => {
+                        assert_eq!(arr.len(), 3);
+                        assert!((arr[0] - 1.5).abs() < 0.001);
+                        assert!((arr[1] - 2.75).abs() < 0.001);
+                        assert!((arr[2] - 3.14).abs() < 0.001);
+                    }
+                    _ => panic!("Expected FloatArray literal"),
+                }
+            }
+            _ => panic!("Expected Var"),
+        }
+    }
+
+    #[test]
+    fn test_bool_array_var() {
+        let program = parse("var flags: bool[] = [true, false, true]");
+        assert_eq!(program.statements.len(), 1);
+        match &program.statements[0].0.kind {
+            StatementKind::Var(decl) => {
+                assert_eq!(decl.name.0, "flags");
+                assert_eq!(decl.var_type.0, VarType::BoolArray);
+                match &decl.default {
+                    Some((Literal::BoolArray(arr), _)) => {
+                        assert_eq!(*arr, vec![true, false, true]);
+                    }
+                    _ => panic!("Expected BoolArray literal"),
+                }
+            }
+            _ => panic!("Expected Var"),
+        }
+    }
+
+    #[test]
+    fn test_array_types_no_default() {
+        let program = parse("var a: int[]\nvar b: float[]\nvar c: bool[]");
+        assert_eq!(program.statements.len(), 3);
+
+        match &program.statements[0].0.kind {
+            StatementKind::Var(decl) => {
+                assert_eq!(decl.var_type.0, VarType::IntArray);
+                assert!(decl.default.is_none());
+            }
+            _ => panic!("Expected Var"),
+        }
+        match &program.statements[1].0.kind {
+            StatementKind::Var(decl) => {
+                assert_eq!(decl.var_type.0, VarType::FloatArray);
+                assert!(decl.default.is_none());
+            }
+            _ => panic!("Expected Var"),
+        }
+        match &program.statements[2].0.kind {
+            StatementKind::Var(decl) => {
+                assert_eq!(decl.var_type.0, VarType::BoolArray);
+                assert!(decl.default.is_none());
+            }
+            _ => panic!("Expected Var"),
         }
     }
 }
