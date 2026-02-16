@@ -90,8 +90,8 @@ struct ConnectionArgs {
 
 #[derive(Args)]
 struct ImportArgs {
-    /// Path to the .jibs configuration file
-    config: PathBuf,
+    /// Path to the .jibs configuration file (optional - imports all tables if not provided)
+    config: Option<PathBuf>,
 
     #[command(flatten)]
     connection: ConnectionArgs,
@@ -181,7 +181,7 @@ async fn run_import(args: ImportArgs) -> Result<()> {
     };
 
     let config = ImportConfig {
-        config_path: args.config,
+        config_path: args.config, // None = import all tables
         remote_host: args.connection.host,
         remote_mysql: args.connection.remote_mysql,
         local_mysql: args.connection.local_mysql,
@@ -216,7 +216,7 @@ async fn run_get(args: GetArgs) -> Result<()> {
     };
 
     let config = ImportConfig {
-        config_path: args.config,
+        config_path: Some(args.config), // Required for `get` command
         remote_host: args.connection.host,
         remote_mysql: args.connection.remote_mysql,
         local_mysql: args.connection.local_mysql,

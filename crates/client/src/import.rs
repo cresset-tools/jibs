@@ -195,7 +195,8 @@ fn load_tsv_data_with_conn(
 
 /// Configuration for an import operation
 pub struct ImportConfig {
-    pub config_path: PathBuf,
+    /// Path to the .jibs configuration file (None = import all tables)
+    pub config_path: Option<PathBuf>,
     pub remote_host: String,
     pub remote_mysql: String,
     pub local_mysql: String,
@@ -219,35 +220,42 @@ pub struct ImportConfig {
 pub async fn run_import(config: ImportConfig) -> Result<()> {
     info!("Starting import from {}", config.remote_host);
 
-    // Parse the .jibs file
-    let source = std::fs::read_to_string(&config.config_path)?;
-    let program = jibs_parser::parse(&source).map_err(|errors| {
-        anyhow::anyhow!(
-            "Parse failed: {}",
-            errors
-                .iter()
-                .map(|e| e.to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
-    })?;
+    // Create execution plan - either from config file or empty (import all tables)
+    let mut plan = if let Some(config_path) = &config.config_path {
+        // Parse the .jibs file
+        let source = std::fs::read_to_string(config_path)?;
+        let program = jibs_parser::parse(&source).map_err(|errors| {
+            anyhow::anyhow!(
+                "Parse failed: {}",
+                errors
+                    .iter()
+                    .map(|e| e.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })?;
 
-    // Load additional variables from file if specified
-    let mut vars = config.vars.clone();
-    if let Some(var_file) = &config.var_file {
-        let content = std::fs::read_to_string(var_file)?;
-        let file_vars: HashMap<String, serde_json::Value> = serde_json::from_str(&content)?;
-        for (k, v) in file_vars {
-            vars.entry(k).or_insert_with(|| match v {
-                serde_json::Value::String(s) => s,
-                other => other.to_string(),
-            });
+        // Load additional variables from file if specified
+        let mut vars = config.vars.clone();
+        if let Some(var_file) = &config.var_file {
+            let content = std::fs::read_to_string(var_file)?;
+            let file_vars: HashMap<String, serde_json::Value> = serde_json::from_str(&content)?;
+            for (k, v) in file_vars {
+                vars.entry(k).or_insert_with(|| match v {
+                    serde_json::Value::String(s) => s,
+                    other => other.to_string(),
+                });
+            }
         }
-    }
 
-    // Resolve the execution plan
-    let mut plan = resolver::resolve(&config.config_path, &program, &vars)
-        .map_err(|e| anyhow::anyhow!("Resolution failed: {}", e))?;
+        // Resolve the execution plan
+        resolver::resolve(config_path, &program, &vars)
+            .map_err(|e| anyhow::anyhow!("Resolution failed: {}", e))?
+    } else {
+        // No config file - import all tables
+        info!("No config file specified, importing all tables");
+        ExecutionPlan::default()
+    };
 
     // Apply aggregate overrides if this is a `get` command
     if let Some(overrides) = &config.aggregate_overrides {
