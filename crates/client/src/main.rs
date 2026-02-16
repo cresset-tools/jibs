@@ -87,6 +87,22 @@ struct ConnectionArgs {
     /// SSH port (default: 22)
     #[arg(long, default_value = "22")]
     port: u16,
+
+    /// Strict host key checking: reject unknown host keys
+    #[arg(long, conflicts_with_all = ["accept_new_host_keys", "no_host_key_checking"])]
+    strict_host_key_checking: bool,
+
+    /// Automatically accept and save new host keys (but reject mismatches)
+    #[arg(long, conflicts_with_all = ["strict_host_key_checking", "no_host_key_checking"])]
+    accept_new_host_keys: bool,
+
+    /// Disable host key checking entirely (insecure, not recommended)
+    #[arg(long, conflicts_with_all = ["strict_host_key_checking", "accept_new_host_keys"])]
+    no_host_key_checking: bool,
+
+    /// Maximum message size in bytes (default: 100MB)
+    #[arg(long, default_value = "104857600")]
+    max_message_size: usize,
 }
 
 #[derive(Args)]
@@ -153,6 +169,19 @@ fn parse_var(s: &str) -> Result<(String, String), String> {
     Ok((parts[0].to_string(), parts[1].to_string()))
 }
 
+/// Determine host key verification mode from CLI args
+fn get_host_key_verification(args: &ConnectionArgs) -> ssh::HostKeyVerification {
+    if args.no_host_key_checking {
+        ssh::HostKeyVerification::AcceptAll
+    } else if args.strict_host_key_checking {
+        ssh::HostKeyVerification::Strict
+    } else if args.accept_new_host_keys {
+        ssh::HostKeyVerification::AcceptNew
+    } else {
+        ssh::HostKeyVerification::WarnUnknown
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize logging
@@ -181,6 +210,8 @@ async fn run_import(args: ImportArgs) -> Result<()> {
         CompressionMode::Auto
     };
 
+    let host_key_verification = get_host_key_verification(&args.connection);
+
     let config = ImportConfig {
         config_path: args.config, // None = import all tables
         remote_host: args.connection.host,
@@ -195,6 +226,8 @@ async fn run_import(args: ImportArgs) -> Result<()> {
         identity_file: args.connection.identity,
         ssh_port: args.connection.port,
         aggregate_overrides: None,
+        host_key_verification,
+        max_message_size: args.connection.max_message_size,
         #[cfg(feature = "test-utils")]
         fail_after_tables: args.fail_after_tables,
     };
@@ -216,6 +249,8 @@ async fn run_get(args: GetArgs) -> Result<()> {
         CompressionMode::Auto
     };
 
+    let host_key_verification = get_host_key_verification(&args.connection);
+
     let config = ImportConfig {
         config_path: Some(args.config), // Required for `get` command
         remote_host: args.connection.host,
@@ -230,6 +265,8 @@ async fn run_get(args: GetArgs) -> Result<()> {
         identity_file: args.connection.identity,
         ssh_port: args.connection.port,
         aggregate_overrides: Some(aggregate_overrides),
+        host_key_verification,
+        max_message_size: args.connection.max_message_size,
         #[cfg(feature = "test-utils")]
         fail_after_tables: None,
     };

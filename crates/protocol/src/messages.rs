@@ -9,6 +9,12 @@ use crate::plan::{ColumnDef, CompressionMode, ExecutionPlan, TableInfo};
 #[derive(Debug, Clone, Encode, Decode)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum ClientMessage {
+    /// Credentials message - sent before Init to provide MySQL connection URL
+    /// This is sent separately to avoid exposing credentials in process listings
+    Credentials {
+        /// MySQL connection URL for the remote database
+        mysql_url: String,
+    },
     /// Initial handshake with full execution plan
     Init {
         plan: ExecutionPlan,

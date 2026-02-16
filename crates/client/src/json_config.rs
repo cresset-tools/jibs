@@ -19,8 +19,10 @@ pub fn parse_json_config(
     config_path: &Path,
     cli_vars: &HashMap<String, String>,
 ) -> Result<ExecutionPlan> {
-    let content = std::fs::read_to_string(config_path)
-        .map_err(|e| ClientError::Io(format!("Cannot read config '{}': {}", config_path.display(), e)))?;
+    let content = std::fs::read_to_string(config_path).map_err(|e| ClientError::Io {
+        operation: format!("read config '{}'", config_path.display()),
+        message: e.to_string(),
+    })?;
 
     let config: JsonConfig = serde_json::from_str(&content)
         .map_err(|e| ClientError::Parse(format!("Invalid JSON config: {}", e)))?;
@@ -301,8 +303,9 @@ impl JsonResolver {
         let base_dir = self.base_path.parent().unwrap_or(Path::new("."));
         let import_file = base_dir.join(import_path);
 
-        let canonical_path = import_file.canonicalize().map_err(|e| {
-            ClientError::Io(format!("Cannot resolve import path '{}': {}", import_path, e))
+        let canonical_path = import_file.canonicalize().map_err(|e| ClientError::Io {
+            operation: format!("resolve import path '{}'", import_path),
+            message: e.to_string(),
         })?;
 
         if self.imported_files.contains(&canonical_path) {
@@ -310,8 +313,9 @@ impl JsonResolver {
         }
         self.imported_files.insert(canonical_path.clone());
 
-        let content = std::fs::read_to_string(&canonical_path).map_err(|e| {
-            ClientError::Io(format!("Cannot read import '{}': {}", import_path, e))
+        let content = std::fs::read_to_string(&canonical_path).map_err(|e| ClientError::Io {
+            operation: format!("read import '{}'", import_path),
+            message: e.to_string(),
         })?;
 
         // Determine if JSON or jibs based on extension

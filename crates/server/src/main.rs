@@ -43,8 +43,9 @@ fn main() {
         eprintln!("    -V, --version    Print version information");
         eprintln!("    --echo           Echo mode: read Init, print plan summary, exit");
         eprintln!();
-        eprintln!("ENVIRONMENT:");
-        eprintln!("    JIBS_MYSQL_URL   MySQL connection URL (default: mysql://root@localhost:3306)");
+        eprintln!("CREDENTIALS:");
+        eprintln!("    MySQL credentials are received via the protocol (Credentials message).");
+        eprintln!("    Fallback: JIBS_MYSQL_URL environment variable (for backward compatibility).");
         return;
     }
 
@@ -98,8 +99,27 @@ fn run() -> Result<()> {
     let mut reader = BufReader::new(stdin.lock());
     let mut writer = BufWriter::new(stdout.lock());
 
-    // Read initial message
-    let init_msg: ClientMessage = read_message(&mut reader)?;
+    // Read first message - could be Credentials or Init (backward compatibility)
+    let first_msg: ClientMessage = read_message(&mut reader)?;
+
+    let (mysql_url, init_msg) = match first_msg {
+        ClientMessage::Credentials { mysql_url } => {
+            // New protocol: Credentials followed by Init
+            let init_msg: ClientMessage = read_message(&mut reader)?;
+            (mysql_url, init_msg)
+        }
+        init @ ClientMessage::Init { .. } => {
+            // Backward compatibility: Init without Credentials, use env var
+            let mysql_url = std::env::var("JIBS_MYSQL_URL")
+                .unwrap_or_else(|_| "mysql://root@localhost:3306".to_string());
+            (mysql_url, init)
+        }
+        _ => {
+            return Err(ServerError::Protocol(
+                "Expected Credentials or Init message".to_string(),
+            ));
+        }
+    };
 
     let (plan, client_compression) = match init_msg {
         ClientMessage::Init { plan, compression } => (plan, compression),
@@ -110,10 +130,7 @@ fn run() -> Result<()> {
         }
     };
 
-    // Connect to MySQL (using environment variables for credentials)
-    let mysql_url = std::env::var("JIBS_MYSQL_URL")
-        .unwrap_or_else(|_| "mysql://root@localhost:3306".to_string());
-
+    // Connect to MySQL using credentials received via protocol
     let mut conn = MySqlConnection::connect(&mysql_url)?;
 
     // Discover tables and build table info
