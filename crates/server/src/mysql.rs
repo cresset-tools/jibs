@@ -183,22 +183,9 @@ impl MySqlConnection {
         Ok(columns)
     }
 
-    /// Get cached schema for a table
-    #[allow(dead_code)]
-    pub fn get_schema(&self, table: &str) -> Option<&Vec<ColumnDef>> {
-        self.schemas.get(table)
-    }
-
     /// Get cached primary key for a table
-    #[allow(dead_code)]
     pub fn get_cached_primary_key(&self, table: &str) -> Option<&Vec<String>> {
         self.primary_keys.get(table)
-    }
-
-    /// Execute a query and return rows
-    #[allow(dead_code)]
-    pub fn query_rows(&mut self, query: &str) -> Result<Vec<Row>> {
-        Ok(self.conn.query(query)?)
     }
 
     /// Execute a query and return a streaming iterator over rows.
@@ -218,31 +205,6 @@ impl MySqlConnection {
         params: P,
     ) -> Result<mysql::QueryResult<'_, '_, '_, mysql::Binary>> {
         Ok(self.conn.exec_iter(query, params)?)
-    }
-
-    /// Execute a parameterized query and return rows
-    #[allow(dead_code)]
-    pub fn query_rows_with_params<P: Into<mysql::Params>>(
-        &mut self,
-        query: &str,
-        params: P,
-    ) -> Result<Vec<Row>> {
-        Ok(self.conn.exec(query, params)?)
-    }
-
-    /// Get a value from a row, handling NULL appropriately
-    #[allow(dead_code)]
-    pub fn get_row_value(row: &Row, column: &str) -> Option<MySqlValue> {
-        row.get_opt(column).and_then(|r| r.ok())
-    }
-
-    /// Get columns for a row
-    #[allow(dead_code)]
-    pub fn get_row_columns(row: &Row) -> Vec<String> {
-        row.columns()
-            .iter()
-            .map(|c| c.name_str().to_string())
-            .collect()
     }
 }
 

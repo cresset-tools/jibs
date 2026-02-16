@@ -31,6 +31,12 @@ struct LoadWork {
     result_tx: std::sync::mpsc::Sender<Result<u64>>,
 }
 
+/// Worker initialization result
+enum WorkerInitResult {
+    Ready,
+    Failed(String),
+}
+
 /// Pool of loader workers for parallel data loading
 struct LoaderPool {
     work_tx: std::sync::mpsc::Sender<LoadWork>,
@@ -39,23 +45,29 @@ struct LoaderPool {
 
 impl LoaderPool {
     /// Create a new loader pool with N workers
+    /// Returns an error if any worker fails to initialize
     fn new(mysql_url: &str, num_workers: usize) -> Result<Self> {
         // Use std sync channel for thread workers
         let (work_tx, work_rx) = std::sync::mpsc::channel::<LoadWork>();
         let work_rx = Arc::new(std::sync::Mutex::new(work_rx));
+
+        // Channel for workers to report initialization status
+        let (init_tx, init_rx) = std::sync::mpsc::channel::<(usize, WorkerInitResult)>();
 
         let mut worker_handles = Vec::with_capacity(num_workers);
 
         for worker_id in 0..num_workers {
             let url = mysql_url.to_string();
             let rx = Arc::clone(&work_rx);
+            let init_reporter = init_tx.clone();
 
             let handle = std::thread::spawn(move || {
                 // Connect to MySQL
                 let opts = match Opts::from_url(&url) {
                     Ok(o) => o,
                     Err(e) => {
-                        tracing::error!("Worker {} invalid URL: {}", worker_id, e);
+                        let msg = format!("Invalid MySQL URL: {}", e);
+                        let _ = init_reporter.send((worker_id, WorkerInitResult::Failed(msg)));
                         return;
                     }
                 };
@@ -63,21 +75,26 @@ impl LoaderPool {
                 let mut conn = match Conn::new(opts) {
                     Ok(c) => c,
                     Err(e) => {
-                        tracing::error!("Worker {} failed to connect: {}", worker_id, e);
+                        let msg = format!("Failed to connect: {}", e);
+                        let _ = init_reporter.send((worker_id, WorkerInitResult::Failed(msg)));
                         return;
                     }
                 };
 
                 // Disable FK checks for this connection
                 if let Err(e) = conn.query_drop("SET FOREIGN_KEY_CHECKS = 0") {
-                    tracing::error!("Worker {} failed to disable FK checks: {}", worker_id, e);
+                    let msg = format!("Failed to disable FK checks: {}", e);
+                    let _ = init_reporter.send((worker_id, WorkerInitResult::Failed(msg)));
                     return;
                 }
                 if let Err(e) = conn.query_drop("SET UNIQUE_CHECKS = 0") {
-                    tracing::error!("Worker {} failed to disable unique checks: {}", worker_id, e);
+                    let msg = format!("Failed to disable unique checks: {}", e);
+                    let _ = init_reporter.send((worker_id, WorkerInitResult::Failed(msg)));
                     return;
                 }
 
+                // Report successful initialization
+                let _ = init_reporter.send((worker_id, WorkerInitResult::Ready));
                 debug!("Loader worker {} connected", worker_id);
 
                 // Process work items
@@ -109,6 +126,62 @@ impl LoaderPool {
 
             worker_handles.push(handle);
         }
+
+        // Drop our copy of init_tx so the channel can close if all workers report
+        drop(init_tx);
+
+        // Wait for all workers to report their initialization status
+        // Use a timeout to avoid hanging if workers get stuck connecting
+        let mut failed_workers: Vec<(usize, String)> = Vec::new();
+        let mut ready_count = 0;
+        let init_timeout = std::time::Duration::from_secs(30);
+
+        for _ in 0..num_workers {
+            match init_rx.recv_timeout(init_timeout) {
+                Ok((worker_id, WorkerInitResult::Ready)) => {
+                    ready_count += 1;
+                    debug!("Worker {} ready ({}/{})", worker_id, ready_count, num_workers);
+                }
+                Ok((worker_id, WorkerInitResult::Failed(msg))) => {
+                    failed_workers.push((worker_id, msg));
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    // Worker didn't respond in time - likely stuck connecting
+                    return Err(anyhow::anyhow!(
+                        "Loader pool initialization timed out after {}s ({}/{} workers ready). \
+                         Check MySQL connectivity to {}",
+                        init_timeout.as_secs(),
+                        ready_count,
+                        num_workers,
+                        mysql_url
+                    ));
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    // Channel closed unexpectedly
+                    return Err(anyhow::anyhow!(
+                        "Loader pool initialization failed: channel closed ({}/{} workers ready)",
+                        ready_count,
+                        num_workers
+                    ));
+                }
+            }
+        }
+
+        // If any workers failed, report the errors
+        if !failed_workers.is_empty() {
+            let error_msgs: Vec<String> = failed_workers
+                .iter()
+                .map(|(id, msg)| format!("Worker {}: {}", id, msg))
+                .collect();
+            return Err(anyhow::anyhow!(
+                "Loader pool initialization failed ({}/{} workers ready):\n  {}",
+                ready_count,
+                num_workers,
+                error_msgs.join("\n  ")
+            ));
+        }
+
+        info!("All {} loader workers connected and ready", num_workers);
 
         Ok(Self {
             work_tx,
@@ -211,6 +284,10 @@ pub struct ImportConfig {
     /// For `get` command: filter to specific aggregates with custom where clauses
     /// Each pair is (aggregate_name, where_clause)
     pub aggregate_overrides: Option<Vec<(String, String)>>,
+    /// SSH host key verification mode
+    pub host_key_verification: crate::ssh::HostKeyVerification,
+    /// Maximum message size in bytes (default: 100MB)
+    pub max_message_size: usize,
     /// Debug: simulate crash after N tables (for testing resume)
     #[cfg(feature = "test-utils")]
     pub fail_after_tables: Option<usize>,
@@ -282,8 +359,12 @@ pub async fn run_import(config: ImportConfig) -> Result<()> {
     );
 
     // Connect to SSH
-    let ssh_config =
-        SshConfig::parse(&config.remote_host, config.ssh_port, config.identity_file.clone())?;
+    let ssh_config = SshConfig::parse(
+        &config.remote_host,
+        config.ssh_port,
+        config.identity_file.clone(),
+        config.host_key_verification,
+    )?;
     info!(
         "Connecting to {}@{}:{}",
         ssh_config.user, ssh_config.host, ssh_config.port
@@ -354,10 +435,15 @@ pub async fn run_import(config: ImportConfig) -> Result<()> {
         None
     };
 
-    // Start the remote server with MySQL URL
-    let server_cmd = format!("JIBS_MYSQL_URL='{}' {}", config.remote_mysql, server_path);
+    // Start the remote server (credentials sent via protocol, not in process listing)
     info!("Starting remote server: {}", server_path);
-    let mut server = session.start_process(&server_cmd).await?;
+    let mut server = session.start_process(&server_path).await?;
+
+    // Send credentials via protocol (not visible in process listing)
+    let creds_msg = ClientMessage::Credentials {
+        mysql_url: config.remote_mysql.clone(),
+    };
+    send_message(&mut server, &creds_msg).await?;
 
     // Run the import protocol
     let result = run_protocol(
@@ -367,6 +453,7 @@ pub async fn run_import(config: ImportConfig) -> Result<()> {
         plan,
         config.compression,
         config.resume,
+        config.max_message_size,
         #[cfg(feature = "test-utils")]
         config.fail_after_tables,
         #[cfg(not(feature = "test-utils"))]
@@ -530,6 +617,7 @@ async fn run_protocol(
     plan: ExecutionPlan,
     compression: CompressionMode,
     is_resume: bool,
+    max_message_size: usize,
     fail_after_tables: Option<usize>,
 ) -> std::result::Result<(ImportStats, Option<LoaderPool>), (anyhow::Error, Option<LoaderPool>)> {
     // Wrap the inner logic to handle errors while preserving the loader pool
@@ -540,6 +628,7 @@ async fn run_protocol(
         plan,
         compression,
         is_resume,
+        max_message_size,
         fail_after_tables,
     )
     .await
@@ -557,6 +646,7 @@ async fn run_protocol_inner(
     plan: ExecutionPlan,
     compression: CompressionMode,
     is_resume: bool,
+    max_message_size: usize,
     fail_after_tables: Option<usize>,
 ) -> Result<ImportStats> {
     let mut stats = ImportStats {
@@ -581,7 +671,7 @@ async fn run_protocol_inner(
     send_message(server, &init_msg).await?;
 
     // Wait for Ready
-    let ready_msg: ServerMessage = recv_message(server).await?;
+    let ready_msg: ServerMessage = recv_message(server, max_message_size).await?;
     let (tables, negotiated_compression) = match ready_msg {
         ServerMessage::Ready {
             tables,
@@ -631,7 +721,7 @@ async fn run_protocol_inner(
     const MAX_PENDING_CHUNKS: usize = 100;
 
     loop {
-        let msg: ServerMessage = recv_message(server).await?;
+        let msg: ServerMessage = recv_message(server, max_message_size).await?;
 
         match msg {
             ServerMessage::Schema { table, columns } => {
@@ -896,7 +986,10 @@ async fn send_message(server: &mut RemoteProcess, msg: &ClientMessage) -> Result
 }
 
 /// Receive a message from the server
-async fn recv_message(server: &mut RemoteProcess) -> Result<ServerMessage> {
+async fn recv_message(
+    server: &mut RemoteProcess,
+    max_message_size: usize,
+) -> Result<ServerMessage> {
     // Read length prefix
     let mut len_bytes = [0u8; 4];
     server
@@ -905,8 +998,14 @@ async fn recv_message(server: &mut RemoteProcess) -> Result<ServerMessage> {
         .map_err(|e| anyhow::anyhow!("Failed to read message length: {}", e))?;
     let len = u32::from_le_bytes(len_bytes) as usize;
 
-    if len > 100 * 1024 * 1024 {
-        return Err(anyhow::anyhow!("Message too large: {} bytes", len));
+    if len > max_message_size {
+        return Err(anyhow::anyhow!(
+            "Message too large: {} bytes (max: {} bytes, ~{}MB). \
+             Consider using --max-message-size to increase the limit.",
+            len,
+            max_message_size,
+            max_message_size / (1024 * 1024)
+        ));
     }
 
     // Read message body

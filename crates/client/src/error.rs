@@ -4,11 +4,15 @@ use thiserror::Error;
 
 pub type Result<T> = std::result::Result<T, ClientError>;
 
+/// Client error types
+///
+/// Some variants are defined for future use or completeness but may not
+/// be constructed in the current codebase.
 #[derive(Debug, Error)]
 #[allow(dead_code)]
 pub enum ClientError {
-    #[error("IO error: {0}")]
-    Io(String),
+    #[error("IO error during {operation}: {message}")]
+    Io { operation: String, message: String },
 
     #[error("Parse error: {0}")]
     Parse(String),
@@ -16,8 +20,15 @@ pub enum ClientError {
     #[error("Resolution error: {0}")]
     Resolution(String),
 
-    #[error("SSH error: {0}")]
-    Ssh(String),
+    #[error("SSH error during {operation}: {message}")]
+    Ssh { operation: String, message: String },
+
+    #[error("MySQL error during {operation}: {source}")]
+    MySqlWithContext {
+        operation: String,
+        #[source]
+        source: mysql::Error,
+    },
 
     #[error("MySQL error: {0}")]
     MySql(#[from] mysql::Error),
@@ -33,4 +44,7 @@ pub enum ClientError {
 
     #[error("Server error: {0}")]
     Server(String),
+
+    #[error("Worker initialization failed: {0}")]
+    WorkerInit(String),
 }

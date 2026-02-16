@@ -115,11 +115,9 @@ impl Resolver {
         let import_file = base_dir.join(import_path);
 
         // Canonicalize to detect circular imports
-        let canonical_path = import_file.canonicalize().map_err(|e| {
-            ClientError::Io(format!(
-                "Cannot resolve import path '{}': {}",
-                import_path, e
-            ))
+        let canonical_path = import_file.canonicalize().map_err(|e| ClientError::Io {
+            operation: format!("resolve import path '{}'", import_path),
+            message: e.to_string(),
         })?;
 
         // Check for circular imports
@@ -130,8 +128,9 @@ impl Resolver {
         self.imported_files.insert(canonical_path.clone());
 
         // Read and parse the imported file
-        let source = std::fs::read_to_string(&canonical_path).map_err(|e| {
-            ClientError::Io(format!("Cannot read import '{}': {}", import_path, e))
+        let source = std::fs::read_to_string(&canonical_path).map_err(|e| ClientError::Io {
+            operation: format!("read import '{}'", import_path),
+            message: e.to_string(),
         })?;
 
         let program = jibs_parser::parse(&source).map_err(|errors| {
