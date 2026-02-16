@@ -1,0 +1,35 @@
+{
+  "relation": [
+    {"from": "orders.user_id", "to": "users.id"},
+    {"from": "order_items.order_id", "to": "orders.id"},
+    {"from": "order_items.product_id", "to": "products.id"}
+  ],
+  "aggregate": [
+    {
+      "name": "user1_orders",
+      "root": "orders",
+      "where": "user_id = 1"
+    }
+  ],
+  "exclude": [
+    {"table": "audit_log"}
+  ],
+  "ignore": [
+    {"table": "sessions"}
+  ],
+  "anonymize": {
+    "users": [
+      {"column": "email", "faker": "emails"},
+      {"column": "password_hash", "null": true}
+    ]
+  },
+  "faker": {
+    "emails": [
+      "anon1@test.local",
+      "anon2@test.local"
+    ]
+  },
+  "after": [
+    {"sql": "UPDATE users SET password_hash = '$2b$10$testpasswordhash' WHERE password_hash IS NULL"}
+  ]
+}

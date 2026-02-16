@@ -1,7 +1,7 @@
 //! Jibs Client - CLI for database imports
 //!
 //! This binary handles:
-//! - Parsing .jibs DSL files
+//! - Parsing .jibs DSL files or JSON configuration files
 //! - Resolving variables and evaluating conditions
 //! - Managing SSH connections to remote hosts
 //! - Uploading server binary (CAS-based)
@@ -10,6 +10,7 @@
 
 mod error;
 mod import;
+mod json_config;
 mod progress;
 mod resolver;
 mod server_binary;
@@ -38,7 +39,7 @@ enum Commands {
     Import(ImportArgs),
     /// Fetch specific aggregates with custom where clauses
     Get(GetArgs),
-    /// Parse and validate a .jibs file
+    /// Parse and validate a config file (.jibs or .json)
     Check(CheckArgs),
     /// Show resolved execution plan (for debugging)
     Plan(PlanArgs),
@@ -90,7 +91,7 @@ struct ConnectionArgs {
 
 #[derive(Args)]
 struct ImportArgs {
-    /// Path to the .jibs configuration file (optional - imports all tables if not provided)
+    /// Path to the configuration file (.jibs or .json) - imports all tables if not provided
     config: Option<PathBuf>,
 
     #[command(flatten)]
@@ -113,7 +114,7 @@ struct ImportArgs {
 
 #[derive(Args)]
 struct GetArgs {
-    /// Path to the .jibs configuration file
+    /// Path to the configuration file (.jibs or .json)
     config: PathBuf,
 
     #[command(flatten)]
@@ -126,13 +127,13 @@ struct GetArgs {
 
 #[derive(Args)]
 struct CheckArgs {
-    /// Path to the .jibs configuration file
+    /// Path to the configuration file (.jibs or .json)
     config: PathBuf,
 }
 
 #[derive(Args)]
 struct PlanArgs {
-    /// Path to the .jibs configuration file
+    /// Path to the configuration file (.jibs or .json)
     config: PathBuf,
 
     /// Variable assignments (can be repeated)
@@ -265,43 +266,45 @@ fn parse_aggregate_queries(args: &[String]) -> Result<Vec<(String, String)>> {
 }
 
 fn run_check(args: CheckArgs) -> Result<()> {
-    let source = std::fs::read_to_string(&args.config)?;
+    let extension = args
+        .config
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
 
-    match jibs_parser::parse(&source) {
-        Ok(program) => {
-            println!(
-                "Parsed {} statements successfully",
-                program.statements.len()
-            );
-            Ok(())
-        }
-        Err(errors) => {
-            for error in &errors {
-                eprintln!("Error: {}", error);
+    if extension == "json" {
+        // Validate JSON config
+        let content = std::fs::read_to_string(&args.config)?;
+        let _: serde_json::Value = serde_json::from_str(&content)?;
+        println!("Valid JSON config file");
+        Ok(())
+    } else {
+        // Validate .jibs DSL
+        let source = std::fs::read_to_string(&args.config)?;
+
+        match jibs_parser::parse(&source) {
+            Ok(program) => {
+                println!(
+                    "Parsed {} statements successfully",
+                    program.statements.len()
+                );
+                Ok(())
             }
-            anyhow::bail!("Parse failed with {} errors", errors.len());
+            Err(errors) => {
+                for error in &errors {
+                    eprintln!("Error: {}", error);
+                }
+                anyhow::bail!("Parse failed with {} errors", errors.len());
+            }
         }
     }
 }
 
 fn run_plan(args: PlanArgs) -> Result<()> {
-    let source = std::fs::read_to_string(&args.config)?;
-
-    let program = jibs_parser::parse(&source).map_err(|errors| {
-        anyhow::anyhow!(
-            "Parse failed: {}",
-            errors
-                .iter()
-                .map(|e| e.to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
-    })?;
-
     // Load variables from file if specified
     let mut vars: std::collections::HashMap<String, String> = args.vars.into_iter().collect();
-    if let Some(var_file) = args.var_file {
-        let content = std::fs::read_to_string(&var_file)?;
+    if let Some(var_file) = &args.var_file {
+        let content = std::fs::read_to_string(var_file)?;
         let file_vars: std::collections::HashMap<String, serde_json::Value> =
             serde_json::from_str(&content)?;
         for (k, v) in file_vars {
@@ -312,8 +315,35 @@ fn run_plan(args: PlanArgs) -> Result<()> {
         }
     }
 
-    // Resolve the plan
-    let plan = resolver::resolve(&args.config, &program, &vars)?;
+    // Detect file type by extension
+    let extension = args
+        .config
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+
+    let plan = if extension == "json" {
+        // Parse as JSON config
+        json_config::parse_json_config(&args.config, &vars)
+            .map_err(|e| anyhow::anyhow!("JSON config error: {}", e))?
+    } else {
+        // Parse as .jibs DSL
+        let source = std::fs::read_to_string(&args.config)?;
+
+        let program = jibs_parser::parse(&source).map_err(|errors| {
+            anyhow::anyhow!(
+                "Parse failed: {}",
+                errors
+                    .iter()
+                    .map(|e| e.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })?;
+
+        // Resolve the plan
+        resolver::resolve(&args.config, &program, &vars)?
+    };
 
     // Print the plan as JSON
     println!("{}", serde_json::to_string_pretty(&plan)?);
