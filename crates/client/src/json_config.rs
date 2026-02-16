@@ -455,9 +455,13 @@ impl JsonResolver {
                 ))),
             },
             (Value::String(_), "string") => Ok(value),
+            (Value::StringArray(_), "string[]") => Ok(value),
             (Value::Int(_), "int") => Ok(value),
+            (Value::IntArray(_), "int[]") => Ok(value),
             (Value::Float(_), "float") => Ok(value),
+            (Value::FloatArray(_), "float[]") => Ok(value),
             (Value::Bool(_), "bool") => Ok(value),
+            (Value::BoolArray(_), "bool[]") => Ok(value),
             _ => Ok(value),
         }
     }
@@ -484,6 +488,58 @@ impl JsonResolver {
                 .parse::<f64>()
                 .map(Value::Float)
                 .map_err(|_| ClientError::TypeError(format!("Cannot convert '{}' to float", s))),
+            (serde_json::Value::Array(arr), "string[]") => {
+                let strings: Result<Vec<String>> = arr
+                    .iter()
+                    .map(|v| match v {
+                        serde_json::Value::String(s) => self.interpolate_string(s),
+                        _ => Err(ClientError::TypeError(
+                            "Expected string in string array".to_string(),
+                        )),
+                    })
+                    .collect();
+                Ok(Value::StringArray(strings?))
+            }
+            (serde_json::Value::Array(arr), "int[]") => {
+                let ints: Result<Vec<i64>> = arr
+                    .iter()
+                    .map(|v| match v {
+                        serde_json::Value::Number(n) => n.as_i64().ok_or_else(|| {
+                            ClientError::TypeError("Expected integer in int array".to_string())
+                        }),
+                        _ => Err(ClientError::TypeError(
+                            "Expected integer in int array".to_string(),
+                        )),
+                    })
+                    .collect();
+                Ok(Value::IntArray(ints?))
+            }
+            (serde_json::Value::Array(arr), "float[]") => {
+                let floats: Result<Vec<f64>> = arr
+                    .iter()
+                    .map(|v| match v {
+                        serde_json::Value::Number(n) => n.as_f64().ok_or_else(|| {
+                            ClientError::TypeError("Expected float in float array".to_string())
+                        }),
+                        _ => Err(ClientError::TypeError(
+                            "Expected float in float array".to_string(),
+                        )),
+                    })
+                    .collect();
+                Ok(Value::FloatArray(floats?))
+            }
+            (serde_json::Value::Array(arr), "bool[]") => {
+                let bools: Result<Vec<bool>> = arr
+                    .iter()
+                    .map(|v| match v {
+                        serde_json::Value::Bool(b) => Ok(*b),
+                        _ => Err(ClientError::TypeError(
+                            "Expected boolean in bool array".to_string(),
+                        )),
+                    })
+                    .collect();
+                Ok(Value::BoolArray(bools?))
+            }
             (serde_json::Value::Null, _) => Ok(Value::Null),
             _ => Err(ClientError::TypeError(format!(
                 "Type mismatch: expected {}",
@@ -871,6 +927,79 @@ impl JsonResolver {
             }
             serde_json::Value::Bool(b) => Ok(Value::Bool(*b)),
             serde_json::Value::Null => Ok(Value::Null),
+            serde_json::Value::Array(arr) => {
+                // Try to infer array type from first element
+                if arr.is_empty() {
+                    // Default to string array for empty arrays
+                    Ok(Value::StringArray(Vec::new()))
+                } else {
+                    match &arr[0] {
+                        serde_json::Value::String(_) => {
+                            let strings: Result<Vec<String>> = arr
+                                .iter()
+                                .map(|v| match v {
+                                    serde_json::Value::String(s) => self.interpolate_string(s),
+                                    _ => Err(ClientError::TypeError(
+                                        "Mixed types in array".to_string(),
+                                    )),
+                                })
+                                .collect();
+                            Ok(Value::StringArray(strings?))
+                        }
+                        serde_json::Value::Number(n) if n.is_i64() => {
+                            let ints: Result<Vec<i64>> = arr
+                                .iter()
+                                .map(|v| match v {
+                                    serde_json::Value::Number(n) => {
+                                        n.as_i64().ok_or_else(|| {
+                                            ClientError::TypeError(
+                                                "Expected integer in array".to_string(),
+                                            )
+                                        })
+                                    }
+                                    _ => Err(ClientError::TypeError(
+                                        "Mixed types in array".to_string(),
+                                    )),
+                                })
+                                .collect();
+                            Ok(Value::IntArray(ints?))
+                        }
+                        serde_json::Value::Number(_) => {
+                            let floats: Result<Vec<f64>> = arr
+                                .iter()
+                                .map(|v| match v {
+                                    serde_json::Value::Number(n) => {
+                                        n.as_f64().ok_or_else(|| {
+                                            ClientError::TypeError(
+                                                "Expected number in array".to_string(),
+                                            )
+                                        })
+                                    }
+                                    _ => Err(ClientError::TypeError(
+                                        "Mixed types in array".to_string(),
+                                    )),
+                                })
+                                .collect();
+                            Ok(Value::FloatArray(floats?))
+                        }
+                        serde_json::Value::Bool(_) => {
+                            let bools: Result<Vec<bool>> = arr
+                                .iter()
+                                .map(|v| match v {
+                                    serde_json::Value::Bool(b) => Ok(*b),
+                                    _ => Err(ClientError::TypeError(
+                                        "Mixed types in array".to_string(),
+                                    )),
+                                })
+                                .collect();
+                            Ok(Value::BoolArray(bools?))
+                        }
+                        _ => Err(ClientError::TypeError(
+                            "Unsupported array element type".to_string(),
+                        )),
+                    }
+                }
+            }
             _ => Err(ClientError::TypeError(
                 "Unsupported JSON value type".to_string(),
             )),

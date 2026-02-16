@@ -62,13 +62,22 @@ import "common/anonymization.dsl"
 ```ebnf
 var_decl = "var" identifier ":" type [ "=" literal ] ;
 
-type = "string" | "int" | "float" | "bool" ;
+type = scalar_type | array_type ;
+
+scalar_type = "string" | "int" | "float" | "bool" ;
+
+array_type = scalar_type "[]" ;
 
 literal = string_literal
         | integer_literal
         | float_literal
         | bool_literal
+        | array_literal
         ;
+
+array_literal = "[" [ array_elements ] "]" ;
+
+array_elements = literal { "," literal } [ "," ] ;
 
 bool_literal = "true" | "false" ;
 ```
@@ -80,20 +89,45 @@ var admin_email: string = "admin@local.test"
 var order_limit: int = 100
 var tax_rate: float = 0.21
 var skip_payments: bool = true
+
+// Array types
+var emails: string[] = ["user1@test.com", "user2@test.com"]
+var ids: int[] = [1, 2, 3, 4, 5]
+var prices: float[] = [9.99, 19.99, 29.99]
+var flags: bool[] = [true, false, true]
 ```
 
 ### Faker Declaration
 
 ```ebnf
-faker_decl = "faker" identifier "[" string_list "]" ;
+faker_decl = "faker" identifier faker_source ;
 
-string_list = string_literal { "," string_literal } ;
+faker_source = faker_array | variable_ref ;
+
+faker_array = "[" [ faker_values ] "]" ;
+
+faker_values = faker_value { "," faker_value } [ "," ] ;
+
+faker_value = string_literal | spread_expr ;
+
+spread_expr = "..." variable_ref ;
 ```
 
 **Examples:**
 ```
+// Inline array of strings
 faker names ["John", "Jane", "Bob", "Alice"]
 faker emails ["user1@example.test", "user2@example.test"]
+
+// Using a string[] variable directly
+var base_emails: string[] = ["admin@test.com", "user@test.com"]
+faker emails $base_emails
+
+// Spread operator to combine values
+faker all_emails [...$base_emails, "extra@test.com"]
+
+// Multiple spreads
+faker combined [...$emails1, ...$emails2, "another@test.com"]
 ```
 
 ### Relation Declaration
@@ -361,6 +395,8 @@ string_literal = '"' { string_char } '"' ;
 
 variable_ref = "$" identifier ;
 
+spread_op = "..." ;
+
 comment = "//" { < any character except newline > } newline ;
 
 whitespace = " " | "\t" | "\n" | "\r" ;
@@ -408,7 +444,17 @@ import_stmt = "import" string_literal ;
 
 var_decl = "var" identifier ":" type [ "=" literal ] ;
 
-faker_decl = "faker" identifier "[" string_list "]" ;
+faker_decl = "faker" identifier faker_source ;
+
+faker_source = faker_array | variable_ref ;
+
+faker_array = "[" [ faker_values ] "]" ;
+
+faker_values = faker_value { "," faker_value } [ "," ] ;
+
+faker_value = string_literal | spread_expr ;
+
+spread_expr = "..." variable_ref ;
 
 relation_decl = "relation" column_ref "->" column_ref ;
 
@@ -454,9 +500,17 @@ assignment_list = assignment { "," assignment } ;
 assignment = identifier "=" value ;
 
 (* Types and Values *)
-type = "string" | "int" | "float" | "bool" ;
+type = scalar_type | array_type ;
 
-literal = string_literal | integer_literal | float_literal | bool_literal ;
+scalar_type = "string" | "int" | "float" | "bool" ;
+
+array_type = scalar_type "[]" ;
+
+literal = string_literal | integer_literal | float_literal | bool_literal | array_literal ;
+
+array_literal = "[" [ array_elements ] "]" ;
+
+array_elements = literal { "," literal } [ "," ] ;
 
 value = literal | variable_ref ;
 
@@ -467,7 +521,7 @@ column_ref = identifier "." identifier ;
 
 variable_ref = "$" identifier ;
 
-string_list = string_literal { "," string_literal } ;
+spread_op = "..." ;
 
 (* Expressions *)
 expression = or_expr ;
@@ -512,6 +566,8 @@ string_literal = interpolated_string ;
 
 multiline_string = '"""' { < any character > } '"""' ;
 
+spread_op = "..." ;
+
 comment = "//" { < any character except newline > } ;
 
 whitespace = " " | "\t" | "\n" | "\r" ;
@@ -536,6 +592,8 @@ whitespace = " " | "\t" | "\n" | "\r" ;
 | Equality (`==`, `!=`) | All | Type must match |
 | Logical (`&&`, `\|\|`, `!`) | `bool` | No coercion |
 | `limit` clause | `int` | Must be positive integer |
+| `faker` source | `string[]` | Variable must be string array |
+| Spread operator (`...`) | `string[]` | Variable must be string array |
 
 ### String Literal Contexts
 

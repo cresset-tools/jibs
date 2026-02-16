@@ -86,9 +86,13 @@ impl Default for ExecutionPlan {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Value {
     String(String),
+    StringArray(Vec<String>),
     Int(i64),
+    IntArray(Vec<i64>),
     Float(f64),
+    FloatArray(Vec<f64>),
     Bool(bool),
+    BoolArray(Vec<bool>),
     Null,
 }
 
@@ -97,9 +101,37 @@ impl Value {
     pub fn as_string(&self) -> String {
         match self {
             Value::String(s) => s.clone(),
+            Value::StringArray(arr) => format!("[{}]", arr.join(", ")),
             Value::Int(i) => i.to_string(),
+            Value::IntArray(arr) => {
+                format!(
+                    "[{}]",
+                    arr.iter()
+                        .map(|i| i.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            }
             Value::Float(f) => f.to_string(),
+            Value::FloatArray(arr) => {
+                format!(
+                    "[{}]",
+                    arr.iter()
+                        .map(|f| f.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            }
             Value::Bool(b) => b.to_string(),
+            Value::BoolArray(arr) => {
+                format!(
+                    "[{}]",
+                    arr.iter()
+                        .map(|b| b.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            }
             Value::Null => "NULL".to_string(),
         }
     }
@@ -116,6 +148,38 @@ impl Value {
     pub fn as_bool(&self) -> Option<bool> {
         match self {
             Value::Bool(b) => Some(*b),
+            _ => None,
+        }
+    }
+
+    /// Try to get the value as a string array
+    pub fn as_string_array(&self) -> Option<&[String]> {
+        match self {
+            Value::StringArray(arr) => Some(arr),
+            _ => None,
+        }
+    }
+
+    /// Try to get the value as an int array
+    pub fn as_int_array(&self) -> Option<&[i64]> {
+        match self {
+            Value::IntArray(arr) => Some(arr),
+            _ => None,
+        }
+    }
+
+    /// Try to get the value as a float array
+    pub fn as_float_array(&self) -> Option<&[f64]> {
+        match self {
+            Value::FloatArray(arr) => Some(arr),
+            _ => None,
+        }
+    }
+
+    /// Try to get the value as a bool array
+    pub fn as_bool_array(&self) -> Option<&[bool]> {
+        match self {
+            Value::BoolArray(arr) => Some(arr),
             _ => None,
         }
     }

@@ -70,18 +70,26 @@ pub struct VarDecl<'src> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VarType {
     String,
+    StringArray,
     Int,
+    IntArray,
     Float,
+    FloatArray,
     Bool,
+    BoolArray,
 }
 
 /// Literal values
 #[derive(Debug, Clone, PartialEq)]
 pub enum Literal<'src> {
     String(StringLiteral<'src>),
+    StringArray(Vec<Spanned<StringLiteral<'src>>>),
     Int(i64),
+    IntArray(Vec<i64>),
     Float(f64),
+    FloatArray(Vec<f64>),
     Bool(bool),
+    BoolArray(Vec<bool>),
     Null,
 }
 
@@ -104,7 +112,25 @@ pub enum StringPart<'src> {
 #[derive(Debug, Clone)]
 pub struct FakerDecl<'src> {
     pub name: Spanned<&'src str>,
-    pub values: Vec<Spanned<StringLiteral<'src>>>,
+    pub source: FakerSource<'src>,
+}
+
+/// A value in a faker list - either a string literal or a spread variable
+#[derive(Debug, Clone, PartialEq)]
+pub enum FakerValue<'src> {
+    /// A regular string literal (possibly with interpolation)
+    Literal(StringLiteral<'src>),
+    /// A spread of a string array variable: ...$variable
+    Spread(&'src str),
+}
+
+/// The source of faker values - either an inline array or a variable reference
+#[derive(Debug, Clone)]
+pub enum FakerSource<'src> {
+    /// Inline array of values: ["a", "b", ...$var]
+    Array(Vec<Spanned<FakerValue<'src>>>),
+    /// Direct variable reference: $emails
+    Variable(&'src str),
 }
 
 /// Relation declaration

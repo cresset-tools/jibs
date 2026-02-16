@@ -53,6 +53,7 @@ pub enum Token<'src> {
 
     // Operators
     Arrow,      // ->
+    Spread,     // ...
     Eq,         // ==
     NotEq,      // !=
     LtEq,       // <=
@@ -121,6 +122,7 @@ impl fmt::Display for Token<'_> {
             Token::Asc => write!(f, "asc"),
             Token::Desc => write!(f, "desc"),
             Token::Arrow => write!(f, "->"),
+            Token::Spread => write!(f, "..."),
             Token::Eq => write!(f, "=="),
             Token::NotEq => write!(f, "!="),
             Token::LtEq => write!(f, "<="),
@@ -220,7 +222,8 @@ pub fn lexer<'src>(
     let lparen = just('(').to(Token::LParen);
     let rparen = just(')').to(Token::RParen);
 
-    // Punctuation
+    // Punctuation (spread must come before dot)
+    let spread = just("...").to(Token::Spread);
     let colon = just(':').to(Token::Colon);
     let comma = just(',').to(Token::Comma);
     let dot = just('.').to(Token::Dot);
@@ -271,10 +274,10 @@ pub fn lexer<'src>(
         lt, gt, not, plus, minus, star, slash, percent, assign,
     ));
 
-    // All delimiters and punctuation
+    // All delimiters and punctuation (spread must come before dot)
     let delimiter = choice((
         lbrace, rbrace, lbracket, rbracket, lparen, rparen,
-        colon, comma, dot, hash, dollar,
+        spread, colon, comma, dot, hash, dollar,
     ));
 
     // A single token can be one of the above
@@ -410,5 +413,71 @@ mod tests {
     fn test_multiline_string() {
         let tokens = lex(r#""""SELECT * FROM table""""#);
         assert_eq!(tokens, vec![Token::MultilineString("SELECT * FROM table")]);
+    }
+
+    #[test]
+    fn test_spread_operator() {
+        let tokens = lex("...$emails");
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Spread,
+                Token::Dollar,
+                Token::Ident("emails"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_spread_vs_dot() {
+        // Ensure ... is tokenized as Spread, not three Dots
+        let tokens = lex("a.b ...$c");
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Ident("a"),
+                Token::Dot,
+                Token::Ident("b"),
+                Token::Spread,
+                Token::Dollar,
+                Token::Ident("c"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_string_array_type() {
+        let tokens = lex("var x: string[]");
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Var,
+                Token::Ident("x"),
+                Token::Colon,
+                Token::TypeString,
+                Token::LBracket,
+                Token::RBracket,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_all_array_types() {
+        // Test that all array type syntaxes lex correctly
+        let tokens = lex("int[] float[] bool[]");
+        assert_eq!(
+            tokens,
+            vec![
+                Token::TypeInt,
+                Token::LBracket,
+                Token::RBracket,
+                Token::TypeFloat,
+                Token::LBracket,
+                Token::RBracket,
+                Token::TypeBool,
+                Token::LBracket,
+                Token::RBracket,
+            ]
+        );
     }
 }

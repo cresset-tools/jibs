@@ -4,9 +4,10 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use jibs_parser::ast::{
-    AggregateBlock, AnonymizeBlock, Expr, FakerDecl, IncludeStmt, LimitValue, Literal,
-    PreserveStmt, Program, RelationDecl, SetBlock, SortDirection as AstSortDirection, Statement,
-    StatementKind, StringLiteral, StringPart, VarDecl, VarType,
+    AggregateBlock, AnonymizeBlock, Expr, FakerDecl, FakerSource, FakerValue, IncludeStmt,
+    LimitValue, Literal, PreserveStmt, Program, RelationDecl, SetBlock,
+    SortDirection as AstSortDirection, Statement, StatementKind, StringLiteral, StringPart,
+    VarDecl, VarType,
 };
 use jibs_protocol::{
     AnonymizeRule, AnonymizeTarget, Assignment, ExecutionPlan, PreserveRule, Relation,
@@ -230,9 +231,13 @@ impl Resolver {
                 ))),
             },
             (Value::String(_), VarType::String) => Ok(value),
+            (Value::StringArray(_), VarType::StringArray) => Ok(value),
             (Value::Int(_), VarType::Int) => Ok(value),
+            (Value::IntArray(_), VarType::IntArray) => Ok(value),
             (Value::Float(_), VarType::Float) => Ok(value),
+            (Value::FloatArray(_), VarType::FloatArray) => Ok(value),
             (Value::Bool(_), VarType::Bool) => Ok(value),
+            (Value::BoolArray(_), VarType::BoolArray) => Ok(value),
             _ => Ok(value), // Allow other conversions for now
         }
     }
@@ -240,11 +245,21 @@ impl Resolver {
     fn literal_to_value(&self, lit: &Literal<'_>, var_type: VarType) -> Result<Value> {
         match (lit, var_type) {
             (Literal::Int(i), VarType::Int) => Ok(Value::Int(*i)),
+            (Literal::IntArray(arr), VarType::IntArray) => Ok(Value::IntArray(arr.clone())),
             (Literal::Float(f), VarType::Float) => Ok(Value::Float(*f)),
+            (Literal::FloatArray(arr), VarType::FloatArray) => Ok(Value::FloatArray(arr.clone())),
             (Literal::Bool(b), VarType::Bool) => Ok(Value::Bool(*b)),
+            (Literal::BoolArray(arr), VarType::BoolArray) => Ok(Value::BoolArray(arr.clone())),
             (Literal::String(s), VarType::String) => {
                 let resolved = self.resolve_string_literal(s)?;
                 Ok(Value::String(resolved))
+            }
+            (Literal::StringArray(arr), VarType::StringArray) => {
+                let resolved: Result<Vec<String>> = arr
+                    .iter()
+                    .map(|(s, _span)| self.resolve_string_literal(s))
+                    .collect();
+                Ok(Value::StringArray(resolved?))
             }
             (Literal::Null, _) => Ok(Value::Null),
             (Literal::Int(i), VarType::Float) => Ok(Value::Float(*i as f64)),
@@ -329,12 +344,22 @@ impl Resolver {
     fn eval_literal(&self, lit: &Literal<'_>) -> Result<Value> {
         match lit {
             Literal::Int(i) => Ok(Value::Int(*i)),
+            Literal::IntArray(arr) => Ok(Value::IntArray(arr.clone())),
             Literal::Float(f) => Ok(Value::Float(*f)),
+            Literal::FloatArray(arr) => Ok(Value::FloatArray(arr.clone())),
             Literal::Bool(b) => Ok(Value::Bool(*b)),
+            Literal::BoolArray(arr) => Ok(Value::BoolArray(arr.clone())),
             Literal::Null => Ok(Value::Null),
             Literal::String(s) => {
                 let resolved = self.resolve_string_literal(s)?;
                 Ok(Value::String(resolved))
+            }
+            Literal::StringArray(arr) => {
+                let resolved: Result<Vec<String>> = arr
+                    .iter()
+                    .map(|(s, _span)| self.resolve_string_literal(s))
+                    .collect();
+                Ok(Value::StringArray(resolved?))
             }
         }
     }
@@ -457,13 +482,77 @@ impl Resolver {
 
     fn process_faker(&mut self, faker_decl: &FakerDecl<'_>) -> Result<()> {
         let name = faker_decl.name.0.to_string();
-        let mut values = Vec::new();
-        for (lit, _span) in &faker_decl.values {
-            let resolved = self.resolve_string_literal(lit)?;
-            values.push(resolved);
-        }
+        let values = match &faker_decl.source {
+            FakerSource::Array(arr) => {
+                let mut values = Vec::new();
+                for (faker_value, _span) in arr {
+                    match faker_value {
+                        FakerValue::Literal(lit) => {
+                            let resolved = self.resolve_string_literal(lit)?;
+                            values.push(resolved);
+                        }
+                        FakerValue::Spread(var_name) => {
+                            self.spread_string_array_into(&mut values, var_name)?;
+                        }
+                    }
+                }
+                values
+            }
+            FakerSource::Variable(var_name) => {
+                // Direct variable reference - must be a string array
+                let var_value = self
+                    .variables
+                    .get(*var_name)
+                    .ok_or_else(|| ClientError::UndefinedVariable(var_name.to_string()))?;
+
+                match var_value.as_string_array() {
+                    Some(arr) => arr.to_vec(),
+                    None => {
+                        return Err(ClientError::TypeError(format!(
+                            "Variable '{}' must be string[] for faker, got {}",
+                            var_name,
+                            self.value_type_name(var_value)
+                        )));
+                    }
+                }
+            }
+        };
+
         self.plan.fakers.insert(name, values);
         Ok(())
+    }
+
+    fn spread_string_array_into(&self, values: &mut Vec<String>, var_name: &str) -> Result<()> {
+        let var_value = self
+            .variables
+            .get(var_name)
+            .ok_or_else(|| ClientError::UndefinedVariable(var_name.to_string()))?;
+
+        match var_value.as_string_array() {
+            Some(arr) => {
+                values.extend(arr.iter().cloned());
+                Ok(())
+            }
+            None => Err(ClientError::TypeError(format!(
+                "Cannot spread variable '{}': expected string[], got {}",
+                var_name,
+                self.value_type_name(var_value)
+            ))),
+        }
+    }
+
+    fn value_type_name(&self, value: &Value) -> &'static str {
+        match value {
+            Value::String(_) => "string",
+            Value::StringArray(_) => "string[]",
+            Value::Int(_) => "int",
+            Value::IntArray(_) => "int[]",
+            Value::Float(_) => "float",
+            Value::FloatArray(_) => "float[]",
+            Value::Bool(_) => "bool",
+            Value::BoolArray(_) => "bool[]",
+            Value::Null => "null",
+        }
     }
 
     fn process_relation(&mut self, relation_decl: &RelationDecl<'_>) -> Result<()> {
