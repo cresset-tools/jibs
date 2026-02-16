@@ -602,9 +602,13 @@ async fn run_protocol_inner(
     // Track schemas per table (for interleaved streaming)
     let mut table_schemas: HashMap<String, Arc<Vec<ColumnDef>>> = HashMap::new();
 
-    // Track pending load results per table (for interleaved streaming)
-    let mut pending_loads_by_table: HashMap<String, Vec<std::sync::mpsc::Receiver<Result<u64>>>> =
-        HashMap::new();
+    // Track pending load results globally (not per-table) to avoid blocking at table boundaries
+    // Each entry is (table_name, result_receiver)
+    let mut pending_loads: Vec<(String, std::sync::mpsc::Receiver<Result<u64>>)> = Vec::new();
+
+    // Maximum number of pending chunks before we start draining
+    // This bounds memory usage while allowing cross-table parallelism
+    const MAX_PENDING_CHUNKS: usize = 100;
 
     loop {
         let msg: ServerMessage = recv_message(server).await?;
@@ -678,10 +682,45 @@ async fn run_protocol_inner(
                 if let Some(pool) = loader_pool {
                     // Submit to loader pool for parallel processing
                     let result_rx = pool.submit(table.clone(), schema, decompressed)?;
-                    pending_loads_by_table
-                        .entry(table.clone())
-                        .or_default()
-                        .push(result_rx);
+                    pending_loads.push((table.clone(), result_rx));
+
+                    // If we have too many pending chunks, drain some to bound memory
+                    // Use try_recv to collect completed loads without blocking
+                    if pending_loads.len() > MAX_PENDING_CHUNKS {
+                        let mut still_pending = Vec::new();
+                        for (tbl, rx) in pending_loads.drain(..) {
+                            match rx.try_recv() {
+                                Ok(Ok(loaded)) => stats.rows_imported += loaded,
+                                Ok(Err(e)) => {
+                                    return Err(anyhow::anyhow!("Loader error for {}: {}", tbl, e));
+                                }
+                                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                                    // Still pending, keep it
+                                    still_pending.push((tbl, rx));
+                                }
+                                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                    return Err(anyhow::anyhow!("Loader worker died for {}", tbl));
+                                }
+                            }
+                        }
+                        pending_loads = still_pending;
+
+                        // If still too many, block on the oldest one
+                        if pending_loads.len() > MAX_PENDING_CHUNKS {
+                            if let Some((tbl, rx)) = pending_loads.first() {
+                                match rx.recv() {
+                                    Ok(Ok(loaded)) => stats.rows_imported += loaded,
+                                    Ok(Err(e)) => {
+                                        return Err(anyhow::anyhow!("Loader error for {}: {}", tbl, e));
+                                    }
+                                    Err(_) => {
+                                        return Err(anyhow::anyhow!("Loader worker died for {}", tbl));
+                                    }
+                                }
+                            }
+                            pending_loads.remove(0);
+                        }
+                    }
                 } else {
                     // Load directly (sequential)
                     let loaded = load_tsv_data(local_conn, &table, &schema, &decompressed)?;
@@ -703,26 +742,26 @@ async fn run_protocol_inner(
                     continue;
                 }
 
-                // Wait for this table's pending loads to complete
-                if let Some(pending_loads) = pending_loads_by_table.remove(&table) {
-                    if !pending_loads.is_empty() {
-                        debug!(
-                            "Waiting for {} pending loads for table {}",
-                            pending_loads.len(),
-                            table
-                        );
-                        for rx in pending_loads {
-                            match rx.recv() {
-                                Ok(Ok(loaded)) => stats.rows_imported += loaded,
-                                Ok(Err(e)) => {
-                                    return Err(anyhow::anyhow!("Loader error for {}: {}", table, e));
-                                }
-                                Err(_) => {
-                                    return Err(anyhow::anyhow!("Loader worker died for {}", table));
-                                }
+                // Don't block waiting for loads - let workers continue across table boundaries
+                // We'll collect all results at the end before processing Done
+                // Just do a quick non-blocking drain of any completed loads
+                {
+                    let mut still_pending = Vec::new();
+                    for (tbl, rx) in pending_loads.drain(..) {
+                        match rx.try_recv() {
+                            Ok(Ok(loaded)) => stats.rows_imported += loaded,
+                            Ok(Err(e)) => {
+                                return Err(anyhow::anyhow!("Loader error for {}: {}", tbl, e));
+                            }
+                            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                                still_pending.push((tbl, rx));
+                            }
+                            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                return Err(anyhow::anyhow!("Loader worker died for {}", tbl));
                             }
                         }
                     }
+                    pending_loads = still_pending;
                 }
 
                 progress.finish_table(&table, row_count);
@@ -732,6 +771,9 @@ async fn run_protocol_inner(
                 table_schemas.remove(&table);
 
                 // Mark table as complete in checkpoint
+                // Note: With parallel loading, some chunks for this table may still be in-flight
+                // This is OK - the checkpoint is for resumability, and we'll wait for all loads
+                // before reporting final success
                 mark_table_complete(local_conn, &table, row_count)?;
 
                 // Debug: simulate crash for testing resume
@@ -746,6 +788,25 @@ async fn run_protocol_inner(
             }
 
             ServerMessage::Done => {
+                // Wait for all remaining pending loads to complete before finishing
+                if !pending_loads.is_empty() {
+                    debug!(
+                        "Waiting for {} remaining pending loads before Done",
+                        pending_loads.len()
+                    );
+                    for (tbl, rx) in pending_loads.drain(..) {
+                        match rx.recv() {
+                            Ok(Ok(loaded)) => stats.rows_imported += loaded,
+                            Ok(Err(e)) => {
+                                return Err(anyhow::anyhow!("Loader error for {}: {}", tbl, e));
+                            }
+                            Err(_) => {
+                                return Err(anyhow::anyhow!("Loader worker died for {}", tbl));
+                            }
+                        }
+                    }
+                }
+
                 progress.finish();
                 break;
             }

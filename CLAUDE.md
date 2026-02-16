@@ -16,20 +16,75 @@ This script:
 
 ## Testing
 
-Run the E2E tests with Docker:
+### Start Test Environment
 ```bash
-# Start test containers
-docker-compose -f test/docker-compose.yml up -d
+# Start test containers (MySQL remote, MySQL local, SSH server)
+docker-compose up -d
 
-# Run aggregate test
+# Check containers are healthy
+docker-compose ps
+```
+
+### Run E2E Tests
+```bash
+# Clear cached server binary (required after rebuilding server)
+ssh -p 2222 -i test/ssh-keys/id_ed25519 -o StrictHostKeyChecking=no testuser@localhost "rm -f /tmp/jibs-*"
+
+# Basic aggregate test (with parallel loading)
 cargo run -p jibs_client -- import test/import-aggregate.jibs \
   --host testuser@localhost --port 2222 \
   --remote-mysql 'mysql://root:remote_root_pass@mysql-remote:3306/production' \
   --local-mysql 'mysql://root:local_root_pass@127.0.0.1:3308/imported' \
-  --identity test/ssh-keys/id_ed25519
+  --identity test/ssh-keys/id_ed25519 \
+  --parallel 4 \
+  --clean
 
-# Clear cached server binary (to force re-upload after rebuild)
-ssh -p 2222 -i test/ssh-keys/id_ed25519 testuser@localhost "rm -f /tmp/jibs-*"
+# Full table import test
+cargo run -p jibs_client -- import test/import-all.jibs \
+  --host testuser@localhost --port 2222 \
+  --remote-mysql 'mysql://root:remote_root_pass@mysql-remote:3306/production' \
+  --local-mysql 'mysql://root:local_root_pass@127.0.0.1:3308/imported' \
+  --identity test/ssh-keys/id_ed25519 \
+  --parallel 4 \
+  --clean
+```
+
+### Test Resume Functionality
+```bash
+# Run with --fail-after-tables to simulate crash (requires test-utils feature)
+cargo run -p jibs_client --features test-utils -- import test/import-resume-test.jibs \
+  --host testuser@localhost --port 2222 \
+  --remote-mysql 'mysql://root:remote_root_pass@mysql-remote:3306/production' \
+  --local-mysql 'mysql://root:local_root_pass@127.0.0.1:3308/imported' \
+  --identity test/ssh-keys/id_ed25519 \
+  --parallel 4 \
+  --clean \
+  --fail-after-tables 2
+
+# Resume the failed import
+cargo run -p jibs_client -- import test/import-resume-test.jibs \
+  --host testuser@localhost --port 2222 \
+  --remote-mysql 'mysql://root:remote_root_pass@mysql-remote:3306/production' \
+  --local-mysql 'mysql://root:local_root_pass@127.0.0.1:3308/imported' \
+  --identity test/ssh-keys/id_ed25519 \
+  --parallel 4 \
+  --resume
+```
+
+### Available Test Files
+- `test/import-aggregate.jibs` - Tests aggregate with relations (orders for user)
+- `test/import-all.jibs` - Full table import (no aggregates)
+- `test/import-resume-test.jibs` - For testing resume functionality
+- `test/import-overlapping-aggregates.jibs` - Multiple aggregates with overlap
+- `test/import-different-roots.jibs` - Aggregates from different root tables
+
+### Cleanup
+```bash
+# Stop containers
+docker-compose down
+
+# Stop and remove volumes (clean slate)
+docker-compose down -v
 ```
 
 ## Project Structure
