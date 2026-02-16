@@ -40,9 +40,9 @@ struct JsonConfig {
     #[serde(default)]
     import: Vec<JsonImport>,
 
-    /// Faker pools
+    /// Faker pools (array format with optional when)
     #[serde(default)]
-    faker: HashMap<String, Vec<String>>,
+    faker: JsonFakers,
 
     /// Relation definitions
     #[serde(default)]
@@ -56,9 +56,9 @@ struct JsonConfig {
     #[serde(default)]
     ignore: Vec<JsonTableRef>,
 
-    /// Anonymization rules per table
+    /// Anonymization rules per table (array format with optional when)
     #[serde(default)]
-    anonymize: HashMap<String, Vec<JsonAnonymizeRule>>,
+    anonymize: JsonAnonymizeBlocks,
 
     /// Aggregate definitions
     #[serde(default)]
@@ -90,6 +90,47 @@ struct JsonVariable {
     default: Option<serde_json::Value>,
 }
 
+/// Faker pools - supports both HashMap format and array format with `when`
+#[derive(Debug, Default, Deserialize)]
+#[serde(untagged)]
+enum JsonFakers {
+    /// Simple HashMap format: {"emails": ["a@b.c"]}
+    Map(HashMap<String, Vec<String>>),
+    /// Array format with when: [{"name": "emails", "values": ["a@b.c"], "when": "$cond"}]
+    Array(Vec<JsonFaker>),
+    #[default]
+    Empty,
+}
+
+#[derive(Debug, Deserialize)]
+struct JsonFaker {
+    name: String,
+    values: Vec<String>,
+    #[serde(default)]
+    when: Option<String>,
+}
+
+/// Anonymize blocks - supports both HashMap format and array format with `when`
+#[derive(Debug, Default, Deserialize)]
+#[serde(untagged)]
+enum JsonAnonymizeBlocks {
+    /// Simple HashMap format: {"users": [...]}
+    Map(HashMap<String, Vec<JsonAnonymizeRule>>),
+    /// Array format with when: [{"table": "users", "rules": [...], "when": "$cond"}]
+    Array(Vec<JsonAnonymizeBlock>),
+    #[default]
+    Empty,
+}
+
+#[derive(Debug, Deserialize)]
+struct JsonAnonymizeBlock {
+    table: String,
+    #[serde(default)]
+    rules: Vec<JsonAnonymizeRule>,
+    #[serde(default)]
+    when: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct JsonImport {
     path: String,
@@ -101,6 +142,8 @@ struct JsonImport {
 struct JsonRelation {
     from: String,
     to: String,
+    #[serde(default)]
+    when: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -129,6 +172,8 @@ struct JsonAggregate {
     order_by: Option<JsonOrderBy>,
     #[serde(default)]
     limit: Option<JsonLimit>,
+    #[serde(default)]
+    when: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -154,6 +199,8 @@ struct JsonInclude {
     aggregate: String,
     #[serde(default, rename = "where")]
     where_clause: Option<String>,
+    #[serde(default)]
+    when: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -161,6 +208,8 @@ struct JsonPreserve {
     table: String,
     #[serde(rename = "where")]
     where_clause: String,
+    #[serde(default)]
+    when: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -170,6 +219,8 @@ struct JsonSet {
     match_clause: HashMap<String, serde_json::Value>,
     #[serde(default)]
     value: HashMap<String, serde_json::Value>,
+    #[serde(default)]
+    when: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -533,19 +584,44 @@ impl JsonResolver {
         }
     }
 
-    fn process_fakers(&mut self, fakers: &HashMap<String, Vec<String>>) -> Result<()> {
-        for (name, values) in fakers {
-            let resolved: Vec<String> = values
-                .iter()
-                .map(|v| self.interpolate_string(v))
-                .collect::<Result<Vec<_>>>()?;
-            self.plan.fakers.insert(name.clone(), resolved);
+    fn process_fakers(&mut self, fakers: &JsonFakers) -> Result<()> {
+        match fakers {
+            JsonFakers::Map(map) => {
+                for (name, values) in map {
+                    let resolved: Vec<String> = values
+                        .iter()
+                        .map(|v| self.interpolate_string(v))
+                        .collect::<Result<Vec<_>>>()?;
+                    self.plan.fakers.insert(name.clone(), resolved);
+                }
+            }
+            JsonFakers::Array(arr) => {
+                for faker in arr {
+                    if let Some(when) = &faker.when {
+                        if !self.evaluate_condition_string(when)? {
+                            continue;
+                        }
+                    }
+                    let resolved: Vec<String> = faker
+                        .values
+                        .iter()
+                        .map(|v| self.interpolate_string(v))
+                        .collect::<Result<Vec<_>>>()?;
+                    self.plan.fakers.insert(faker.name.clone(), resolved);
+                }
+            }
+            JsonFakers::Empty => {}
         }
         Ok(())
     }
 
     fn process_relations(&mut self, relations: &[JsonRelation]) -> Result<()> {
         for rel in relations {
+            if let Some(when) = &rel.when {
+                if !self.evaluate_condition_string(when)? {
+                    continue;
+                }
+            }
             let (from_table, from_column) = parse_column_ref(&rel.from)?;
             let (to_table, to_column) = parse_column_ref(&rel.to)?;
 
@@ -583,36 +659,63 @@ impl JsonResolver {
         Ok(())
     }
 
-    fn process_anonymize(
-        &mut self,
-        anonymize: &HashMap<String, Vec<JsonAnonymizeRule>>,
-    ) -> Result<()> {
-        for (table, rules) in anonymize {
-            let mut resolved_rules = Vec::new();
-            for rule in rules {
-                let target = if rule.null == Some(true) {
-                    AnonymizeTarget::Null
-                } else if let Some(faker) = &rule.faker {
-                    AnonymizeTarget::Faker(faker.clone())
-                } else {
-                    return Err(ClientError::Parse(format!(
-                        "Anonymize rule for {}.{} must specify 'faker' or 'null: true'",
-                        table, rule.column
-                    )));
-                };
-
-                resolved_rules.push(AnonymizeRule {
-                    column: rule.column.clone(),
-                    target,
-                });
+    fn process_anonymize(&mut self, anonymize: &JsonAnonymizeBlocks) -> Result<()> {
+        match anonymize {
+            JsonAnonymizeBlocks::Map(map) => {
+                for (table, rules) in map {
+                    self.add_anonymize_rules(table, rules)?;
+                }
             }
-            self.plan.anonymization.insert(table.clone(), resolved_rules);
+            JsonAnonymizeBlocks::Array(arr) => {
+                for block in arr {
+                    if let Some(when) = &block.when {
+                        if !self.evaluate_condition_string(when)? {
+                            continue;
+                        }
+                    }
+                    self.add_anonymize_rules(&block.table, &block.rules)?;
+                }
+            }
+            JsonAnonymizeBlocks::Empty => {}
         }
+        Ok(())
+    }
+
+    fn add_anonymize_rules(&mut self, table: &str, rules: &[JsonAnonymizeRule]) -> Result<()> {
+        let mut resolved_rules = Vec::new();
+        for rule in rules {
+            let target = if rule.null == Some(true) {
+                AnonymizeTarget::Null
+            } else if let Some(faker) = &rule.faker {
+                AnonymizeTarget::Faker(faker.clone())
+            } else {
+                return Err(ClientError::Parse(format!(
+                    "Anonymize rule for {}.{} must specify 'faker' or 'null: true'",
+                    table, rule.column
+                )));
+            };
+
+            resolved_rules.push(AnonymizeRule {
+                column: rule.column.clone(),
+                target,
+            });
+        }
+        self.plan
+            .anonymization
+            .entry(table.to_string())
+            .or_default()
+            .extend(resolved_rules);
         Ok(())
     }
 
     fn process_aggregates(&mut self, aggregates: &[JsonAggregate]) -> Result<()> {
         for agg in aggregates {
+            if let Some(when) = &agg.when {
+                if !self.evaluate_condition_string(when)? {
+                    continue;
+                }
+            }
+
             let where_clause = agg
                 .where_clause
                 .as_ref()
@@ -659,6 +762,12 @@ impl JsonResolver {
 
     fn process_includes(&mut self, includes: &[JsonInclude]) -> Result<()> {
         for include in includes {
+            if let Some(when) = &include.when {
+                if !self.evaluate_condition_string(when)? {
+                    continue;
+                }
+            }
+
             if let Some(existing) = self
                 .plan
                 .aggregates
@@ -682,6 +791,11 @@ impl JsonResolver {
 
     fn process_preserves(&mut self, preserves: &[JsonPreserve]) -> Result<()> {
         for preserve in preserves {
+            if let Some(when) = &preserve.when {
+                if !self.evaluate_condition_string(when)? {
+                    continue;
+                }
+            }
             self.plan.preserves.push(PreserveRule {
                 table: preserve.table.clone(),
                 where_clause: self.interpolate_string(&preserve.where_clause)?,
@@ -692,6 +806,12 @@ impl JsonResolver {
 
     fn process_sets(&mut self, sets: &[JsonSet]) -> Result<()> {
         for set in sets {
+            if let Some(when) = &set.when {
+                if !self.evaluate_condition_string(when)? {
+                    continue;
+                }
+            }
+
             let match_clause: Vec<Assignment> = set
                 .match_clause
                 .iter()
