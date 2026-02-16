@@ -222,19 +222,6 @@ pub async fn run_import(config: ImportConfig) -> Result<()> {
 
     // Create execution plan - either from config file or empty (import all tables)
     let mut plan = if let Some(config_path) = &config.config_path {
-        // Parse the .jibs file
-        let source = std::fs::read_to_string(config_path)?;
-        let program = jibs_parser::parse(&source).map_err(|errors| {
-            anyhow::anyhow!(
-                "Parse failed: {}",
-                errors
-                    .iter()
-                    .map(|e| e.to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
-        })?;
-
         // Load additional variables from file if specified
         let mut vars = config.vars.clone();
         if let Some(var_file) = &config.var_file {
@@ -248,9 +235,34 @@ pub async fn run_import(config: ImportConfig) -> Result<()> {
             }
         }
 
-        // Resolve the execution plan
-        resolver::resolve(config_path, &program, &vars)
-            .map_err(|e| anyhow::anyhow!("Resolution failed: {}", e))?
+        // Detect file type by extension
+        let extension = config_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("");
+
+        if extension == "json" {
+            // Parse as JSON config
+            crate::json_config::parse_json_config(config_path, &vars)
+                .map_err(|e| anyhow::anyhow!("JSON config error: {}", e))?
+        } else {
+            // Parse as .jibs DSL
+            let source = std::fs::read_to_string(config_path)?;
+            let program = jibs_parser::parse(&source).map_err(|errors| {
+                anyhow::anyhow!(
+                    "Parse failed: {}",
+                    errors
+                        .iter()
+                        .map(|e| e.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })?;
+
+            // Resolve the execution plan
+            resolver::resolve(config_path, &program, &vars)
+                .map_err(|e| anyhow::anyhow!("Resolution failed: {}", e))?
+        }
     } else {
         // No config file - import all tables
         info!("No config file specified, importing all tables");

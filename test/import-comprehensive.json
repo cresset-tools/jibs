@@ -1,0 +1,62 @@
+{
+  "variable": [
+    {"name": "user_id", "type": "int", "default": 1},
+    {"name": "base_domain", "type": "string", "default": "localhost"},
+    {"name": "order_limit", "type": "int", "default": 100},
+    {"name": "production", "type": "bool", "default": false},
+    {"name": "skip_sessions", "type": "bool", "default": true}
+  ],
+  "faker": {
+    "emails": ["user1@test.local", "user2@test.local"],
+    "names": ["John", "Jane", "Bob"]
+  },
+  "relation": [
+    {"from": "orders.user_id", "to": "users.id"},
+    {"from": "order_items.order_id", "to": "orders.id"},
+    {"from": "order_items.product_id", "to": "products.id"}
+  ],
+  "exclude": [
+    {"table": "audit_log"},
+    {"table": "debug_log", "when": "$production"}
+  ],
+  "ignore": [
+    {"table": "cache"},
+    {"table": "sessions", "when": "$skip_sessions"}
+  ],
+  "anonymize": {
+    "users": [
+      {"column": "email", "faker": "emails"},
+      {"column": "password_hash", "null": true}
+    ]
+  },
+  "aggregate": [
+    {
+      "name": "recent_orders",
+      "root": "orders",
+      "where": "user_id = {$user_id}",
+      "order_by": {"column": "created_at", "direction": "desc"},
+      "limit": "$order_limit"
+    },
+    {
+      "name": "all_products",
+      "root": "products"
+    }
+  ],
+  "include": [
+    {"aggregate": "recent_orders", "where": "total > 100"}
+  ],
+  "preserve": [
+    {"table": "settings", "where": "scope = 'local'"}
+  ],
+  "set": [
+    {
+      "table": "config",
+      "match": {"key": "app_url"},
+      "value": {"value": "https://{$base_domain}/"}
+    }
+  ],
+  "after": [
+    {"sql": "UPDATE users SET password_hash = 'test' WHERE password_hash IS NULL"},
+    {"sql": "UPDATE settings SET debug = 1", "when": "!$production"}
+  ]
+}
