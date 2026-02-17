@@ -1,4 +1,6 @@
 // Test circular foreign key handling
+// Uses the org_chart database (separate from e-commerce production database)
+//
 // This tests the scenario where:
 // - employees.department_id -> departments.id
 // - departments.head_employee_id -> employees.id  (circular!)
@@ -27,14 +29,6 @@ aggregate engineering_team {
     root departments
     where "name = 'Engineering'"
 }
-
-// Exclude tables from the original e-commerce schema
-ignore_table users
-ignore_table orders
-ignore_table order_items
-ignore_table products
-ignore_table audit_log
-ignore_table sessions
 
 // Anonymize employee emails
 anonymize employees {
