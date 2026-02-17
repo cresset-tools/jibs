@@ -33,8 +33,12 @@ pub struct ExecutionPlan {
     pub aggregates: Vec<ResolvedAggregate>,
     /// Tables to exclude entirely (no data, but structure preserved)
     pub excluded_tables: HashSet<String>,
+    /// Regex patterns for tables to exclude (expanded server-side)
+    pub excluded_patterns: Vec<String>,
     /// Tables to ignore (no structure either)
     pub ignored_tables: HashSet<String>,
+    /// Regex patterns for tables to ignore (expanded server-side)
+    pub ignored_patterns: Vec<String>,
     /// Anonymization rules per table
     pub anonymization: HashMap<String, Vec<AnonymizeRule>>,
     /// Faker pools (resolved values)
@@ -65,7 +69,9 @@ impl ExecutionPlan {
             relations: Vec::new(),
             aggregates: Vec::new(),
             excluded_tables: HashSet::new(),
+            excluded_patterns: Vec::new(),
             ignored_tables: HashSet::new(),
+            ignored_patterns: Vec::new(),
             anonymization: HashMap::new(),
             fakers: HashMap::new(),
             preserves: Vec::new(),

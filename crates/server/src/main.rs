@@ -121,7 +121,7 @@ fn run() -> Result<()> {
         }
     };
 
-    let (plan, client_compression) = match init_msg {
+    let (mut plan, client_compression) = match init_msg {
         ClientMessage::Init { plan, compression } => (plan, compression),
         _ => {
             return Err(ServerError::Protocol(
@@ -134,7 +134,7 @@ fn run() -> Result<()> {
     let mut conn = MySqlConnection::connect(&mysql_url)?;
 
     // Discover tables and build table info
-    let tables = conn.discover_tables(&plan)?;
+    let tables = conn.discover_tables(&mut plan)?;
 
     // Negotiate compression
     let compression = negotiate_compression(client_compression);

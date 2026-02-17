@@ -9,6 +9,17 @@ use jibs_protocol::{ColumnDef, ColumnFlags, ExecutionPlan, TableInfo};
 
 use crate::error::{Result, ServerError};
 
+/// Compile a list of regex pattern strings into Regex objects
+fn compile_patterns(patterns: &[String]) -> Result<Vec<regex::Regex>> {
+    patterns
+        .iter()
+        .map(|p| {
+            regex::Regex::new(p)
+                .map_err(|e| ServerError::Config(format!("Invalid regex pattern '{}': {}", p, e)))
+        })
+        .collect()
+}
+
 /// MySQL connection wrapper
 pub struct MySqlConnection {
     conn: Conn,
@@ -39,33 +50,46 @@ impl MySqlConnection {
         Ok(table_names)
     }
 
-    /// Discover tables and their metadata
-    pub fn discover_tables(&mut self, plan: &ExecutionPlan) -> Result<Vec<TableInfo>> {
+    /// Discover tables and their metadata.
+    /// Regex patterns in the plan are expanded into the exact table name sets.
+    pub fn discover_tables(&mut self, plan: &mut ExecutionPlan) -> Result<Vec<TableInfo>> {
         let mut tables = Vec::new();
 
         // Get all tables from the database
         let table_names = self.get_all_table_names()?;
 
-        for table_name in table_names {
+        // Expand regex patterns into the exact table name sets
+        let ignored_regexes = compile_patterns(&plan.ignored_patterns)?;
+        let excluded_regexes = compile_patterns(&plan.excluded_patterns)?;
+        for table_name in &table_names {
+            if ignored_regexes.iter().any(|re| re.is_match(table_name)) {
+                plan.ignored_tables.insert(table_name.clone());
+            }
+            if excluded_regexes.iter().any(|re| re.is_match(table_name)) {
+                plan.excluded_tables.insert(table_name.clone());
+            }
+        }
+
+        for table_name in &table_names {
             // Skip ignored tables
-            if plan.ignored_tables.contains(&table_name) {
+            if plan.ignored_tables.contains(table_name) {
                 continue;
             }
 
             // Get estimated row count
-            let estimated_rows = self.get_estimated_row_count(&table_name)?;
+            let estimated_rows = self.get_estimated_row_count(table_name)?;
 
             // Get primary key columns
-            let primary_key = self.get_primary_key(&table_name)?;
+            let primary_key = self.get_primary_key(table_name)?;
 
             // Cache the schema
-            let schema = self.get_column_defs(&table_name)?;
+            let schema = self.get_column_defs(table_name)?;
             self.schemas.insert(table_name.clone(), schema);
             self.primary_keys
                 .insert(table_name.clone(), primary_key.clone());
 
             tables.push(TableInfo {
-                name: table_name,
+                name: table_name.clone(),
                 estimated_rows,
                 primary_key,
             });
