@@ -1,5 +1,6 @@
 //! Progress tracking for import operations
 
+use std::collections::{HashMap, VecDeque};
 use std::io::IsTerminal;
 use std::time::Instant;
 
@@ -25,18 +26,16 @@ pub struct ImportProgress {
     multi: MultiProgress,
     /// Overall tables progress bar
     overall_bar: ProgressBar,
-    /// Current table progress bar
-    table_bar: Option<ProgressBar>,
+    /// Active table progress bars (multiple tables can be in-flight)
+    table_bars: HashMap<String, ProgressBar>,
     /// Whether we're running in a TTY
     is_tty: bool,
     /// Start time of import
     start_time: Instant,
     /// Current statistics
     stats: ProgressStats,
-    /// Estimated rows for current table
-    current_table_rows: u64,
-    /// Current table name
-    current_table_name: Option<String>,
+    /// Rolling window of (timestamp, cumulative_bytes) for throughput calculation
+    throughput_samples: VecDeque<(Instant, u64)>,
 }
 
 impl ImportProgress {
@@ -70,7 +69,7 @@ impl ImportProgress {
         Self {
             multi,
             overall_bar,
-            table_bar: None,
+            table_bars: HashMap::new(),
             is_tty,
             start_time: Instant::now(),
             stats: ProgressStats {
@@ -80,22 +79,13 @@ impl ImportProgress {
                 rows_total: total_rows,
                 bytes_total: 0,
             },
-            current_table_rows: 0,
-            current_table_name: None,
+            throughput_samples: VecDeque::new(),
         }
     }
 
     /// Called when starting to import a table
     pub fn start_table(&mut self, name: &str, estimated_rows: u64) {
-        self.current_table_name = Some(name.to_string());
-        self.current_table_rows = 0;
-
         if self.is_tty {
-            // Remove old table bar if exists
-            if let Some(bar) = self.table_bar.take() {
-                bar.finish_and_clear();
-            }
-
             // Create new table progress bar
             let bar = self.multi.add(ProgressBar::new(estimated_rows));
             bar.set_style(
@@ -105,16 +95,15 @@ impl ImportProgress {
                     .progress_chars("=>-"),
             );
             bar.set_prefix(name.to_string());
-            self.table_bar = Some(bar);
+            self.table_bars.insert(name.to_string(), bar);
         }
     }
 
     /// Called when a data chunk is received
-    pub fn update_table(&mut self, rows: u32, bytes: usize) {
-        self.current_table_rows += rows as u64;
+    pub fn update_table(&mut self, name: &str, rows: u32, bytes: usize) {
         self.stats.bytes_total += bytes as u64;
 
-        if let Some(bar) = &self.table_bar {
+        if let Some(bar) = self.table_bars.get(name) {
             bar.inc(rows as u64);
         }
 
@@ -126,7 +115,7 @@ impl ImportProgress {
     pub fn finish_table(&mut self, name: &str, final_rows: u64) {
         self.stats.tables_completed += 1;
 
-        if let Some(bar) = self.table_bar.take() {
+        if let Some(bar) = self.table_bars.remove(name) {
             bar.set_position(final_rows);
             bar.finish_and_clear();
         }
@@ -138,8 +127,6 @@ impl ImportProgress {
             // Plain log output for non-TTY
             tracing::info!("Imported table {} ({} rows)", name, final_rows);
         }
-
-        self.current_table_name = None;
     }
 
     /// Called when skipping an already-completed table (resume)
@@ -153,7 +140,7 @@ impl ImportProgress {
 
     /// Called when import is fully complete
     pub fn finish(&self) {
-        if let Some(bar) = &self.table_bar {
+        for bar in self.table_bars.values() {
             bar.finish_and_clear();
         }
         self.overall_bar.finish_and_clear();
@@ -170,17 +157,34 @@ impl ImportProgress {
         );
     }
 
-    /// Update the overall progress bar message with throughput info
+    /// Update the overall progress bar message with rolling 5s throughput
     fn update_overall_message(&mut self) {
         if !self.is_tty {
             return;
         }
 
-        let elapsed = self.start_time.elapsed().as_secs_f64();
-        if elapsed > 0.0 {
-            let mb_per_sec = (self.stats.bytes_total as f64 / (1024.0 * 1024.0)) / elapsed;
-            let msg = format!("{:.1} MB/s", mb_per_sec);
-            self.overall_bar.set_message(msg);
+        let now = Instant::now();
+        self.throughput_samples
+            .push_back((now, self.stats.bytes_total));
+
+        // Remove samples older than 5 seconds
+        let cutoff = now - std::time::Duration::from_secs(5);
+        while self
+            .throughput_samples
+            .front()
+            .is_some_and(|(t, _)| *t < cutoff)
+        {
+            self.throughput_samples.pop_front();
+        }
+
+        if let Some((oldest_time, oldest_bytes)) = self.throughput_samples.front() {
+            let dt = now.duration_since(*oldest_time).as_secs_f64();
+            let db = self.stats.bytes_total - oldest_bytes;
+            if dt > 0.1 {
+                let mb_per_sec = (db as f64 / (1024.0 * 1024.0)) / dt;
+                self.overall_bar
+                    .set_message(format!("{:.1} MB/s", mb_per_sec));
+            }
         }
     }
 
@@ -198,7 +202,7 @@ impl ImportProgress {
 
 impl Drop for ImportProgress {
     fn drop(&mut self) {
-        if let Some(bar) = &self.table_bar {
+        for bar in self.table_bars.values() {
             bar.finish_and_clear();
         }
         self.overall_bar.finish_and_clear();
