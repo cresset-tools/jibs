@@ -1,7 +1,7 @@
 -- Seed data for circular foreign key testing
 -- Must handle the chicken-and-egg problem of circular FKs
 
-USE production;
+USE org_chart;
 
 -- Temporarily disable FK checks to insert circular data
 SET FOREIGN_KEY_CHECKS = 0;

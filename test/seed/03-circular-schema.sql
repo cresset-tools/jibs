@@ -1,7 +1,9 @@
 -- Circular foreign key schema for testing
 -- Creates a circular dependency: employees -> departments -> employees
 
-USE production;
+-- Create separate database for org chart / circular FK tests
+CREATE DATABASE IF NOT EXISTS org_chart;
+USE org_chart;
 
 -- Departments table (created first, FK added later)
 CREATE TABLE departments (
