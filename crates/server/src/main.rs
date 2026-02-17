@@ -12,6 +12,7 @@ mod mysql;
 mod traversal;
 mod tsv;
 
+use std::collections::HashSet;
 use std::io::{self, BufReader, BufWriter};
 
 use jibs_protocol::{
@@ -136,6 +137,39 @@ fn run() -> Result<()> {
 
     // Discover tables and build table info
     let tables = conn.discover_tables(&mut plan)?;
+
+    // Discover and merge database FK relations
+    let explicit_count = plan.relations.len();
+    let db_relations = conn.discover_foreign_keys()?;
+    let existing: HashSet<(String, String, String, String)> = plan
+        .relations
+        .iter()
+        .map(|r| {
+            (
+                r.from_table.clone(),
+                r.from_column.clone(),
+                r.to_table.clone(),
+                r.to_column.clone(),
+            )
+        })
+        .collect();
+    let mut added = 0usize;
+    for rel in db_relations {
+        let key = (
+            rel.from_table.clone(),
+            rel.from_column.clone(),
+            rel.to_table.clone(),
+            rel.to_column.clone(),
+        );
+        if !existing.contains(&key) {
+            plan.relations.push(rel);
+            added += 1;
+        }
+    }
+    eprintln!(
+        "Relations: {} explicit, {} discovered from FK constraints",
+        explicit_count, added
+    );
 
     // Negotiate compression
     let compression = negotiate_compression(client_compression);
