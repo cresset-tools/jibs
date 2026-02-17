@@ -1,0 +1,62 @@
+// Test circular foreign key handling
+// This tests the scenario where:
+// - employees.department_id -> departments.id
+// - departments.head_employee_id -> employees.id  (circular!)
+// - employees.manager_id -> employees.id (self-reference)
+
+// Define the circular relations
+relation employees.department_id -> departments.id
+relation employees.manager_id -> employees.id
+relation departments.head_employee_id -> employees.id
+
+// Project relations
+relation projects.department_id -> departments.id
+relation projects.lead_employee_id -> employees.id
+relation project_assignments.project_id -> projects.id
+relation project_assignments.employee_id -> employees.id
+
+// Import the Engineering department and all related data
+// This should pull in:
+// - The department itself
+// - All employees in that department
+// - The department head (who may be in the same department - circular!)
+// - All managers up the chain
+// - All projects for the department
+// - All project assignments
+aggregate engineering_team {
+    root departments
+    where "name = 'Engineering'"
+}
+
+// Exclude tables from the original e-commerce schema
+ignore_table users
+ignore_table orders
+ignore_table order_items
+ignore_table products
+ignore_table audit_log
+ignore_table sessions
+
+// Anonymize employee emails
+anonymize employees {
+    email -> employee_emails
+    salary -> null
+}
+
+// Faker pool for employee emails
+faker employee_emails [
+    "employee1@anon.local",
+    "employee2@anon.local",
+    "employee3@anon.local",
+    "employee4@anon.local",
+    "employee5@anon.local",
+    "employee6@anon.local",
+    "employee7@anon.local",
+    "employee8@anon.local",
+    "employee9@anon.local",
+    "employee10@anon.local"
+]
+
+// Set salary to a fixed value after import
+after {
+    """UPDATE employees SET salary = 100000.00 WHERE salary IS NULL"""
+}
