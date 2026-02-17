@@ -497,12 +497,37 @@ impl<'a> DependencyTraverser<'a> {
                     // Dedup check
                     let pk = extract_pk_from_row(&row, &pk_columns);
                     let pk_bytes = serialize_pk(&pk);
-                    if !visited
+                    let is_new = visited
                         .entry(root_table.clone())
                         .or_default()
-                        .insert(pk_bytes)
-                    {
-                        continue; // Already visited
+                        .insert(pk_bytes);
+
+                    // Always extract backward FK values from root table rows,
+                    // even for already-visited rows. A previous aggregate may have
+                    // reached this table via forward traversal (which skips backward
+                    // relations), so we need to ensure child tables are discovered.
+                    for relation in &backward_relations {
+                        if !all_table_names.contains(&relation.from_table) || !all_table_names.contains(&relation.to_table) {
+                            continue;
+                        }
+                        if let Some(Ok(v)) =
+                            row.get_opt::<MySqlValue, _>(relation.to_column.as_str())
+                        {
+                            if !matches!(v, MySqlValue::NULL) {
+                                fk_accumulator
+                                    .entry((
+                                        relation.from_table.clone(),
+                                        relation.from_column.clone(),
+                                        true,
+                                    ))
+                                    .or_default()
+                                    .push(v);
+                            }
+                        }
+                    }
+
+                    if !is_new {
+                        continue; // Already visited — skip TSV and forward FK extraction
                     }
 
                     // Extract FK values for forward relations
@@ -519,27 +544,6 @@ impl<'a> DependencyTraverser<'a> {
                                         relation.to_table.clone(),
                                         relation.to_column.clone(),
                                         false,
-                                    ))
-                                    .or_default()
-                                    .push(v);
-                            }
-                        }
-                    }
-
-                    // Extract FK values for backward relations (bidirectional from root)
-                    for relation in &backward_relations {
-                        if !all_table_names.contains(&relation.from_table) || !all_table_names.contains(&relation.to_table) {
-                            continue;
-                        }
-                        if let Some(Ok(v)) =
-                            row.get_opt::<MySqlValue, _>(relation.to_column.as_str())
-                        {
-                            if !matches!(v, MySqlValue::NULL) {
-                                fk_accumulator
-                                    .entry((
-                                        relation.from_table.clone(),
-                                        relation.from_column.clone(),
-                                        true,
                                     ))
                                     .or_default()
                                     .push(v);
