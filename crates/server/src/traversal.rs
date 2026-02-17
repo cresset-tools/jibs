@@ -2,15 +2,16 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write;
+use std::sync::{mpsc, Arc, Mutex};
 
 use mysql::{Row, Value as MySqlValue};
 
 use jibs_protocol::{
-    framing::write_message, Checkpoint, ColumnDef, CompressionMode, ExecutionPlan, Relation,
-    ResolvedAggregate, ServerMessage, SortDirection,
+    framing::write_message, AnonymizeRule, Checkpoint, ColumnDef, CompressionMode, ExecutionPlan,
+    Relation, ResolvedAggregate, ServerMessage, SortDirection,
 };
 
-use crate::error::Result;
+use crate::error::{Result, ServerError};
 use crate::mysql::MySqlConnection;
 use crate::tsv::TsvWriter;
 
@@ -18,6 +19,13 @@ use crate::tsv::TsvWriter;
 const CHUNK_ROW_LIMIT: usize = 10_000;
 /// Maximum bytes per chunk
 const CHUNK_BYTE_LIMIT: usize = 10 * 1024 * 1024; // 10MB
+
+/// A table task for parallel streaming
+struct TableTask {
+    table: String,
+    columns: Vec<ColumnDef>,
+    anonymization: Vec<AnonymizeRule>,
+}
 
 // ============================================================================
 // Streaming helpers
@@ -112,11 +120,14 @@ impl<'a> DependencyTraverser<'a> {
     /// 4. Ignored tables: skip entirely
     ///
     /// If `resume_from` is provided, skip tables already completed.
+    /// If `parallel > 1`, Phase 2 uses worker threads with their own MySQL connections.
     pub fn stream_all_tables<W: Write>(
         &mut self,
         resume_from: Option<Checkpoint>,
         compression: CompressionMode,
         writer: &mut W,
+        parallel: u32,
+        mysql_url: &str,
     ) -> Result<()> {
         let mut checkpoint = resume_from.unwrap_or_default();
 
@@ -125,9 +136,11 @@ impl<'a> DependencyTraverser<'a> {
         // Returns the set of tables that were touched by aggregates.
         let aggregate_tables = self.stream_aggregate_tables(compression, &mut checkpoint, writer)?;
 
-        // Phase 2: Stream non-aggregate tables one at a time.
+        // Phase 2: Stream non-aggregate tables.
+        // Collect the list of tables to stream with their metadata.
         let all_tables: Vec<String> = self.conn.get_all_table_names()?;
 
+        let mut tables_to_stream: Vec<TableTask> = Vec::new();
         for table in all_tables {
             if self.plan.ignored_tables.contains(&table) {
                 continue;
@@ -150,24 +163,45 @@ impl<'a> DependencyTraverser<'a> {
                 .cloned()
                 .unwrap_or_default();
 
-            let total_rows = self.stream_full_table(
-                &table,
-                &columns,
+            tables_to_stream.push(TableTask {
+                table,
+                columns,
                 anonymization,
+            });
+        }
+
+        if parallel <= 1 || tables_to_stream.len() <= 1 {
+            // Sequential path
+            for task in tables_to_stream {
+                let total_rows = self.stream_full_table(
+                    &task.table,
+                    &task.columns,
+                    task.anonymization,
+                    compression,
+                    &mut checkpoint,
+                    writer,
+                )?;
+
+                if total_rows > 0 {
+                    write_message(
+                        writer,
+                        &ServerMessage::TableDone {
+                            table: task.table.clone(),
+                            row_count: total_rows,
+                        },
+                    )?;
+                }
+            }
+        } else {
+            // Parallel path
+            self.stream_full_tables_parallel(
+                tables_to_stream,
                 compression,
                 &mut checkpoint,
                 writer,
+                parallel as usize,
+                mysql_url,
             )?;
-
-            if total_rows > 0 {
-                write_message(
-                    writer,
-                    &ServerMessage::TableDone {
-                        table: table.clone(),
-                        row_count: total_rows,
-                    },
-                )?;
-            }
         }
 
         Ok(())
@@ -241,6 +275,120 @@ impl<'a> DependencyTraverser<'a> {
         }
 
         Ok(total_rows)
+    }
+
+    /// Stream full tables in parallel using worker threads.
+    ///
+    /// Each worker opens its own MySQL connection and streams assigned tables.
+    /// Workers send ServerMessage values through a bounded channel.
+    /// The main thread drains the channel and writes to stdout.
+    fn stream_full_tables_parallel<W: Write>(
+        &self,
+        tables: Vec<TableTask>,
+        compression: CompressionMode,
+        checkpoint: &mut Checkpoint,
+        writer: &mut W,
+        num_workers: usize,
+        mysql_url: &str,
+    ) -> Result<()> {
+        let num_workers = num_workers.min(tables.len());
+
+        // Distribute tables round-robin across workers
+        let mut worker_tasks: Vec<Vec<TableTask>> = (0..num_workers).map(|_| Vec::new()).collect();
+        for (i, task) in tables.into_iter().enumerate() {
+            worker_tasks[i % num_workers].push(task);
+        }
+
+        // Bounded channel: workers send messages, main thread writes them
+        let (tx, rx) = mpsc::sync_channel::<ServerMessage>(num_workers * 4);
+
+        // Shared checkpoint for workers to update bytes/rows counters
+        let shared_checkpoint = Arc::new(Mutex::new(checkpoint.clone()));
+
+        // Clone data workers need
+        let fakers = self.plan.fakers.clone();
+        let mysql_url = mysql_url.to_string();
+
+        // Spawn worker threads
+        let mut handles = Vec::with_capacity(num_workers);
+        for tasks in worker_tasks {
+            let tx = tx.clone();
+            let fakers = fakers.clone();
+            let mysql_url = mysql_url.clone();
+            let shared_checkpoint = Arc::clone(&shared_checkpoint);
+
+            let handle = std::thread::spawn(move || -> Result<()> {
+                let mut conn = MySqlConnection::connect(&mysql_url)?;
+
+                for task in tasks {
+                    let result = stream_full_table_to_channel(
+                        &mut conn,
+                        &task.table,
+                        &task.columns,
+                        task.anonymization,
+                        compression,
+                        &fakers,
+                        &shared_checkpoint,
+                        &tx,
+                    );
+
+                    if let Err(e) = result {
+                        // Send error through channel before returning
+                        let _ = tx.send(ServerMessage::Error {
+                            message: e.to_string(),
+                            recoverable: e.is_recoverable(),
+                        });
+                        return Err(e);
+                    }
+                }
+
+                Ok(())
+            });
+
+            handles.push(handle);
+        }
+
+        // Drop our copy of tx so the channel closes when all workers finish
+        drop(tx);
+
+        // Writer loop: drain channel and write to stdout
+        for msg in rx {
+            write_message(writer, &msg)?;
+        }
+
+        // Join all workers and propagate first error
+        let mut first_error: Option<ServerError> = None;
+        for handle in handles {
+            match handle.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    if first_error.is_none() {
+                        first_error = Some(e);
+                    }
+                }
+                Err(_) => {
+                    if first_error.is_none() {
+                        first_error =
+                            Some(ServerError::Protocol("Worker thread panicked".to_string()));
+                    }
+                }
+            }
+        }
+
+        if let Some(e) = first_error {
+            return Err(e);
+        }
+
+        // Update checkpoint from shared state
+        let final_checkpoint = shared_checkpoint.lock().unwrap();
+        checkpoint.bytes_transferred = final_checkpoint.bytes_transferred;
+        checkpoint.rows_transferred = final_checkpoint.rows_transferred;
+        // Merge completed tables
+        for table in &final_checkpoint.completed_tables {
+            checkpoint.completed_tables.insert(table.clone());
+        }
+
+        Ok(())
     }
 
     /// Stream all rows reachable from aggregates via BFS relation traversal.
@@ -755,4 +903,109 @@ fn maybe_compress(data: Vec<u8>, mode: CompressionMode) -> Vec<u8> {
             }
         }
     }
+}
+
+/// Stream a full table using its own MySQL connection, sending messages through a channel.
+/// Used by worker threads in parallel mode.
+fn stream_full_table_to_channel(
+    conn: &mut MySqlConnection,
+    table: &str,
+    columns: &[ColumnDef],
+    anonymization: Vec<AnonymizeRule>,
+    compression: CompressionMode,
+    fakers: &HashMap<String, Vec<String>>,
+    shared_checkpoint: &Arc<Mutex<Checkpoint>>,
+    tx: &mpsc::SyncSender<ServerMessage>,
+) -> Result<()> {
+    let column_names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
+    let mut tsv_writer = TsvWriter::new(column_names, anonymization, fakers.clone());
+    let mut total_rows: u64 = 0;
+    let mut chunk_row_count: u32 = 0;
+    let mut schema_sent = false;
+
+    let query = format!("SELECT * FROM `{}`", table);
+    let result = conn.query_iter(&query)?;
+
+    for row_result in result {
+        let row: Row = row_result?;
+
+        // Send schema before first row
+        if !schema_sent {
+            tx.send(ServerMessage::Schema {
+                table: table.to_string(),
+                columns: columns.to_vec(),
+            })
+            .map_err(|_| {
+                crate::error::ServerError::Protocol("Channel closed".to_string())
+            })?;
+            schema_sent = true;
+        }
+
+        tsv_writer.write_row(&row)?;
+        chunk_row_count += 1;
+        total_rows += 1;
+
+        if chunk_row_count >= CHUNK_ROW_LIMIT as u32
+            || tsv_writer.buffer_size() >= CHUNK_BYTE_LIMIT
+        {
+            // Flush chunk through channel
+            let tsv_data = tsv_writer.take_buffer();
+            let bytes = tsv_data.len() as u64;
+
+            // Update shared checkpoint
+            {
+                let mut cp = shared_checkpoint.lock().unwrap();
+                cp.bytes_transferred += bytes;
+                cp.rows_transferred += chunk_row_count as u64;
+            }
+
+            let checkpoint = shared_checkpoint.lock().unwrap().clone();
+            let msg = ServerMessage::Data {
+                table: table.to_string(),
+                row_count: chunk_row_count,
+                tsv_data: maybe_compress(tsv_data, compression),
+                checkpoint,
+            };
+            tx.send(msg).map_err(|_| {
+                crate::error::ServerError::Protocol("Channel closed".to_string())
+            })?;
+            chunk_row_count = 0;
+        }
+    }
+
+    // Flush remaining data
+    if chunk_row_count > 0 {
+        let tsv_data = tsv_writer.take_buffer();
+        let bytes = tsv_data.len() as u64;
+
+        {
+            let mut cp = shared_checkpoint.lock().unwrap();
+            cp.bytes_transferred += bytes;
+            cp.rows_transferred += chunk_row_count as u64;
+        }
+
+        let checkpoint = shared_checkpoint.lock().unwrap().clone();
+        let msg = ServerMessage::Data {
+            table: table.to_string(),
+            row_count: chunk_row_count,
+            tsv_data: maybe_compress(tsv_data, compression),
+            checkpoint,
+        };
+        tx.send(msg).map_err(|_| {
+            crate::error::ServerError::Protocol("Channel closed".to_string())
+        })?;
+    }
+
+    // Send TableDone
+    if total_rows > 0 {
+        tx.send(ServerMessage::TableDone {
+            table: table.to_string(),
+            row_count: total_rows,
+        })
+        .map_err(|_| {
+            crate::error::ServerError::Protocol("Channel closed".to_string())
+        })?;
+    }
+
+    Ok(())
 }
