@@ -3,15 +3,17 @@
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::sync::{mpsc, Arc, Mutex};
+use std::time::Instant;
 
 use mysql::{Row, Value as MySqlValue};
 
 use jibs_protocol::{
     framing::write_message, AnonymizeRule, Checkpoint, ColumnDef, CompressionMode, ExecutionPlan,
-    Relation, ResolvedAggregate, ServerMessage, SortDirection,
+    Relation, ResolvedAggregate, ServerMessage, ServerMetrics, SortDirection,
 };
 
 use crate::error::{Result, ServerError};
+use crate::metrics::MetricsCollector;
 use crate::mysql::MySqlConnection;
 use crate::tsv::TsvWriter;
 
@@ -34,7 +36,6 @@ struct TableTask {
 // ============================================================================
 
 /// Flush a TSV buffer as a Data message if non-empty.
-/// Returns the number of bytes flushed.
 fn flush_chunk<W: Write>(
     table: &str,
     tsv_writer: &mut TsvWriter,
@@ -42,6 +43,7 @@ fn flush_chunk<W: Write>(
     compression: CompressionMode,
     checkpoint: &mut Checkpoint,
     writer: &mut W,
+    metrics: &MetricsCollector,
 ) -> Result<()> {
     if tsv_writer.is_empty() {
         return Ok(());
@@ -52,13 +54,22 @@ fn flush_chunk<W: Write>(
     checkpoint.bytes_transferred += bytes;
     checkpoint.rows_transferred += chunk_row_count as u64;
 
+    // Track bytes sent for metrics
+    metrics.add_bytes_sent(bytes);
+    metrics.add_rows_sent(chunk_row_count as u64);
+
     let msg = ServerMessage::Data {
         table: table.to_string(),
         row_count: chunk_row_count,
         tsv_data: maybe_compress(tsv_data, compression),
         checkpoint: checkpoint.clone(),
     };
+
+    // Time the write operation (includes flush)
+    let write_start = Instant::now();
     write_message(writer, &msg)?;
+    metrics.add_write_time(write_start.elapsed());
+
     Ok(())
 }
 
@@ -86,11 +97,17 @@ pub struct DependencyTraverser<'a> {
     relations_by_source: HashMap<String, Vec<&'a Relation>>,
     /// Relations indexed by target table
     relations_by_target: HashMap<String, Vec<&'a Relation>>,
+    /// Metrics collector for timing
+    metrics: Arc<MetricsCollector>,
 }
 
 impl<'a> DependencyTraverser<'a> {
     /// Create a new traverser
-    pub fn new(conn: &'a mut MySqlConnection, plan: &'a ExecutionPlan) -> Result<Self> {
+    pub fn new(
+        conn: &'a mut MySqlConnection,
+        plan: &'a ExecutionPlan,
+        collect_metrics: bool,
+    ) -> Result<Self> {
         let mut relations_by_source: HashMap<String, Vec<&Relation>> = HashMap::new();
         let mut relations_by_target: HashMap<String, Vec<&Relation>> = HashMap::new();
 
@@ -105,12 +122,24 @@ impl<'a> DependencyTraverser<'a> {
                 .push(relation);
         }
 
+        let metrics = if collect_metrics {
+            Arc::new(MetricsCollector::enabled())
+        } else {
+            Arc::new(MetricsCollector::disabled())
+        };
+
         Ok(Self {
             conn,
             plan,
             relations_by_source,
             relations_by_target,
+            metrics,
         })
+    }
+
+    /// Get the collected metrics (if enabled)
+    pub fn get_metrics(&self) -> Option<ServerMetrics> {
+        self.metrics.to_server_metrics()
     }
 
     /// Stream all tables, processing one table at a time to avoid loading all rows into memory.
@@ -228,13 +257,21 @@ impl<'a> DependencyTraverser<'a> {
         let mut schema_sent = false;
 
         let query = format!("SELECT * FROM `{}`", table);
+
+        // Time the query execution
+        let query_start = Instant::now();
         let result = self.conn.query_iter(&query)?;
+        self.metrics.add_query_time(query_start.elapsed());
 
         for row_result in result {
+            // Time row iteration (fetch from network/buffer)
+            let iterate_start = Instant::now();
             let row: Row = row_result?;
+            self.metrics.add_iterate_time(iterate_start.elapsed());
 
             // Send schema before first row
             if !schema_sent {
+                let write_start = Instant::now();
                 write_message(
                     writer,
                     &ServerMessage::Schema {
@@ -242,10 +279,15 @@ impl<'a> DependencyTraverser<'a> {
                         columns: columns.to_vec(),
                     },
                 )?;
+                self.metrics.add_write_time(write_start.elapsed());
                 schema_sent = true;
             }
 
+            // Time serialization
+            let serialize_start = Instant::now();
             tsv_writer.write_row(&row)?;
+            self.metrics.add_serialize_time(serialize_start.elapsed());
+
             chunk_row_count += 1;
             total_rows += 1;
 
@@ -259,6 +301,7 @@ impl<'a> DependencyTraverser<'a> {
                     compression,
                     checkpoint,
                     writer,
+                    &self.metrics,
                 )?;
                 chunk_row_count = 0;
             }
@@ -273,6 +316,7 @@ impl<'a> DependencyTraverser<'a> {
                 compression,
                 checkpoint,
                 writer,
+                &self.metrics,
             )?;
         }
 
@@ -310,6 +354,7 @@ impl<'a> DependencyTraverser<'a> {
         // Clone data workers need
         let fakers = self.plan.fakers.clone();
         let mysql_url = mysql_url.to_string();
+        let metrics = Arc::clone(&self.metrics);
 
         // Spawn worker threads
         let mut handles = Vec::with_capacity(num_workers);
@@ -318,6 +363,7 @@ impl<'a> DependencyTraverser<'a> {
             let fakers = fakers.clone();
             let mysql_url = mysql_url.clone();
             let shared_checkpoint = Arc::clone(&shared_checkpoint);
+            let metrics = Arc::clone(&metrics);
 
             let handle = std::thread::spawn(move || -> Result<()> {
                 let mut conn = MySqlConnection::connect(&mysql_url)?;
@@ -332,6 +378,7 @@ impl<'a> DependencyTraverser<'a> {
                         &fakers,
                         &shared_checkpoint,
                         &tx,
+                        &metrics,
                     );
 
                     if let Err(e) = result {
@@ -354,8 +401,11 @@ impl<'a> DependencyTraverser<'a> {
         drop(tx);
 
         // Writer loop: drain channel and write to stdout
+        // Time the write operations
         for msg in rx {
+            let write_start = Instant::now();
             write_message(writer, &msg)?;
+            self.metrics.add_write_time(write_start.elapsed());
         }
 
         // Join all workers and propagate first error
@@ -478,13 +528,20 @@ impl<'a> DependencyTraverser<'a> {
 
             // Stream root table rows
             {
+                // Time query execution
+                let query_start = Instant::now();
                 let result = self.conn.query_iter(&root_query)?;
+                self.metrics.add_query_time(query_start.elapsed());
 
                 for row_result in result {
+                    // Time row iteration
+                    let iterate_start = Instant::now();
                     let row: Row = row_result?;
+                    self.metrics.add_iterate_time(iterate_start.elapsed());
 
                     // Send schema on first row
                     if schemas_sent.insert(root_table.clone()) {
+                        let write_start = Instant::now();
                         write_message(
                             writer,
                             &ServerMessage::Schema {
@@ -492,6 +549,7 @@ impl<'a> DependencyTraverser<'a> {
                                 columns: columns.clone(),
                             },
                         )?;
+                        self.metrics.add_write_time(write_start.elapsed());
                     }
 
                     // Dedup check
@@ -551,8 +609,11 @@ impl<'a> DependencyTraverser<'a> {
                         }
                     }
 
-                    // Write TSV
+                    // Write TSV - time serialization
+                    let serialize_start = Instant::now();
                     tsv_writer.write_row(&row)?;
+                    self.metrics.add_serialize_time(serialize_start.elapsed());
+
                     chunk_row_count += 1;
                     *table_row_counts.entry(root_table.clone()).or_default() += 1;
 
@@ -566,6 +627,7 @@ impl<'a> DependencyTraverser<'a> {
                             compression,
                             checkpoint,
                             writer,
+                            &self.metrics,
                         )?;
                         chunk_row_count = 0;
                     }
@@ -582,6 +644,7 @@ impl<'a> DependencyTraverser<'a> {
                     compression,
                     checkpoint,
                     writer,
+                    &self.metrics,
                 )?;
             }
 
@@ -665,13 +728,19 @@ impl<'a> DependencyTraverser<'a> {
                             );
                             let params: Vec<MySqlValue> = batch.to_vec();
 
+                            // Time query execution
+                            let query_start = Instant::now();
                             let result = self.conn.exec_iter(
                                 &query,
                                 mysql::Params::Positional(params),
                             )?;
+                            self.metrics.add_query_time(query_start.elapsed());
 
                             for row_result in result {
+                                // Time row iteration
+                                let iterate_start = Instant::now();
                                 let row: Row = row_result?;
+                                self.metrics.add_iterate_time(iterate_start.elapsed());
 
                                 // Dedup check
                                 let pk = extract_pk_from_row(&row, &pk_columns);
@@ -686,6 +755,7 @@ impl<'a> DependencyTraverser<'a> {
 
                                 // Send schema on first new row for this table
                                 if schemas_sent.insert(table.clone()) {
+                                    let write_start = Instant::now();
                                     write_message(
                                         writer,
                                         &ServerMessage::Schema {
@@ -693,6 +763,7 @@ impl<'a> DependencyTraverser<'a> {
                                             columns: columns.clone(),
                                         },
                                     )?;
+                                    self.metrics.add_write_time(write_start.elapsed());
                                 }
 
                                 // Extract FK values for forward relations
@@ -735,8 +806,11 @@ impl<'a> DependencyTraverser<'a> {
                                     }
                                 }
 
-                                // Write TSV
+                                // Write TSV - time serialization
+                                let serialize_start = Instant::now();
                                 tsv_writer.write_row(&row)?;
+                                self.metrics.add_serialize_time(serialize_start.elapsed());
+
                                 chunk_row_count += 1;
                                 *table_row_counts
                                     .entry(table.clone())
@@ -752,6 +826,7 @@ impl<'a> DependencyTraverser<'a> {
                                         compression,
                                         checkpoint,
                                         writer,
+                                        &self.metrics,
                                     )?;
                                     chunk_row_count = 0;
                                 }
@@ -769,6 +844,7 @@ impl<'a> DependencyTraverser<'a> {
                             compression,
                             checkpoint,
                             writer,
+                            &self.metrics,
                         )?;
                     }
                 }
@@ -788,6 +864,7 @@ impl<'a> DependencyTraverser<'a> {
 
         // Send TableDone for all aggregate tables that had rows
         for (table, row_count) in &table_row_counts {
+            let write_start = Instant::now();
             write_message(
                 writer,
                 &ServerMessage::TableDone {
@@ -795,6 +872,7 @@ impl<'a> DependencyTraverser<'a> {
                     row_count: *row_count,
                 },
             )?;
+            self.metrics.add_write_time(write_start.elapsed());
         }
 
         Ok(aggregate_tables)
@@ -949,6 +1027,7 @@ fn stream_full_table_to_channel(
     fakers: &HashMap<String, Vec<String>>,
     shared_checkpoint: &Arc<Mutex<Checkpoint>>,
     tx: &mpsc::SyncSender<ServerMessage>,
+    metrics: &Arc<MetricsCollector>,
 ) -> Result<()> {
     let column_names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
     let mut tsv_writer = TsvWriter::new(column_names, anonymization, fakers.clone());
@@ -957,10 +1036,17 @@ fn stream_full_table_to_channel(
     let mut schema_sent = false;
 
     let query = format!("SELECT * FROM `{}`", table);
+
+    // Time query execution
+    let query_start = Instant::now();
     let result = conn.query_iter(&query)?;
+    metrics.add_query_time(query_start.elapsed());
 
     for row_result in result {
+        // Time row iteration
+        let iterate_start = Instant::now();
         let row: Row = row_result?;
+        metrics.add_iterate_time(iterate_start.elapsed());
 
         // Send schema before first row
         if !schema_sent {
@@ -974,7 +1060,11 @@ fn stream_full_table_to_channel(
             schema_sent = true;
         }
 
+        // Time serialization
+        let serialize_start = Instant::now();
         tsv_writer.write_row(&row)?;
+        metrics.add_serialize_time(serialize_start.elapsed());
+
         chunk_row_count += 1;
         total_rows += 1;
 
@@ -984,6 +1074,10 @@ fn stream_full_table_to_channel(
             // Flush chunk through channel
             let tsv_data = tsv_writer.take_buffer();
             let bytes = tsv_data.len() as u64;
+
+            // Track metrics
+            metrics.add_bytes_sent(bytes);
+            metrics.add_rows_sent(chunk_row_count as u64);
 
             // Update shared checkpoint
             {
@@ -1010,6 +1104,10 @@ fn stream_full_table_to_channel(
     if chunk_row_count > 0 {
         let tsv_data = tsv_writer.take_buffer();
         let bytes = tsv_data.len() as u64;
+
+        // Track metrics
+        metrics.add_bytes_sent(bytes);
+        metrics.add_rows_sent(chunk_row_count as u64);
 
         {
             let mut cp = shared_checkpoint.lock().unwrap();
