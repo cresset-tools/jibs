@@ -356,6 +356,9 @@ impl<'a> DependencyTraverser<'a> {
 
                     // Extract FK values for forward relations
                     for relation in &forward_relations {
+                        if !all_table_names.contains(&relation.from_table) || !all_table_names.contains(&relation.to_table) {
+                            continue;
+                        }
                         if let Some(Ok(v)) =
                             row.get_opt::<MySqlValue, _>(relation.from_column.as_str())
                         {
@@ -374,6 +377,9 @@ impl<'a> DependencyTraverser<'a> {
 
                     // Extract FK values for backward relations (bidirectional from root)
                     for relation in &backward_relations {
+                        if !all_table_names.contains(&relation.from_table) || !all_table_names.contains(&relation.to_table) {
+                            continue;
+                        }
                         if let Some(Ok(v)) =
                             row.get_opt::<MySqlValue, _>(relation.to_column.as_str())
                         {
