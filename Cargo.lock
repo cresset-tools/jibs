@@ -1612,6 +1612,7 @@ dependencies = [
  "jibs_protocol",
  "mysql",
  "rand",
+ "regex",
  "thiserror 2.0.18",
  "zstd",
 ]

@@ -36,11 +36,11 @@ pub enum StatementKind<'src> {
     /// anonymize table { ... }
     Anonymize(AnonymizeBlock<'src>),
 
-    /// exclude table
-    Exclude(Spanned<&'src str>),
+    /// exclude table or /pattern/
+    Exclude(TablePattern<'src>),
 
-    /// ignore table
-    Ignore(Spanned<&'src str>),
+    /// ignore table or /pattern/
+    Ignore(TablePattern<'src>),
 
     /// aggregate name { ... }
     Aggregate(AggregateBlock<'src>),
@@ -242,6 +242,15 @@ pub enum Value<'src> {
 #[derive(Debug, Clone)]
 pub struct AfterBlock<'src> {
     pub statements: Vec<Spanned<&'src str>>,
+}
+
+/// A table name pattern - either an exact name or a regex
+#[derive(Debug, Clone)]
+pub enum TablePattern<'src> {
+    /// Exact table name match
+    Exact(Spanned<&'src str>),
+    /// Regex pattern match
+    Regex(Spanned<&'src str>),
 }
 
 /// Expression (used in conditionals and interpolation)

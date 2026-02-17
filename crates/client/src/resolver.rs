@@ -7,7 +7,7 @@ use jibs_parser::ast::{
     AggregateBlock, AnonymizeBlock, Expr, FakerDecl, FakerSource, FakerValue, IncludeStmt,
     LimitValue, Literal, PreserveStmt, Program, RelationDecl, SetBlock,
     SortDirection as AstSortDirection, Statement, StatementKind, StringLiteral, StringPart,
-    VarDecl, VarType,
+    TablePattern, VarDecl, VarType,
 };
 use jibs_protocol::{
     AnonymizeRule, AnonymizeTarget, Assignment, ExecutionPlan, PreserveRule, Relation,
@@ -288,12 +288,26 @@ impl Resolver {
             StatementKind::Faker(faker_decl) => self.process_faker(faker_decl),
             StatementKind::Relation(relation_decl) => self.process_relation(relation_decl),
             StatementKind::Anonymize(anon_block) => self.process_anonymize(anon_block),
-            StatementKind::Exclude((table, _span)) => {
-                self.plan.excluded_tables.insert(table.to_string());
+            StatementKind::Exclude(pattern) => {
+                match pattern {
+                    TablePattern::Exact((table, _span)) => {
+                        self.plan.excluded_tables.insert(table.to_string());
+                    }
+                    TablePattern::Regex((pattern, _span)) => {
+                        self.plan.excluded_patterns.push(pattern.to_string());
+                    }
+                }
                 Ok(())
             }
-            StatementKind::Ignore((table, _span)) => {
-                self.plan.ignored_tables.insert(table.to_string());
+            StatementKind::Ignore(pattern) => {
+                match pattern {
+                    TablePattern::Exact((table, _span)) => {
+                        self.plan.ignored_tables.insert(table.to_string());
+                    }
+                    TablePattern::Regex((pattern, _span)) => {
+                        self.plan.ignored_patterns.push(pattern.to_string());
+                    }
+                }
                 Ok(())
             }
             StatementKind::Aggregate(agg_block) => self.process_aggregate(agg_block),

@@ -15,6 +15,7 @@ pub enum Token<'src> {
     Bool(bool),
     String(&'src str),
     MultilineString(&'src str),
+    Regex(&'src str),
 
     // Identifiers and keywords
     Ident(&'src str),
@@ -94,6 +95,7 @@ impl fmt::Display for Token<'_> {
             Token::Bool(b) => write!(f, "{b}"),
             Token::String(s) => write!(f, "\"{s}\""),
             Token::MultilineString(s) => write!(f, "\"\"\"{s}\"\"\""),
+            Token::Regex(s) => write!(f, "/{s}/"),
             Token::Ident(s) => write!(f, "{s}"),
             Token::Import => write!(f, "import"),
             Token::Var => write!(f, "var"),
@@ -230,6 +232,12 @@ pub fn lexer<'src>(
     let hash = just('#').to(Token::Hash);
     let dollar = just('$').to(Token::Dollar);
 
+    // Regex literal: /pattern/
+    let regex = just('/')
+        .ignore_then(any().and_is(just('/').not()).repeated().at_least(1).to_slice())
+        .then_ignore(just('/'))
+        .map(Token::Regex);
+
     // Identifiers and keywords (allow digits after first char)
     let ident_start = any().filter(|c: &char| c.is_ascii_alphabetic() || *c == '_');
     let ident_cont = any().filter(|c: &char| c.is_ascii_alphanumeric() || *c == '_');
@@ -281,11 +289,13 @@ pub fn lexer<'src>(
     ));
 
     // A single token can be one of the above
+    // regex must come before operator so /pattern/ is not lexed as Slash
     let token = choice((
         multiline_string,
         string,
         float,
         int,
+        regex,
         operator,
         delimiter,
         ident,

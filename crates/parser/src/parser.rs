@@ -236,25 +236,37 @@ where
         })
 }
 
-/// Parse: exclude_data table
+/// Parse a table pattern: either an identifier (exact) or a regex literal
+fn table_pattern<'tokens, 'src: 'tokens, I>(
+) -> impl Parser<'tokens, I, TablePattern<'src>, extra::Err<Rich<'tokens, Token<'src>, Span>>> + Clone
+where
+    I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
+{
+    let exact = ident().map(TablePattern::Exact);
+    let regex = select! { Token::Regex(s) => s }
+        .map_with(|s, e| TablePattern::Regex((s, e.span())));
+    regex.or(exact)
+}
+
+/// Parse: exclude_data table_or_pattern
 fn exclude_parser<'tokens, 'src: 'tokens, I>(
 ) -> impl Parser<'tokens, I, StatementKind<'src>, extra::Err<Rich<'tokens, Token<'src>, Span>>> + Clone
 where
     I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
 {
     just(Token::ExcludeData)
-        .ignore_then(ident())
+        .ignore_then(table_pattern())
         .map(StatementKind::Exclude)
 }
 
-/// Parse: ignore_table table
+/// Parse: ignore_table table_or_pattern
 fn ignore_parser<'tokens, 'src: 'tokens, I>(
 ) -> impl Parser<'tokens, I, StatementKind<'src>, extra::Err<Rich<'tokens, Token<'src>, Span>>> + Clone
 where
     I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
 {
     just(Token::IgnoreTable)
-        .ignore_then(ident())
+        .ignore_then(table_pattern())
         .map(StatementKind::Ignore)
 }
 
@@ -734,12 +746,26 @@ mod tests {
         let program = parse("exclude_data payments\nignore_table logs");
         assert_eq!(program.statements.len(), 2);
         match &program.statements[0].0.kind {
-            StatementKind::Exclude((table, _)) => assert_eq!(*table, "payments"),
-            _ => panic!("Expected Exclude"),
+            StatementKind::Exclude(TablePattern::Exact((table, _))) => assert_eq!(*table, "payments"),
+            _ => panic!("Expected Exclude with exact pattern"),
         }
         match &program.statements[1].0.kind {
-            StatementKind::Ignore((table, _)) => assert_eq!(*table, "logs"),
-            _ => panic!("Expected Ignore"),
+            StatementKind::Ignore(TablePattern::Exact((table, _))) => assert_eq!(*table, "logs"),
+            _ => panic!("Expected Ignore with exact pattern"),
+        }
+    }
+
+    #[test]
+    fn test_exclude_ignore_regex() {
+        let program = parse("exclude_data /^cache_/\nignore_table /^tmp_/");
+        assert_eq!(program.statements.len(), 2);
+        match &program.statements[0].0.kind {
+            StatementKind::Exclude(TablePattern::Regex((pattern, _))) => assert_eq!(*pattern, "^cache_"),
+            _ => panic!("Expected Exclude with regex pattern"),
+        }
+        match &program.statements[1].0.kind {
+            StatementKind::Ignore(TablePattern::Regex((pattern, _))) => assert_eq!(*pattern, "^tmp_"),
+            _ => panic!("Expected Ignore with regex pattern"),
         }
     }
 
