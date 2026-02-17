@@ -5,6 +5,24 @@ use bincode::{Decode, Encode};
 use crate::checkpoint::Checkpoint;
 use crate::plan::{ColumnDef, CompressionMode, ExecutionPlan, TableInfo};
 
+/// Server-side performance metrics collected during import
+#[derive(Debug, Clone, Default, Encode, Decode)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct ServerMetrics {
+    /// Time spent executing MySQL queries (ms)
+    pub query_time_ms: u64,
+    /// Time spent iterating over result rows (ms)
+    pub iterate_time_ms: u64,
+    /// Time spent serializing rows to TSV (ms)
+    pub serialize_time_ms: u64,
+    /// Time spent writing to stdout (ms) - high values indicate client backpressure
+    pub write_time_ms: u64,
+    /// Total rows sent
+    pub rows_sent: u64,
+    /// Total bytes sent (before compression)
+    pub bytes_sent: u64,
+}
+
 /// Messages sent from client to server
 #[derive(Debug, Clone, Encode, Decode)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -21,6 +39,8 @@ pub enum ClientMessage {
         compression: CompressionMode,
         /// Server-side parallelism for full table streaming (0 or 1 = sequential)
         parallel: u32,
+        /// Whether to collect detailed timing metrics
+        collect_metrics: bool,
     },
     /// Start streaming data (optionally resume from checkpoint)
     Start {
@@ -59,6 +79,8 @@ pub enum ServerMessage {
     Done {
         /// Tables that were imported via aggregate BFS (partial imports)
         aggregate_tables: Vec<String>,
+        /// Performance metrics (only populated if --metrics flag was used)
+        metrics: Option<ServerMetrics>,
     },
     /// Error occurred
     Error { message: String, recoverable: bool },

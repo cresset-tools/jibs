@@ -8,6 +8,7 @@
 //! - Applying anonymization during streaming
 
 mod error;
+mod metrics;
 mod mysql;
 mod traversal;
 mod tsv;
@@ -73,10 +74,11 @@ fn run_echo_mode() -> Result<()> {
     let init_msg: ClientMessage = read_message(&mut reader)?;
 
     match init_msg {
-        ClientMessage::Init { plan, compression, parallel } => {
+        ClientMessage::Init { plan, compression, parallel, collect_metrics } => {
             eprintln!("Received Init message:");
             eprintln!("  Compression: {:?}", compression);
             eprintln!("  Parallel: {}", parallel);
+            eprintln!("  Collect metrics: {}", collect_metrics);
             eprintln!("  Variables: {}", plan.variables.len());
             eprintln!("  Relations: {}", plan.relations.len());
             eprintln!("  Aggregates: {}", plan.aggregates.len());
@@ -123,8 +125,8 @@ fn run() -> Result<()> {
         }
     };
 
-    let (mut plan, client_compression, parallel) = match init_msg {
-        ClientMessage::Init { plan, compression, parallel } => (plan, compression, parallel),
+    let (mut plan, client_compression, parallel, collect_metrics) = match init_msg {
+        ClientMessage::Init { plan, compression, parallel, collect_metrics } => (plan, compression, parallel, collect_metrics),
         _ => {
             return Err(ServerError::Protocol(
                 "Expected Init message".to_string(),
@@ -186,7 +188,7 @@ fn run() -> Result<()> {
 
     match msg {
         ClientMessage::Start { resume_from } => {
-            let mut traverser = DependencyTraverser::new(&mut conn, &plan)?;
+            let mut traverser = DependencyTraverser::new(&mut conn, &plan, collect_metrics)?;
 
             let aggregate_tables = match traverser.stream_all_tables(resume_from, compression, &mut writer, parallel, &mysql_url) {
                 Ok(tables) => tables,
@@ -200,10 +202,13 @@ fn run() -> Result<()> {
                 }
             };
 
+            // Get metrics if enabled
+            let metrics = traverser.get_metrics();
+
             // Send completion message
             let mut agg_list: Vec<String> = aggregate_tables.into_iter().collect();
             agg_list.sort();
-            write_message(&mut writer, &ServerMessage::Done { aggregate_tables: agg_list })?;
+            write_message(&mut writer, &ServerMessage::Done { aggregate_tables: agg_list, metrics })?;
         }
         ClientMessage::Shutdown => {
             return Ok(());

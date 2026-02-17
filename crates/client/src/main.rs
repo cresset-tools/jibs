@@ -11,6 +11,7 @@
 mod error;
 mod import;
 mod json_config;
+mod metrics;
 mod progress;
 mod resolver;
 mod server_binary;
@@ -103,6 +104,10 @@ struct ConnectionArgs {
     /// Maximum message size in bytes (default: 100MB)
     #[arg(long, default_value = "104857600")]
     max_message_size: usize,
+
+    /// Print detailed timing metrics after import
+    #[arg(long)]
+    metrics: bool,
 }
 
 #[derive(Args)]
@@ -228,6 +233,7 @@ async fn run_import(args: ImportArgs) -> Result<()> {
         aggregate_overrides: None,
         host_key_verification,
         max_message_size: args.connection.max_message_size,
+        collect_metrics: args.connection.metrics,
         #[cfg(feature = "test-utils")]
         fail_after_tables: args.fail_after_tables,
     };
@@ -267,6 +273,7 @@ async fn run_get(args: GetArgs) -> Result<()> {
         aggregate_overrides: Some(aggregate_overrides),
         host_key_verification,
         max_message_size: args.connection.max_message_size,
+        collect_metrics: args.connection.metrics,
         #[cfg(feature = "test-utils")]
         fail_after_tables: None,
     };

@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::Result;
 use mysql::prelude::*;
@@ -11,9 +12,10 @@ use tracing::{debug, info, warn};
 
 use jibs_protocol::{
     framing::write_message, ClientMessage, ColumnDef, CompressionMode, ExecutionPlan,
-    PreserveRule, ServerMessage, SetRule, Value,
+    PreserveRule, ServerMessage, ServerMetrics, SetRule, Value,
 };
 
+use crate::metrics::ClientMetrics;
 use crate::progress::ImportProgress;
 use crate::resolver;
 use crate::server_binary;
@@ -288,6 +290,8 @@ pub struct ImportConfig {
     pub host_key_verification: crate::ssh::HostKeyVerification,
     /// Maximum message size in bytes (default: 100MB)
     pub max_message_size: usize,
+    /// Whether to collect and display timing metrics
+    pub collect_metrics: bool,
     /// Debug: simulate crash after N tables (for testing resume)
     #[cfg(feature = "test-utils")]
     pub fail_after_tables: Option<usize>,
@@ -459,6 +463,7 @@ pub async fn run_import(config: ImportConfig) -> Result<()> {
         #[cfg(not(feature = "test-utils"))]
         None,
         config.parallel as u32,
+        config.collect_metrics,
     )
     .await;
 
@@ -468,7 +473,7 @@ pub async fn run_import(config: ImportConfig) -> Result<()> {
 
     // Handle result
     match result {
-        Ok((stats, pool)) => {
+        Ok((stats, client_metrics, pool)) => {
             // Shutdown loader pool if used
             if let Some(pool) = pool {
                 debug!("Shutting down loader pool");
@@ -478,6 +483,12 @@ pub async fn run_import(config: ImportConfig) -> Result<()> {
                 "Import complete: {} tables, {} rows",
                 stats.tables_imported, stats.rows_imported
             );
+
+            // Display metrics if enabled
+            if config.collect_metrics {
+                client_metrics.display(stats.server_metrics.as_ref());
+            }
+
             Ok(())
         }
         Err((e, pool)) => {
@@ -497,6 +508,7 @@ struct ImportStats {
     tables_imported: usize,
     tables_imported_names: Vec<String>,
     rows_imported: u64,
+    server_metrics: Option<ServerMetrics>,
 }
 
 /// Apply aggregate overrides for the `get` command
@@ -622,7 +634,8 @@ async fn run_protocol(
     max_message_size: usize,
     fail_after_tables: Option<usize>,
     parallel: u32,
-) -> std::result::Result<(ImportStats, Option<LoaderPool>), (anyhow::Error, Option<LoaderPool>)> {
+    collect_metrics: bool,
+) -> std::result::Result<(ImportStats, ClientMetrics, Option<LoaderPool>), (anyhow::Error, Option<LoaderPool>)> {
     // Wrap the inner logic to handle errors while preserving the loader pool
     match run_protocol_inner(
         server,
@@ -634,10 +647,11 @@ async fn run_protocol(
         max_message_size,
         fail_after_tables,
         parallel,
+        collect_metrics,
     )
     .await
     {
-        Ok(stats) => Ok((stats, loader_pool)),
+        Ok((stats, client_metrics)) => Ok((stats, client_metrics, loader_pool)),
         Err(e) => Err((e, loader_pool)),
     }
 }
@@ -653,12 +667,19 @@ async fn run_protocol_inner(
     max_message_size: usize,
     fail_after_tables: Option<usize>,
     parallel: u32,
-) -> Result<ImportStats> {
+    collect_metrics: bool,
+) -> Result<(ImportStats, ClientMetrics)> {
     let mut stats = ImportStats {
         tables_imported: 0,
         tables_imported_names: Vec::new(),
         rows_imported: 0,
+        server_metrics: None,
     };
+
+    let mut client_metrics = ClientMetrics::new();
+    if collect_metrics {
+        client_metrics.start();
+    }
 
     // Set up checkpointing
     create_checkpoint_table(local_conn)?;
@@ -674,6 +695,7 @@ async fn run_protocol_inner(
         plan: plan.clone(),
         compression,
         parallel,
+        collect_metrics,
     };
     send_message(server, &init_msg).await?;
 
@@ -728,7 +750,12 @@ async fn run_protocol_inner(
     const MAX_PENDING_CHUNKS: usize = 100;
 
     loop {
+        // Time message receive
+        let recv_start = Instant::now();
         let msg: ServerMessage = recv_message(server, max_message_size).await?;
+        if collect_metrics {
+            client_metrics.add_recv_time(recv_start.elapsed());
+        }
 
         match msg {
             ServerMessage::Schema { table, columns } => {
@@ -781,8 +808,16 @@ async fn run_protocol_inner(
                     continue;
                 }
 
+                // Time decompression
+                let decompress_start = Instant::now();
                 let decompressed = maybe_decompress(tsv_data, negotiated_compression)?;
+                if collect_metrics {
+                    client_metrics.add_decompress_time(decompress_start.elapsed());
+                }
                 let bytes_received = decompressed.len();
+                if collect_metrics {
+                    client_metrics.add_bytes_received(bytes_received as u64);
+                }
 
                 debug!(
                     "Data chunk: {} rows, {} bytes for {}",
@@ -839,8 +874,13 @@ async fn run_protocol_inner(
                         }
                     }
                 } else {
-                    // Load directly (sequential)
+                    // Load directly (sequential) - time the load
+                    let load_start = Instant::now();
                     let loaded = load_tsv_data(local_conn, &table, &schema, &decompressed)?;
+                    if collect_metrics {
+                        client_metrics.add_load_time(load_start.elapsed());
+                        client_metrics.add_rows_loaded(loaded);
+                    }
                     stats.rows_imported += loaded;
                 }
 
@@ -922,7 +962,7 @@ async fn run_protocol_inner(
                 }
             }
 
-            ServerMessage::Done { aggregate_tables: server_aggregate_tables } => {
+            ServerMessage::Done { aggregate_tables: server_aggregate_tables, metrics: server_metrics } => {
                 // Wait for all remaining pending loads to complete before finishing
                 if !pending_loads.is_empty() {
                     debug!(
@@ -941,6 +981,9 @@ async fn run_protocol_inner(
                         }
                     }
                 }
+
+                // Store server metrics
+                stats.server_metrics = server_metrics;
 
                 progress.finish();
 
@@ -1018,7 +1061,12 @@ async fn run_protocol_inner(
     // Send shutdown
     send_message(server, &ClientMessage::Shutdown).await?;
 
-    Ok(stats)
+    // Stop client metrics timing
+    if collect_metrics {
+        client_metrics.stop();
+    }
+
+    Ok((stats, client_metrics))
 }
 
 /// Send a message to the server
