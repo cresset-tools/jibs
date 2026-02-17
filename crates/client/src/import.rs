@@ -852,22 +852,41 @@ async fn run_protocol_inner(
                     continue;
                 }
 
-                // Don't block waiting for loads - let workers continue across table boundaries
-                // We'll collect all results at the end before processing Done
-                // Just do a quick non-blocking drain of any completed loads
+                // IMPORTANT: Before marking the table complete in checkpoint, we must ensure
+                // all data chunks for THIS table have been loaded. Otherwise, if we crash
+                // after marking complete but before loads finish, we'd skip incomplete data
+                // on resume.
+                //
+                // Strategy:
+                // 1. Wait (blocking) for all pending loads for THIS table
+                // 2. Non-blocking drain of loads for OTHER tables (keep parallelism)
                 {
                     let mut still_pending = Vec::new();
                     for (tbl, rx) in pending_loads.drain(..) {
-                        match rx.try_recv() {
-                            Ok(Ok(loaded)) => stats.rows_imported += loaded,
-                            Ok(Err(e)) => {
-                                return Err(anyhow::anyhow!("Loader error for {}: {}", tbl, e));
+                        if tbl == table {
+                            // This table's chunk - must wait for it
+                            match rx.recv() {
+                                Ok(Ok(loaded)) => stats.rows_imported += loaded,
+                                Ok(Err(e)) => {
+                                    return Err(anyhow::anyhow!("Loader error for {}: {}", tbl, e));
+                                }
+                                Err(_) => {
+                                    return Err(anyhow::anyhow!("Loader worker died for {}", tbl));
+                                }
                             }
-                            Err(std::sync::mpsc::TryRecvError::Empty) => {
-                                still_pending.push((tbl, rx));
-                            }
-                            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                                return Err(anyhow::anyhow!("Loader worker died for {}", tbl));
+                        } else {
+                            // Other table's chunk - try non-blocking
+                            match rx.try_recv() {
+                                Ok(Ok(loaded)) => stats.rows_imported += loaded,
+                                Ok(Err(e)) => {
+                                    return Err(anyhow::anyhow!("Loader error for {}: {}", tbl, e));
+                                }
+                                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                                    still_pending.push((tbl, rx));
+                                }
+                                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                    return Err(anyhow::anyhow!("Loader worker died for {}", tbl));
+                                }
                             }
                         }
                     }
@@ -881,9 +900,7 @@ async fn run_protocol_inner(
                 table_schemas.remove(&table);
 
                 // Mark table as complete in checkpoint
-                // Note: With parallel loading, some chunks for this table may still be in-flight
-                // This is OK - the checkpoint is for resumability, and we'll wait for all loads
-                // before reporting final success
+                // Safe to do now - all chunks for this table have been loaded
                 mark_table_complete(local_conn, &table, row_count)?;
 
                 // Debug: simulate crash for testing resume
