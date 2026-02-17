@@ -56,7 +56,10 @@ pub enum ServerMessage {
     /// Table fully transferred
     TableDone { table: String, row_count: u64 },
     /// All data transferred
-    Done,
+    Done {
+        /// Tables that were imported via aggregate BFS (partial imports)
+        aggregate_tables: Vec<String>,
+    },
     /// Error occurred
     Error { message: String, recoverable: bool },
 }

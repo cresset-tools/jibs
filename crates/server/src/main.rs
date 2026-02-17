@@ -188,17 +188,22 @@ fn run() -> Result<()> {
         ClientMessage::Start { resume_from } => {
             let mut traverser = DependencyTraverser::new(&mut conn, &plan)?;
 
-            if let Err(e) = traverser.stream_all_tables(resume_from, compression, &mut writer, parallel, &mysql_url) {
-                let error_msg = ServerMessage::Error {
-                    message: e.to_string(),
-                    recoverable: e.is_recoverable(),
-                };
-                write_message(&mut writer, &error_msg)?;
-                return Err(e);
-            }
+            let aggregate_tables = match traverser.stream_all_tables(resume_from, compression, &mut writer, parallel, &mysql_url) {
+                Ok(tables) => tables,
+                Err(e) => {
+                    let error_msg = ServerMessage::Error {
+                        message: e.to_string(),
+                        recoverable: e.is_recoverable(),
+                    };
+                    write_message(&mut writer, &error_msg)?;
+                    return Err(e);
+                }
+            };
 
             // Send completion message
-            write_message(&mut writer, &ServerMessage::Done)?;
+            let mut agg_list: Vec<String> = aggregate_tables.into_iter().collect();
+            agg_list.sort();
+            write_message(&mut writer, &ServerMessage::Done { aggregate_tables: agg_list })?;
         }
         ClientMessage::Shutdown => {
             return Ok(());

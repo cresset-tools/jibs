@@ -130,7 +130,7 @@ impl<'a> DependencyTraverser<'a> {
         writer: &mut W,
         parallel: u32,
         mysql_url: &str,
-    ) -> Result<()> {
+    ) -> Result<HashSet<String>> {
         let mut checkpoint = resume_from.unwrap_or_default();
 
         // Phase 1: Stream aggregate tables via BFS traversal.
@@ -206,7 +206,7 @@ impl<'a> DependencyTraverser<'a> {
             )?;
         }
 
-        Ok(())
+        Ok(aggregate_tables)
     }
 
     /// Stream all rows from a non-aggregate table directly from a MySQL query.
