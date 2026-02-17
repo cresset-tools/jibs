@@ -838,7 +838,7 @@ async fn run_protocol_inner(
                 }
 
                 // Update progress
-                progress.update_table(row_count, bytes_received);
+                progress.update_table(&table, row_count, bytes_received);
 
                 // Send ack
                 let ack_msg = ClientMessage::Ack { checkpoint };
