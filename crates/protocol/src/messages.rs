@@ -19,6 +19,8 @@ pub enum ClientMessage {
     Init {
         plan: ExecutionPlan,
         compression: CompressionMode,
+        /// Server-side parallelism for full table streaming (0 or 1 = sequential)
+        parallel: u32,
     },
     /// Start streaming data (optionally resume from checkpoint)
     Start {

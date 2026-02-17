@@ -72,9 +72,10 @@ fn run_echo_mode() -> Result<()> {
     let init_msg: ClientMessage = read_message(&mut reader)?;
 
     match init_msg {
-        ClientMessage::Init { plan, compression } => {
+        ClientMessage::Init { plan, compression, parallel } => {
             eprintln!("Received Init message:");
             eprintln!("  Compression: {:?}", compression);
+            eprintln!("  Parallel: {}", parallel);
             eprintln!("  Variables: {}", plan.variables.len());
             eprintln!("  Relations: {}", plan.relations.len());
             eprintln!("  Aggregates: {}", plan.aggregates.len());
@@ -121,8 +122,8 @@ fn run() -> Result<()> {
         }
     };
 
-    let (mut plan, client_compression) = match init_msg {
-        ClientMessage::Init { plan, compression } => (plan, compression),
+    let (mut plan, client_compression, parallel) = match init_msg {
+        ClientMessage::Init { plan, compression, parallel } => (plan, compression, parallel),
         _ => {
             return Err(ServerError::Protocol(
                 "Expected Init message".to_string(),
@@ -153,7 +154,7 @@ fn run() -> Result<()> {
         ClientMessage::Start { resume_from } => {
             let mut traverser = DependencyTraverser::new(&mut conn, &plan)?;
 
-            if let Err(e) = traverser.stream_all_tables(resume_from, compression, &mut writer) {
+            if let Err(e) = traverser.stream_all_tables(resume_from, compression, &mut writer, parallel, &mysql_url) {
                 let error_msg = ServerMessage::Error {
                     message: e.to_string(),
                     recoverable: e.is_recoverable(),

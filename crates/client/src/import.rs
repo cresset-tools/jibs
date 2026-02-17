@@ -458,6 +458,7 @@ pub async fn run_import(config: ImportConfig) -> Result<()> {
         config.fail_after_tables,
         #[cfg(not(feature = "test-utils"))]
         None,
+        config.parallel as u32,
     )
     .await;
 
@@ -619,6 +620,7 @@ async fn run_protocol(
     is_resume: bool,
     max_message_size: usize,
     fail_after_tables: Option<usize>,
+    parallel: u32,
 ) -> std::result::Result<(ImportStats, Option<LoaderPool>), (anyhow::Error, Option<LoaderPool>)> {
     // Wrap the inner logic to handle errors while preserving the loader pool
     match run_protocol_inner(
@@ -630,6 +632,7 @@ async fn run_protocol(
         is_resume,
         max_message_size,
         fail_after_tables,
+        parallel,
     )
     .await
     {
@@ -648,6 +651,7 @@ async fn run_protocol_inner(
     is_resume: bool,
     max_message_size: usize,
     fail_after_tables: Option<usize>,
+    parallel: u32,
 ) -> Result<ImportStats> {
     let mut stats = ImportStats {
         tables_imported: 0,
@@ -667,6 +671,7 @@ async fn run_protocol_inner(
     let init_msg = ClientMessage::Init {
         plan: plan.clone(),
         compression,
+        parallel,
     };
     send_message(server, &init_msg).await?;
 

@@ -24,7 +24,9 @@ fn test_echo_mode_parses_init_message() {
             limit: Some(100),
         }],
         excluded_tables: Default::default(),
+        excluded_patterns: Default::default(),
         ignored_tables: Default::default(),
+        ignored_patterns: Default::default(),
         anonymization: Default::default(),
         fakers: Default::default(),
         preserves: vec![],
@@ -35,6 +37,7 @@ fn test_echo_mode_parses_init_message() {
     let init_msg = ClientMessage::Init {
         plan,
         compression: CompressionMode::None,
+        parallel: 1,
     };
 
     // Serialize the message
@@ -84,6 +87,7 @@ fn test_message_roundtrip() {
     let init_msg = ClientMessage::Init {
         plan: plan.clone(),
         compression: CompressionMode::Zstd,
+        parallel: 4,
     };
 
     let mut buffer = Vec::new();
@@ -96,8 +100,10 @@ fn test_message_roundtrip() {
         ClientMessage::Init {
             plan: decoded_plan,
             compression,
+            parallel,
         } => {
             assert_eq!(compression, CompressionMode::Zstd);
+            assert_eq!(parallel, 4);
             assert_eq!(decoded_plan.aggregates.len(), plan.aggregates.len());
         }
         _ => panic!("Expected Init message"),
