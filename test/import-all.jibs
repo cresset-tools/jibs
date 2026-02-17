@@ -9,6 +9,12 @@ exclude_data audit_log
 // Ignore sessions table entirely (no structure, no data)
 ignore_table sessions
 
+// Ignore circular FK test tables (not part of e-commerce schema)
+ignore_table departments
+ignore_table employees
+ignore_table projects
+ignore_table project_assignments
+
 // Anonymize sensitive user data
 anonymize users {
     email -> emails
