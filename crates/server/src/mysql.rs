@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use mysql::prelude::*;
 use mysql::{Conn, Opts, Row, Value as MySqlValue};
 
-use jibs_protocol::{ColumnDef, ColumnFlags, ExecutionPlan, TableInfo};
+use jibs_protocol::{ColumnDef, ColumnFlags, ExecutionPlan, Relation, TableInfo};
 
 use crate::error::{Result, ServerError};
 
@@ -205,6 +205,68 @@ impl MySqlConnection {
 
         self.schemas.insert(table.to_string(), columns.clone());
         Ok(columns)
+    }
+
+    /// Discover foreign key constraints from MySQL's INFORMATION_SCHEMA.
+    /// Returns single-column FK relations (composite FKs are skipped).
+    pub fn discover_foreign_keys(&mut self) -> Result<Vec<Relation>> {
+        let rows: Vec<Row> = self.conn.query(
+            r#"
+            SELECT
+                TABLE_NAME, COLUMN_NAME,
+                REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME,
+                CONSTRAINT_NAME
+            FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND REFERENCED_TABLE_NAME IS NOT NULL
+            "#,
+        )?;
+
+        // Group by constraint name to detect composite FKs
+        let mut by_constraint: HashMap<String, Vec<(String, String, String, String)>> =
+            HashMap::new();
+        for row in &rows {
+            let constraint: String = row
+                .get_opt("CONSTRAINT_NAME")
+                .and_then(|r| r.ok())
+                .unwrap_or_default();
+            let from_table: String = row
+                .get_opt("TABLE_NAME")
+                .and_then(|r| r.ok())
+                .unwrap_or_default();
+            let from_column: String = row
+                .get_opt("COLUMN_NAME")
+                .and_then(|r| r.ok())
+                .unwrap_or_default();
+            let to_table: String = row
+                .get_opt("REFERENCED_TABLE_NAME")
+                .and_then(|r| r.ok())
+                .unwrap_or_default();
+            let to_column: String = row
+                .get_opt("REFERENCED_COLUMN_NAME")
+                .and_then(|r| r.ok())
+                .unwrap_or_default();
+            by_constraint
+                .entry(constraint)
+                .or_default()
+                .push((from_table, from_column, to_table, to_column));
+        }
+
+        // Only keep single-column constraints
+        let mut relations = Vec::new();
+        for (_constraint, columns) in by_constraint {
+            if columns.len() == 1 {
+                let (from_table, from_column, to_table, to_column) = columns.into_iter().next().unwrap();
+                relations.push(Relation {
+                    from_table,
+                    from_column,
+                    to_table,
+                    to_column,
+                });
+            }
+        }
+
+        Ok(relations)
     }
 
     /// Get cached primary key for a table
