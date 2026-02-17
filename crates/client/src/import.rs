@@ -714,6 +714,23 @@ async fn run_protocol_inner(
     // Track skipped tables (already completed in previous run)
     let mut skipped_tables: std::collections::HashSet<String> = std::collections::HashSet::new();
 
+    // Build set of tables that are part of aggregates (root tables + all relation tables)
+    let aggregate_table_set: std::collections::HashSet<String> = {
+        let mut set = std::collections::HashSet::new();
+        for agg in &plan.aggregates {
+            set.insert(agg.root_table.clone());
+        }
+        for rel in &plan.relations {
+            set.insert(rel.from_table.clone());
+            set.insert(rel.to_table.clone());
+        }
+        set
+    };
+
+    // Track which tables were imported as aggregates vs full
+    let mut tables_via_aggregate: Vec<String> = Vec::new();
+    let mut tables_full: Vec<String> = Vec::new();
+
     // Track schemas per table (for interleaved streaming)
     let mut table_schemas: HashMap<String, Arc<Vec<ColumnDef>>> = HashMap::new();
 
@@ -901,6 +918,13 @@ async fn run_protocol_inner(
                 progress.finish_table(&table, row_count);
                 stats.tables_imported += 1;
 
+                // Classify table as aggregate or full
+                if aggregate_table_set.contains(&table) {
+                    tables_via_aggregate.push(table.clone());
+                } else {
+                    tables_full.push(table.clone());
+                }
+
                 // Clean up schema for this table
                 table_schemas.remove(&table);
 
@@ -940,6 +964,27 @@ async fn run_protocol_inner(
                 }
 
                 progress.finish();
+
+                // Log summary of aggregate vs full table imports
+                if !tables_via_aggregate.is_empty() || !tables_full.is_empty() {
+                    if !tables_via_aggregate.is_empty() {
+                        tables_via_aggregate.sort();
+                        info!(
+                            "Imported via aggregates ({}):\n  {}",
+                            tables_via_aggregate.len(),
+                            tables_via_aggregate.join(", ")
+                        );
+                    }
+                    if !tables_full.is_empty() {
+                        tables_full.sort();
+                        info!(
+                            "Imported full tables ({}):\n  {}",
+                            tables_full.len(),
+                            tables_full.join(", ")
+                        );
+                    }
+                }
+
                 break;
             }
 
