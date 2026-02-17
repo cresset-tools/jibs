@@ -1,0 +1,375 @@
+// Magento 2 import configuration
+// Generated from schema dump - review and adjust as needed
+//
+// 411 tables: 302 imported, 92 schema-only, 17 ignored
+// 582 relations (407 explicit FK, 175 inferred)
+
+// ─── Variables ───
+var admin_password_hash: string = "$2y$10$placeholder"
+var customer_password_hash: string = "$2y$10$placeholder"
+
+// ─── Faker pools for anonymization ───
+
+faker fake_emails [
+    "user1@example.test",
+    "user2@example.test",
+    "user3@example.test",
+    "user4@example.test",
+    "user5@example.test",
+    "user6@example.test",
+    "user7@example.test",
+    "user8@example.test",
+    "user9@example.test",
+    "user10@example.test",
+    "user11@example.test",
+    "user12@example.test",
+    "user13@example.test",
+    "user14@example.test",
+    "user15@example.test",
+    "user16@example.test",
+    "user17@example.test",
+    "user18@example.test",
+    "user19@example.test",
+    "user20@example.test"
+]
+
+faker fake_names [
+    "Alice",
+    "Bob",
+    "Charlie",
+    "Diana",
+    "Edward",
+    "Fiona",
+    "George",
+    "Hannah",
+    "Ivan",
+    "Julia",
+    "Kevin",
+    "Laura",
+    "Michael",
+    "Nancy",
+    "Oscar",
+    "Patricia",
+    "Quinn",
+    "Rachel",
+    "Steven",
+    "Teresa"
+]
+
+faker fake_streets [
+    "123 Test Street",
+    "456 Demo Avenue",
+    "789 Sample Road",
+    "101 Example Lane",
+    "202 Mock Boulevard"
+]
+
+faker fake_phones [
+    "+31600000001",
+    "+31600000002",
+    "+31600000003",
+    "+31600000004",
+    "+31600000005"
+]
+
+faker fake_postcodes [
+    "1000AA",
+    "2000BB",
+    "3000CC",
+    "4000DD",
+    "5000EE"
+]
+
+// ─── Table relations ───
+// Relations tell jibs how to traverse between tables for aggregates.
+// inferred = from column naming convention.
+
+relation authorization_role.user_id -> admin_user.user_id
+relation import_history.user_id -> admin_user.user_id
+relation jwt_auth_revoked.user_id -> admin_user.user_id
+relation magento_bulk.user_id -> admin_user.user_id
+relation magento_login_as_customer_log.user_id -> admin_user.user_id
+relation sales_creditmemo_comment.user_id -> admin_user.user_id
+relation sales_invoice_comment.user_id -> admin_user.user_id
+relation sales_shipment_comment.user_id -> admin_user.user_id
+
+relation braintree_credit_prices.product_id -> catalog_product_entity.entity_id
+relation cataloginventory_stock_status.product_id -> catalog_product_entity.entity_id
+relation catalogrule_product.product_id -> catalog_product_entity.entity_id
+relation catalogrule_product_price.product_id -> catalog_product_entity.entity_id
+relation downloadable_link_purchased_item.product_id -> catalog_product_entity.entity_id
+relation quote_address_item.product_id -> catalog_product_entity.entity_id
+relation quote_item.product_id -> catalog_product_entity.entity_id
+relation quote_item_option.product_id -> catalog_product_entity.entity_id
+relation sales_bestsellers_aggregated_daily.product_id -> catalog_product_entity.entity_id
+relation sales_bestsellers_aggregated_monthly.product_id -> catalog_product_entity.entity_id
+relation sales_bestsellers_aggregated_yearly.product_id -> catalog_product_entity.entity_id
+relation sales_creditmemo_item.product_id -> catalog_product_entity.entity_id
+relation sales_invoice_item.product_id -> catalog_product_entity.entity_id
+relation sales_order_item.product_id -> catalog_product_entity.entity_id
+relation sales_shipment_item.product_id -> catalog_product_entity.entity_id
+relation wishlist_item_option.product_id -> catalog_product_entity.entity_id
+
+relation cataloginventory_stock_status.stock_id -> cataloginventory_stock.stock_id
+
+relation catalogrule_group_website.rule_id -> catalogrule.rule_id
+relation catalogrule_product.rule_id -> catalogrule.rule_id
+
+relation quote_address.customer_address_id -> customer_address_entity.entity_id
+relation sales_order_address.customer_address_id -> customer_address_entity.entity_id
+relation customer_log.customer_id -> customer_entity.entity_id
+relation customer_visitor.customer_id -> customer_entity.entity_id
+relation gift_message.customer_id -> customer_entity.entity_id
+relation login_as_customer.customer_id -> customer_entity.entity_id
+relation magento_login_as_customer_log.customer_id -> customer_entity.entity_id
+relation mollie_pending_payment_reminder.customer_id -> customer_entity.entity_id
+relation newsletter_subscriber.customer_id -> customer_entity.entity_id
+relation quote.customer_id -> customer_entity.entity_id
+relation quote_address.customer_id -> customer_entity.entity_id
+relation rating_option_vote.customer_id -> customer_entity.entity_id
+relation reporting_orders.customer_id -> customer_entity.entity_id
+relation sales_order_address.customer_id -> customer_entity.entity_id
+relation sales_order_grid.customer_id -> customer_entity.entity_id
+relation sales_shipment.customer_id -> customer_entity.entity_id
+relation catalogrule_group_website.customer_group_id -> customer_group.customer_group_id
+relation catalogrule_product.customer_group_id -> customer_group.customer_group_id
+relation catalogrule_product_price.customer_group_id -> customer_group.customer_group_id
+relation customer_group_excluded_website.customer_group_id -> customer_group.customer_group_id
+relation quote.customer_group_id -> customer_group.customer_group_id
+relation sales_creditmemo_grid.customer_group_id -> customer_group.customer_group_id
+relation sales_invoice_grid.customer_group_id -> customer_group.customer_group_id
+relation sales_order.customer_group_id -> customer_group.customer_group_id
+relation sales_shipment_grid.customer_group_id -> customer_group.customer_group_id
+relation catalog_compare_item.visitor_id -> customer_visitor.visitor_id
+relation catalog_product_frontend_action.visitor_id -> customer_visitor.visitor_id
+
+relation customer_address_entity.country_id -> directory_country.country_id
+relation directory_country_format.country_id -> directory_country.country_id
+relation directory_country_region.country_id -> directory_country.country_id
+relation quote_address.country_id -> directory_country.country_id
+relation sales_order_address.country_id -> directory_country.country_id
+relation customer_address_entity.region_id -> directory_country_region.region_id
+relation quote_address.region_id -> directory_country_region.region_id
+relation sales_order_address.region_id -> directory_country_region.region_id
+
+relation catalog_category_entity.attribute_set_id -> eav_attribute_set.attribute_set_id
+relation catalog_product_entity.attribute_set_id -> eav_attribute_set.attribute_set_id
+relation eav_entity.attribute_set_id -> eav_attribute_set.attribute_set_id
+relation eav_entity_attribute.attribute_set_id -> eav_attribute_set.attribute_set_id
+relation eav_entity_attribute.entity_type_id -> eav_entity_type.entity_type_id
+
+relation quote.gift_message_id -> gift_message.gift_message_id
+relation quote_address.gift_message_id -> gift_message.gift_message_id
+relation quote_address_item.gift_message_id -> gift_message.gift_message_id
+relation quote_item.gift_message_id -> gift_message.gift_message_id
+relation sales_order.gift_message_id -> gift_message.gift_message_id
+relation sales_order_item.gift_message_id -> gift_message.gift_message_id
+
+relation sales_order.quote_id -> quote.entity_id
+relation sales_order.quote_address_id -> quote_address.address_id
+relation sales_order_address.quote_address_id -> quote_address.address_id
+relation sales_order_item.quote_item_id -> quote_item.item_id
+relation sales_order_payment.quote_payment_id -> quote_payment.payment_id
+
+relation rating_option_vote.rating_id -> rating.rating_id
+
+relation mollie_order_lines.order_id -> sales_order.entity_id
+relation mollie_payment_transaction_to_order.order_id -> sales_order.entity_id
+relation mollie_pending_payment_reminder.order_id -> sales_order.entity_id
+relation mollie_sent_payment_reminder.order_id -> sales_order.entity_id
+relation sales_creditmemo_grid.order_id -> sales_order.entity_id
+relation sales_invoice_grid.order_id -> sales_order.entity_id
+relation sales_order_tax.order_id -> sales_order.entity_id
+relation sales_shipment_grid.order_id -> sales_order.entity_id
+relation sales_shipment_track.order_id -> sales_order.entity_id
+
+relation amasty_amshopby_option_setting.store_id -> store.store_id
+relation catalog_product_bundle_option_value.store_id -> store.store_id
+relation design_config_grid_flat.store_id -> store.store_id
+relation paypal_settlement_report_row.store_id -> store.store_id
+relation quote_address_item.store_id -> store.store_id
+relation sales_creditmemo_grid.store_id -> store.store_id
+relation sales_invoice_grid.store_id -> store.store_id
+relation sales_order_grid.store_id -> store.store_id
+relation sales_sequence_meta.store_id -> store.store_id
+relation sales_shipment_grid.store_id -> store.store_id
+relation url_rewrite.store_id -> store.store_id
+relation customer_entity.group_id -> store_group.group_id
+relation customer_grid_flat.group_id -> store_group.group_id
+relation design_config_grid_flat.store_group_id -> store_group.group_id
+relation design_config_grid_flat.store_website_id -> store_website.website_id
+
+relation customer_group.tax_class_id -> tax_class.class_id
+
+// ─── Ignored tables (not imported at all) ───
+// Session, cache, changelog, and cron tables that are rebuilt automatically.
+ignore_table /^cache/
+ignore_table /_cl$/
+ignore_table cron_schedule
+ignore_table session
+
+// ─── Schema-only tables (structure imported, no data) ───
+// Index temp tables, reports, logs, and aggregated data that gets rebuilt.
+exclude_data /_idx$/
+exclude_data /index/
+exclude_data /_tmp$/
+exclude_data /_replica$/
+exclude_data /_aggregated/
+exclude_data /^report/
+exclude_data /data_exporter/
+exclude_data /^queue_/
+exclude_data /^payment_services_/
+exclude_data captcha_log
+exclude_data customer_log
+exclude_data customer_visitor
+exclude_data importexport_importdata
+exclude_data oauth_nonce
+exclude_data oauth_token_request_log
+exclude_data password_reset_request_event
+exclude_data sendfriend_log
+exclude_data ae_ec
+
+// ─── Anonymization rules ───
+// Strips PII from customer, order, and admin tables.
+
+anonymize admin_adobe_ims_webapi {
+    access_token -> null
+    access_token_hash -> null
+}
+
+anonymize admin_passwords {
+    password_hash -> null
+}
+
+anonymize admin_user {
+    email -> fake_emails
+    firstname -> fake_names
+    lastname -> fake_names
+    password -> null
+    rp_token -> null
+}
+
+anonymize admin_user_session {
+    ip -> null
+}
+
+anonymize adobe_user_profile {
+    access_token -> null
+    email -> fake_emails
+}
+
+anonymize customer_address_entity {
+    fax -> fake_phones
+    firstname -> fake_names
+    lastname -> fake_names
+    postcode -> fake_postcodes
+    street -> fake_streets
+    telephone -> fake_phones
+}
+
+anonymize customer_entity {
+    email -> fake_emails
+    firstname -> fake_names
+    lastname -> fake_names
+    password_hash -> null
+    rp_token -> null
+}
+
+anonymize customer_grid_flat {
+    billing_fax -> fake_phones
+    billing_firstname -> fake_names
+    billing_lastname -> fake_names
+    billing_postcode -> fake_postcodes
+    billing_street -> fake_streets
+    billing_telephone -> fake_phones
+    email -> fake_emails
+}
+
+anonymize email_template {
+    template_sender_email -> fake_emails
+}
+
+anonymize integration {
+    email -> fake_emails
+}
+
+anonymize magento_login_as_customer_log {
+    customer_email -> fake_emails
+}
+
+anonymize newsletter_subscriber {
+    subscriber_email -> fake_emails
+}
+
+anonymize newsletter_template {
+    template_sender_email -> fake_emails
+}
+
+anonymize quote {
+    customer_email -> fake_emails
+    customer_firstname -> fake_names
+    customer_lastname -> fake_names
+    password_hash -> null
+    remote_ip -> null
+}
+
+anonymize quote_address {
+    email -> fake_emails
+    fax -> fake_phones
+    firstname -> fake_names
+    lastname -> fake_names
+    postcode -> fake_postcodes
+    street -> fake_streets
+    telephone -> fake_phones
+}
+
+anonymize rating_option_vote {
+    remote_ip -> null
+    remote_ip_long -> null
+}
+
+anonymize sales_creditmemo_grid {
+    customer_email -> fake_emails
+}
+
+anonymize sales_invoice_grid {
+    customer_email -> fake_emails
+}
+
+anonymize sales_order {
+    customer_email -> fake_emails
+    customer_firstname -> fake_names
+    customer_lastname -> fake_names
+    remote_ip -> null
+    x_forwarded_for -> null
+}
+
+anonymize sales_order_address {
+    email -> fake_emails
+    fax -> fake_phones
+    firstname -> fake_names
+    lastname -> fake_names
+    postcode -> fake_postcodes
+    street -> fake_streets
+    telephone -> fake_phones
+}
+
+anonymize sales_order_grid {
+    customer_email -> fake_emails
+}
+
+anonymize sales_shipment_grid {
+    customer_email -> fake_emails
+}
+
+aggregate orders {
+    root sales_order
+    where "created_at > DATE_SUB(NOW(), INTERVAL 90 DAY)"
+    order by created_at desc
+    limit 100
+}
+
+aggregate products {
+    root catalog_product_entity
+    where "entity_id IN (SELECT product_id FROM catalog_category_product WHERE category_id IN (SELECT entity_id FROM url_rewrite WHERE request_path = 'werkkleding/werkshirts'))"
+}
