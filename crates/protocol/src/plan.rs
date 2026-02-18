@@ -39,6 +39,8 @@ pub struct ExecutionPlan {
     pub ignored_tables: HashSet<String>,
     /// Regex patterns for tables to ignore (expanded server-side)
     pub ignored_patterns: Vec<String>,
+    /// Relations to ignore (filter out from auto-discovered FKs)
+    pub ignored_relations: Vec<Relation>,
     /// Anonymization rules per table
     pub anonymization: HashMap<String, Vec<AnonymizeRule>>,
     /// Faker pools (resolved values)
@@ -47,6 +49,8 @@ pub struct ExecutionPlan {
     pub preserves: Vec<PreserveRule>,
     /// Set blocks (post-processing)
     pub sets: Vec<SetRule>,
+    /// Tables to import in full (skip BFS filtering)
+    pub full_tables: HashSet<String>,
     /// After blocks (raw SQL to run post-import)
     ///
     /// Statements are executed in order. When imports are used, the order is
@@ -72,8 +76,10 @@ impl ExecutionPlan {
             excluded_patterns: Vec::new(),
             ignored_tables: HashSet::new(),
             ignored_patterns: Vec::new(),
+            ignored_relations: Vec::new(),
             anonymization: HashMap::new(),
             fakers: HashMap::new(),
+            full_tables: HashSet::new(),
             preserves: Vec::new(),
             sets: Vec::new(),
             after_statements: Vec::new(),
@@ -219,6 +225,12 @@ pub struct ResolvedAggregate {
     pub order_direction: Option<SortDirection>,
     /// LIMIT value
     pub limit: Option<i64>,
+    /// Tables to skip during BFS traversal
+    pub exclude_tables: Vec<String>,
+    /// Regex patterns for tables to skip during BFS traversal (expanded server-side)
+    pub exclude_patterns: Vec<String>,
+    /// If true, only import the root table (no BFS traversal)
+    pub root_only: bool,
 }
 
 /// Sort direction

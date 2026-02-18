@@ -166,6 +166,10 @@
           "match": "\\bignore_table\\b"
         },
         {
+          "name": "keyword.control.ignore-relation.jibs",
+          "match": "\\bignore_relation\\b"
+        },
+        {
           "name": "keyword.declaration.aggregate.jibs",
           "match": "\\baggregate\\b"
         },
@@ -204,6 +208,18 @@
         {
           "name": "keyword.other.limit.jibs",
           "match": "\\blimit\\b"
+        },
+        {
+          "name": "keyword.other.full.jibs",
+          "match": "\\bfull\\b"
+        },
+        {
+          "name": "keyword.other.root-only.jibs",
+          "match": "\\broot_only\\b"
+        },
+        {
+          "name": "keyword.control.exclude.aggregate.jibs",
+          "match": "(?<=\\b)exclude(?=\\s)"
         },
         {
           "name": "keyword.other.match.jibs",

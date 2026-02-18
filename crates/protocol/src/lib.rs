@@ -10,7 +10,7 @@ pub mod plan;
 
 pub use checkpoint::Checkpoint;
 pub use framing::{read_message, write_message};
-pub use messages::{ClientMessage, ServerMessage, ServerMetrics};
+pub use messages::{ClientMessage, QueryTiming, ServerMessage, ServerMetrics};
 pub use plan::{
     AnonymizeRule, AnonymizeTarget, Assignment, ColumnDef, ColumnFlags, CompressionMode,
     ExecutionPlan, PreserveRule, Relation, ResolvedAggregate, SetRule, SortDirection, TableInfo,

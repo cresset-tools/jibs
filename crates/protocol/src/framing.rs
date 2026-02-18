@@ -26,6 +26,18 @@ pub fn write_message<W: Write, T: Encode>(writer: &mut W, message: &T) -> io::Re
     Ok(())
 }
 
+/// Write a message without flushing — lets the BufWriter coalesce writes.
+/// Use this in hot streaming paths where flush would cause unnecessary syscalls.
+pub fn write_message_noflush<W: Write, T: Encode>(writer: &mut W, message: &T) -> io::Result<()> {
+    let encoded = bincode::encode_to_vec(message, bincode_config())
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+    let len = encoded.len() as u32;
+    writer.write_all(&len.to_le_bytes())?;
+    writer.write_all(&encoded)?;
+    Ok(())
+}
+
 /// Read a message from a reader with length-prefix framing
 pub fn read_message<R: Read, T: Decode<()>>(reader: &mut R) -> io::Result<T> {
     let mut len_bytes = [0u8; 4];

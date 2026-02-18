@@ -58,6 +58,10 @@ struct JsonConfig {
     #[serde(default)]
     ignore: Vec<JsonTableRef>,
 
+    /// Relations to ignore (filter out from auto-discovered FKs)
+    #[serde(default)]
+    ignore_relation: Vec<JsonRelation>,
+
     /// Anonymization rules per table (array format with optional when)
     #[serde(default)]
     anonymize: JsonAnonymizeBlocks,
@@ -289,6 +293,7 @@ impl JsonResolver {
         self.process_relations(&config.relation)?;
         self.process_excludes(&config.exclude)?;
         self.process_ignores(&config.ignore)?;
+        self.process_ignore_relations(&config.ignore_relation)?;
         self.process_anonymize(&config.anonymize)?;
         self.process_aggregates(&config.aggregate)?;
         self.process_includes(&config.include)?;
@@ -354,6 +359,7 @@ impl JsonResolver {
             self.process_relations(&config.relation)?;
             self.process_excludes(&config.exclude)?;
             self.process_ignores(&config.ignore)?;
+            self.process_ignore_relations(&config.ignore_relation)?;
             self.process_anonymize(&config.anonymize)?;
             self.process_aggregates(&config.aggregate)?;
             self.process_includes(&config.include)?;
@@ -402,6 +408,7 @@ impl JsonResolver {
 
         // Append collections
         self.plan.relations.extend(other.relations);
+        self.plan.ignored_relations.extend(other.ignored_relations);
         self.plan.aggregates.extend(other.aggregates);
         self.plan.excluded_tables.extend(other.excluded_tables);
         self.plan.ignored_tables.extend(other.ignored_tables);
@@ -719,6 +726,26 @@ impl JsonResolver {
         Ok(())
     }
 
+    fn process_ignore_relations(&mut self, relations: &[JsonRelation]) -> Result<()> {
+        for rel in relations {
+            if let Some(when) = &rel.when {
+                if !self.evaluate_condition_string(when)? {
+                    continue;
+                }
+            }
+            let (from_table, from_column) = parse_column_ref(&rel.from)?;
+            let (to_table, to_column) = parse_column_ref(&rel.to)?;
+
+            self.plan.ignored_relations.push(Relation {
+                from_table,
+                from_column,
+                to_table,
+                to_column,
+            });
+        }
+        Ok(())
+    }
+
     fn process_anonymize(&mut self, anonymize: &JsonAnonymizeBlocks) -> Result<()> {
         match anonymize {
             JsonAnonymizeBlocks::Map(map) => {
@@ -815,6 +842,9 @@ impl JsonResolver {
                 order_by,
                 order_direction,
                 limit,
+                exclude_tables: Vec::new(),
+                exclude_patterns: Vec::new(),
+                root_only: false,
             });
         }
         Ok(())
