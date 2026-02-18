@@ -370,7 +370,11 @@ pub struct SshSession {
 impl SshSession {
     /// Connect to a remote host
     pub async fn connect(config: SshConfig) -> Result<Self> {
-        let ssh_config = Config::default();
+        let ssh_config = Config {
+            window_size: 32 * 1024 * 1024,    // 32 MB (vs 2 MB default)
+            maximum_packet_size: 65535,         // max allowed (vs 32 KB default)
+            ..Config::default()
+        };
 
         let verification_result = Arc::new(Mutex::new(None));
         let handler = SshHandler {
@@ -380,9 +384,20 @@ impl SshSession {
             verification_result: Arc::clone(&verification_result),
         };
 
-        let mut handle = client::connect(
+        let socket = tokio::net::TcpStream::connect((&config.host as &str, config.port))
+            .await
+            .map_err(|e| ClientError::Ssh {
+                operation: "connect".to_string(),
+                message: format!("Failed to connect to {}:{}: {}", config.host, config.port, e),
+            })?;
+        socket.set_nodelay(true).map_err(|e| ClientError::Ssh {
+            operation: "set TCP_NODELAY".to_string(),
+            message: format!("Failed to set TCP_NODELAY: {}", e),
+        })?;
+
+        let mut handle = client::connect_stream(
             Arc::new(ssh_config),
-            (&config.host as &str, config.port),
+            socket,
             handler,
         )
         .await
