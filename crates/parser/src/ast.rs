@@ -33,6 +33,9 @@ pub enum StatementKind<'src> {
     /// relation table.column -> table.column
     Relation(RelationDecl<'src>),
 
+    /// ignore_relation table.column -> table.column
+    IgnoreRelation(RelationDecl<'src>),
+
     /// anonymize table { ... }
     Anonymize(AnonymizeBlock<'src>),
 
@@ -41,6 +44,9 @@ pub enum StatementKind<'src> {
 
     /// ignore table or /pattern/
     Ignore(TablePattern<'src>),
+
+    /// full table1, table2, ...
+    Full(Vec<Spanned<&'src str>>),
 
     /// aggregate name { ... }
     Aggregate(AggregateBlock<'src>),
@@ -178,6 +184,8 @@ pub struct AggregateBlock<'src> {
     pub where_clause: Option<Spanned<StringLiteral<'src>>>,
     pub order_by: Option<OrderByClause<'src>>,
     pub limit: Option<Spanned<LimitValue<'src>>>,
+    pub exclude_tables: Vec<TablePattern<'src>>,
+    pub root_only: bool,
 }
 
 /// Order by clause
@@ -205,7 +213,7 @@ pub enum LimitValue<'src> {
 #[derive(Debug, Clone)]
 pub struct IncludeStmt<'src> {
     pub aggregate: Spanned<&'src str>,
-    pub where_clause: Spanned<StringLiteral<'src>>,
+    pub where_clause: Option<Spanned<StringLiteral<'src>>>,
 }
 
 /// Preserve statement

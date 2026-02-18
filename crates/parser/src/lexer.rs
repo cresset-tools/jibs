@@ -28,6 +28,7 @@ pub enum Token<'src> {
     Anonymize,
     ExcludeData,
     IgnoreTable,
+    IgnoreRelation,
     Aggregate,
     Include,
     Preserve,
@@ -38,6 +39,9 @@ pub enum Token<'src> {
     Order,
     By,
     Limit,
+    Full,
+    Exclude,
+    RootOnly,
     Match,
     When,
     Null,
@@ -104,6 +108,7 @@ impl fmt::Display for Token<'_> {
             Token::Anonymize => write!(f, "anonymize"),
             Token::ExcludeData => write!(f, "exclude_data"),
             Token::IgnoreTable => write!(f, "ignore_table"),
+            Token::IgnoreRelation => write!(f, "ignore_relation"),
             Token::Aggregate => write!(f, "aggregate"),
             Token::Include => write!(f, "include"),
             Token::Preserve => write!(f, "preserve"),
@@ -114,6 +119,9 @@ impl fmt::Display for Token<'_> {
             Token::Order => write!(f, "order"),
             Token::By => write!(f, "by"),
             Token::Limit => write!(f, "limit"),
+            Token::Full => write!(f, "full"),
+            Token::Exclude => write!(f, "exclude"),
+            Token::RootOnly => write!(f, "root_only"),
             Token::Match => write!(f, "match"),
             Token::When => write!(f, "when"),
             Token::Null => write!(f, "null"),
@@ -238,6 +246,12 @@ pub fn lexer<'src>(
         .then_ignore(just('/'))
         .map(Token::Regex);
 
+    // Backtick-quoted identifiers (e.g. `quote_2023-08-17`)
+    let backtick_ident = just('`')
+        .ignore_then(none_of('`').repeated().at_least(1).to_slice())
+        .then_ignore(just('`'))
+        .map(Token::Ident);
+
     // Identifiers and keywords (allow digits after first char)
     let ident_start = any().filter(|c: &char| c.is_ascii_alphabetic() || *c == '_');
     let ident_cont = any().filter(|c: &char| c.is_ascii_alphanumeric() || *c == '_');
@@ -252,6 +266,7 @@ pub fn lexer<'src>(
         "anonymize" => Token::Anonymize,
         "exclude_data" => Token::ExcludeData,
         "ignore_table" => Token::IgnoreTable,
+        "ignore_relation" => Token::IgnoreRelation,
         "aggregate" => Token::Aggregate,
         "include" => Token::Include,
         "preserve" => Token::Preserve,
@@ -262,6 +277,9 @@ pub fn lexer<'src>(
         "order" => Token::Order,
         "by" => Token::By,
         "limit" => Token::Limit,
+        "full" => Token::Full,
+        "exclude" => Token::Exclude,
+        "root_only" => Token::RootOnly,
         "match" => Token::Match,
         "when" => Token::When,
         "null" => Token::Null,
@@ -298,6 +316,7 @@ pub fn lexer<'src>(
         regex,
         operator,
         delimiter,
+        backtick_ident,
         ident,
     ));
 
@@ -468,6 +487,21 @@ mod tests {
                 Token::LBracket,
                 Token::RBracket,
             ]
+        );
+    }
+
+    #[test]
+    fn test_backtick_quoted_ident() {
+        let tokens = lex("`quote_2023-08-17`");
+        assert_eq!(tokens, vec![Token::Ident("quote_2023-08-17")]);
+    }
+
+    #[test]
+    fn test_backtick_quoted_in_context() {
+        let tokens = lex("ignore_table `quote_2023-08-17`");
+        assert_eq!(
+            tokens,
+            vec![Token::IgnoreTable, Token::Ident("quote_2023-08-17")]
         );
     }
 

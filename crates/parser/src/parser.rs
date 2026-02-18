@@ -64,9 +64,11 @@ where
         var_parser(),
         faker_parser(),
         relation_parser(),
+        ignore_relation_parser(),
         anonymize_parser(),
         exclude_parser(),
         ignore_parser(),
+        full_parser(),
         aggregate_parser(),
         include_parser(),
         preserve_parser(),
@@ -194,6 +196,21 @@ where
         })
 }
 
+/// Parse: ignore_relation table.column -> table.column
+fn ignore_relation_parser<'tokens, 'src: 'tokens, I>(
+) -> impl Parser<'tokens, I, StatementKind<'src>, extra::Err<Rich<'tokens, Token<'src>, Span>>> + Clone
+where
+    I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
+{
+    just(Token::IgnoreRelation)
+        .ignore_then(column_ref())
+        .then_ignore(just(Token::Arrow))
+        .then(column_ref())
+        .map(|(from, to)| {
+            StatementKind::IgnoreRelation(RelationDecl { from, to })
+        })
+}
+
 /// Parse: table.column
 fn column_ref<'tokens, 'src: 'tokens, I>(
 ) -> impl Parser<'tokens, I, Spanned<ColumnRef<'src>>, extra::Err<Rich<'tokens, Token<'src>, Span>>> + Clone
@@ -270,6 +287,22 @@ where
         .map(StatementKind::Ignore)
 }
 
+/// Parse: full table1, table2, ...
+fn full_parser<'tokens, 'src: 'tokens, I>(
+) -> impl Parser<'tokens, I, StatementKind<'src>, extra::Err<Rich<'tokens, Token<'src>, Span>>> + Clone
+where
+    I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
+{
+    just(Token::Full)
+        .ignore_then(
+            ident()
+                .separated_by(just(Token::Comma))
+                .at_least(1)
+                .collect::<Vec<_>>()
+        )
+        .map(StatementKind::Full)
+}
+
 /// Parse: aggregate name { root, where, order by, limit }
 fn aggregate_parser<'tokens, 'src: 'tokens, I>(
 ) -> impl Parser<'tokens, I, StatementKind<'src>, extra::Err<Rich<'tokens, Token<'src>, Span>>> + Clone
@@ -303,6 +336,16 @@ where
         )
         .map_with(|v, e| (v, e.span()));
 
+    let exclude_clause = just(Token::Exclude)
+        .ignore_then(
+            table_pattern()
+                .separated_by(just(Token::Comma))
+                .at_least(1)
+                .collect::<Vec<_>>()
+        );
+
+    let root_only_clause = just(Token::RootOnly).to(true);
+
     just(Token::Aggregate)
         .ignore_then(ident())
         .then(
@@ -310,15 +353,19 @@ where
                 .then(where_clause.or_not())
                 .then(order_by_clause.or_not())
                 .then(limit_clause.or_not())
+                .then(exclude_clause.or_not())
+                .then(root_only_clause.or_not())
                 .delimited_by(just(Token::LBrace), just(Token::RBrace))
         )
-        .map(|(name, (((root, where_clause), order_by), limit))| {
+        .map(|(name, (((((root, where_clause), order_by), limit), exclude_tables), root_only))| {
             StatementKind::Aggregate(AggregateBlock {
                 name,
                 root,
                 where_clause,
                 order_by,
                 limit,
+                exclude_tables: exclude_tables.unwrap_or_default(),
+                root_only: root_only.unwrap_or(false),
             })
         })
 }
@@ -331,8 +378,11 @@ where
 {
     just(Token::Include)
         .ignore_then(ident())
-        .then_ignore(just(Token::Where))
-        .then(string_literal())
+        .then(
+            just(Token::Where)
+                .ignore_then(string_literal())
+                .or_not(),
+        )
         .map(|(aggregate, where_clause)| {
             StatementKind::Include(IncludeStmt {
                 aggregate,
@@ -793,12 +843,40 @@ mod tests {
     }
 
     #[test]
+    fn test_full() {
+        let program = parse("full store, catalog_category_entity");
+        assert_eq!(program.statements.len(), 1);
+        match &program.statements[0].0.kind {
+            StatementKind::Full(tables) => {
+                assert_eq!(tables.len(), 2);
+                assert_eq!(tables[0].0, "store");
+                assert_eq!(tables[1].0, "catalog_category_entity");
+            }
+            _ => panic!("Expected Full"),
+        }
+    }
+
+    #[test]
     fn test_include() {
         let program = parse(r#"include orders where "id = 123""#);
         assert_eq!(program.statements.len(), 1);
         match &program.statements[0].0.kind {
             StatementKind::Include(stmt) => {
                 assert_eq!(stmt.aggregate.0, "orders");
+                assert!(stmt.where_clause.is_some());
+            }
+            _ => panic!("Expected Include"),
+        }
+    }
+
+    #[test]
+    fn test_include_without_where() {
+        let program = parse(r#"include orders"#);
+        assert_eq!(program.statements.len(), 1);
+        match &program.statements[0].0.kind {
+            StatementKind::Include(stmt) => {
+                assert_eq!(stmt.aggregate.0, "orders");
+                assert!(stmt.where_clause.is_none());
             }
             _ => panic!("Expected Include"),
         }

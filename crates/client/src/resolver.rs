@@ -287,6 +287,7 @@ impl Resolver {
             }
             StatementKind::Faker(faker_decl) => self.process_faker(faker_decl),
             StatementKind::Relation(relation_decl) => self.process_relation(relation_decl),
+            StatementKind::IgnoreRelation(relation_decl) => self.process_ignore_relation(relation_decl),
             StatementKind::Anonymize(anon_block) => self.process_anonymize(anon_block),
             StatementKind::Exclude(pattern) => {
                 match pattern {
@@ -307,6 +308,12 @@ impl Resolver {
                     TablePattern::Regex((pattern, _span)) => {
                         self.plan.ignored_patterns.push(pattern.to_string());
                     }
+                }
+                Ok(())
+            }
+            StatementKind::Full(tables) => {
+                for (table, _span) in tables {
+                    self.plan.full_tables.insert(table.to_string());
                 }
                 Ok(())
             }
@@ -581,6 +588,19 @@ impl Resolver {
         Ok(())
     }
 
+    fn process_ignore_relation(&mut self, relation_decl: &RelationDecl<'_>) -> Result<()> {
+        let from = &relation_decl.from.0;
+        let to = &relation_decl.to.0;
+
+        self.plan.ignored_relations.push(Relation {
+            from_table: from.table.to_string(),
+            from_column: from.column.to_string(),
+            to_table: to.table.to_string(),
+            to_column: to.column.to_string(),
+        });
+        Ok(())
+    }
+
     fn process_anonymize(&mut self, anon_block: &AnonymizeBlock<'_>) -> Result<()> {
         let table = anon_block.table.0.to_string();
         let mut rules = Vec::new();
@@ -633,6 +653,19 @@ impl Resolver {
             None
         };
 
+        let mut exclude_tables = Vec::new();
+        let mut exclude_patterns = Vec::new();
+        for pattern in &agg_block.exclude_tables {
+            match pattern {
+                TablePattern::Exact((name, _span)) => {
+                    exclude_tables.push(name.to_string());
+                }
+                TablePattern::Regex((pat, _span)) => {
+                    exclude_patterns.push(pat.to_string());
+                }
+            }
+        }
+
         self.plan.aggregates.push(ResolvedAggregate {
             name,
             root_table,
@@ -640,21 +673,34 @@ impl Resolver {
             order_by,
             order_direction,
             limit,
+            exclude_tables,
+            exclude_patterns,
+            root_only: agg_block.root_only,
         });
         Ok(())
     }
 
     fn process_include(&mut self, include_stmt: &IncludeStmt<'_>) -> Result<()> {
-        // Find the aggregate and add another where clause
         let aggregate_name = include_stmt.aggregate.0.to_string();
-        let where_clause = self.resolve_string_literal(&include_stmt.where_clause.0)?;
 
-        // For simplicity, we treat include as creating a new aggregate entry
-        // with the same root table but different where clause
         if let Some(existing) = self.plan.aggregates.iter().find(|a| a.name == aggregate_name) {
             let mut new_agg = existing.clone();
             new_agg.name = format!("{}_include_{}", aggregate_name, self.plan.aggregates.len());
-            new_agg.where_clause = Some(where_clause);
+
+            match &include_stmt.where_clause {
+                Some(wc) => {
+                    // Override with the specified where clause
+                    new_agg.where_clause = Some(self.resolve_string_literal(&wc.0)?);
+                }
+                None => {
+                    // No where clause: import the full root table (+ relations)
+                    new_agg.where_clause = None;
+                    new_agg.order_by = None;
+                    new_agg.order_direction = None;
+                    new_agg.limit = None;
+                }
+            }
+
             self.plan.aggregates.push(new_agg);
         }
         Ok(())
