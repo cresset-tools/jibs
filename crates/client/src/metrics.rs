@@ -2,6 +2,7 @@
 //!
 //! Provides timing measurements for identifying bottlenecks in the import pipeline.
 
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use jibs_protocol::ServerMetrics;
@@ -129,7 +130,6 @@ impl ClientMetrics {
                 let total_iterate_ms: u64 = sm.query_timings.iter().map(|t| t.iterate_ms).sum();
                 let total_rows: u64 = sm.query_timings.iter().map(|t| t.rows).sum();
                 let mysql_total = total_query_ms + total_iterate_ms;
-                let accounted = mysql_total + sm.dedup_time_ms;
 
                 println!(
                     "Aggregate BFS: {} queries, {} rows fetched",
@@ -144,14 +144,35 @@ impl ClientMetrics {
                     "  Dedup + FK extract:    {:>6}",
                     format_duration_ms(sm.dedup_time_ms),
                 );
+                println!(
+                    "  TSV serialization:     {:>6}",
+                    format_duration_ms(sm.aggregate_serialize_ms),
+                );
+                let agg_write_pct = if sm.aggregate_wall_ms > 0 {
+                    percent(sm.aggregate_write_ms, sm.aggregate_wall_ms)
+                } else {
+                    0
+                };
+                let agg_write_note = if agg_write_pct > 30 { " <- backpressure" } else { "" };
+                println!(
+                    "  Stdout write:          {:>6} ({:>3}%){}",
+                    format_duration_ms(sm.aggregate_write_ms),
+                    agg_write_pct,
+                    agg_write_note,
+                );
+                let accounted = mysql_total + sm.dedup_time_ms + sm.aggregate_serialize_ms + sm.aggregate_write_ms;
                 if sm.aggregate_wall_ms > accounted {
                     println!(
-                        "  Other (serialize/write/overhead): {:>6}",
+                        "  Overhead:              {:>6}",
                         format_duration_ms(sm.aggregate_wall_ms - accounted),
                     );
                 }
                 println!();
 
+                // Per-table aggregate totals
+                display_per_table_totals(&sm.query_timings);
+
+                // Per-query slowest
                 let mut timings = sm.query_timings.clone();
                 timings.sort_by(|a, b| {
                     let total_a = a.query_ms + a.iterate_ms;
@@ -233,6 +254,55 @@ impl ClientMetrics {
         println!("Rows: {}", format_rows(self.rows_loaded));
         println!("Wall time: {}", format_duration(self.wall_time));
     }
+}
+
+/// Display per-table totals for aggregate BFS queries
+fn display_per_table_totals(query_timings: &[jibs_protocol::QueryTiming]) {
+    // Group by table
+    struct TableTotal {
+        queries: u64,
+        rows: u64,
+        query_ms: u64,
+        iterate_ms: u64,
+    }
+
+    let mut by_table: HashMap<&str, TableTotal> = HashMap::new();
+    for t in query_timings {
+        let entry = by_table.entry(&t.table).or_insert(TableTotal {
+            queries: 0,
+            rows: 0,
+            query_ms: 0,
+            iterate_ms: 0,
+        });
+        entry.queries += 1;
+        entry.rows += t.rows;
+        entry.query_ms += t.query_ms;
+        entry.iterate_ms += t.iterate_ms;
+    }
+
+    // Sort by total MySQL time descending
+    let mut sorted: Vec<_> = by_table.iter().collect();
+    sorted.sort_by(|a, b| {
+        let total_a = a.1.query_ms + a.1.iterate_ms;
+        let total_b = b.1.query_ms + b.1.iterate_ms;
+        total_b.cmp(&total_a)
+    });
+
+    println!("Per-table aggregate totals:");
+    for (table, total) in sorted.iter().take(20) {
+        let mysql_ms = total.query_ms + total.iterate_ms;
+        println!(
+            "  {:>8}  {:<50} {:>3} queries, {} rows",
+            format_duration_ms(mysql_ms),
+            table,
+            total.queries,
+            format_rows(total.rows),
+        );
+    }
+    if sorted.len() > 20 {
+        println!("  ... and {} more tables", sorted.len() - 20);
+    }
+    println!();
 }
 
 /// Format milliseconds as duration string

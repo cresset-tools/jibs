@@ -168,6 +168,7 @@ impl<'a> DependencyTraverser<'a> {
         let phase1_start = Instant::now();
         let aggregate_tables = self.stream_aggregate_tables(compression, &mut checkpoint, writer)?;
         self.metrics.set_aggregate_wall_time(phase1_start.elapsed());
+        self.metrics.snapshot_aggregate_phase();
 
         // Phase 2: Stream non-aggregate tables.
         // Collect the list of tables to stream with their metadata.

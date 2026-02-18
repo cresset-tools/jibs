@@ -31,6 +31,10 @@ pub struct MetricsCollector {
     aggregate_wall_ns: AtomicU64,
     /// Wall-clock time for full table streaming (Phase 2)
     full_tables_wall_ns: AtomicU64,
+    /// Serialize time during aggregate phase only
+    aggregate_serialize_ns: AtomicU64,
+    /// Write time during aggregate phase only
+    aggregate_write_ns: AtomicU64,
     /// Per-query timing records for aggregate BFS queries
     query_timings: Mutex<Vec<QueryTiming>>,
 }
@@ -48,6 +52,8 @@ impl Default for MetricsCollector {
             dedup_time_ns: AtomicU64::new(0),
             aggregate_wall_ns: AtomicU64::new(0),
             full_tables_wall_ns: AtomicU64::new(0),
+            aggregate_serialize_ns: AtomicU64::new(0),
+            aggregate_write_ns: AtomicU64::new(0),
             query_timings: Mutex::new(Vec::new()),
         }
     }
@@ -153,6 +159,21 @@ impl MetricsCollector {
         }
     }
 
+    /// Snapshot current serialize/write totals as the aggregate phase totals.
+    /// Call this at the end of Phase 1, before Phase 2 starts adding to the same counters.
+    pub fn snapshot_aggregate_phase(&self) {
+        if self.enabled {
+            self.aggregate_serialize_ns.store(
+                self.serialize_time_ns.load(Ordering::Relaxed),
+                Ordering::Relaxed,
+            );
+            self.aggregate_write_ns.store(
+                self.write_time_ns.load(Ordering::Relaxed),
+                Ordering::Relaxed,
+            );
+        }
+    }
+
     /// Record timing for a single aggregate BFS query
     pub fn record_query(&self, timing: QueryTiming) {
         if self.enabled {
@@ -176,6 +197,8 @@ impl MetricsCollector {
             dedup_time_ms: self.dedup_time_ns.load(Ordering::Relaxed) / 1_000_000,
             aggregate_wall_ms: self.aggregate_wall_ns.load(Ordering::Relaxed) / 1_000_000,
             full_tables_wall_ms: self.full_tables_wall_ns.load(Ordering::Relaxed) / 1_000_000,
+            aggregate_serialize_ms: self.aggregate_serialize_ns.load(Ordering::Relaxed) / 1_000_000,
+            aggregate_write_ms: self.aggregate_write_ns.load(Ordering::Relaxed) / 1_000_000,
             query_timings: std::mem::take(&mut *self.query_timings.lock().unwrap()),
         })
     }
