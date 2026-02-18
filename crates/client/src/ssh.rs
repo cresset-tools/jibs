@@ -9,11 +9,11 @@ use async_trait::async_trait;
 use base64::Engine;
 use russh::client::{self, Config, Handle, Msg};
 use russh::keys::key::PublicKey;
-use russh::{Channel, ChannelMsg};
+use russh::{Channel, ChannelMsg, ChannelStream};
 use russh_sftp::client::SftpSession;
 use russh_sftp::protocol::OpenFlags;
 use sha2::{Digest, Sha256};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::sync::Mutex;
 
 use crate::error::{ClientError, Result};
@@ -738,6 +738,49 @@ impl RemoteProcess {
     #[allow(dead_code)]
     pub fn exit_code(&self) -> Option<i32> {
         self.exit_code
+    }
+
+    /// Split into independent reader and writer halves for concurrent I/O.
+    ///
+    /// After splitting, the reader and writer can be used from different tasks.
+    /// Note: stderr messages from the remote process will be silently discarded
+    /// after splitting (they were only logged before).
+    pub fn split(self) -> (ProcessReader, ProcessWriter) {
+        let stream = self.channel.into_stream();
+        let (reader, writer) = tokio::io::split(stream);
+        (ProcessReader { reader }, ProcessWriter { writer })
+    }
+}
+
+/// Read half of a split RemoteProcess
+pub struct ProcessReader {
+    reader: ReadHalf<ChannelStream<Msg>>,
+}
+
+impl ProcessReader {
+    /// Read exact number of bytes from the remote process stdout
+    pub async fn read_exact(&mut self, buf: &mut [u8]) -> Result<()> {
+        self.reader.read_exact(buf).await.map_err(|e| ClientError::Ssh {
+            operation: "read from process".to_string(),
+            message: e.to_string(),
+        })?;
+        Ok(())
+    }
+}
+
+/// Write half of a split RemoteProcess
+pub struct ProcessWriter {
+    writer: WriteHalf<ChannelStream<Msg>>,
+}
+
+impl ProcessWriter {
+    /// Write data to the remote process stdin
+    pub async fn write(&mut self, data: &[u8]) -> Result<()> {
+        self.writer.write_all(data).await.map_err(|e| ClientError::Ssh {
+            operation: "write to process stdin".to_string(),
+            message: e.to_string(),
+        })?;
+        Ok(())
     }
 }
 

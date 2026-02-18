@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use mysql::prelude::*;
@@ -19,7 +19,7 @@ use crate::metrics::ClientMetrics;
 use crate::progress::ImportProgress;
 use crate::resolver;
 use crate::server_binary;
-use crate::ssh::{get_server_path, RemoteProcess, SshConfig, SshSession};
+use crate::ssh::{get_server_path, ProcessReader, ProcessWriter, RemoteProcess, SshConfig, SshSession};
 
 // ============================================================================
 // Loader Pool - manages parallel MySQL connections for data loading
@@ -29,7 +29,10 @@ use crate::ssh::{get_server_path, RemoteProcess, SshConfig, SshSession};
 struct LoadWork {
     table: String,
     columns: Arc<Vec<ColumnDef>>,
+    /// Raw data — may be compressed depending on `compression`
     data: Vec<u8>,
+    /// Compression mode for this chunk
+    compression: CompressionMode,
     result_tx: std::sync::mpsc::Sender<Result<u64>>,
 }
 
@@ -94,6 +97,12 @@ impl LoaderPool {
                     let _ = init_reporter.send((worker_id, WorkerInitResult::Failed(msg)));
                     return;
                 }
+                // Allow inserting 0 into auto-increment columns
+                if let Err(e) = conn.query_drop("SET SQL_MODE = 'NO_AUTO_VALUE_ON_ZERO'") {
+                    let msg = format!("Failed to set SQL mode: {}", e);
+                    let _ = init_reporter.send((worker_id, WorkerInitResult::Failed(msg)));
+                    return;
+                }
 
                 // Report successful initialization
                 let _ = init_reporter.send((worker_id, WorkerInitResult::Ready));
@@ -115,11 +124,15 @@ impl LoaderPool {
                         table,
                         columns,
                         data,
+                        compression,
                         result_tx,
                     } = work;
 
-                    // Load data
-                    let result = load_tsv_data_with_conn(&mut conn, &table, &columns, &data);
+                    // Decompress + load data
+                    let result = (|| -> Result<u64> {
+                        let decompressed = maybe_decompress(data, compression)?;
+                        load_tsv_data_with_conn(&mut conn, &table, &columns, &decompressed)
+                    })();
                     let _ = result_tx.send(result);
                 }
 
@@ -191,12 +204,14 @@ impl LoaderPool {
         })
     }
 
-    /// Submit data for loading, returns a receiver for the result
+    /// Submit data for loading, returns a receiver for the result.
+    /// Data may be compressed — workers decompress before loading.
     fn submit(
         &self,
         table: String,
         columns: Arc<Vec<ColumnDef>>,
         data: Vec<u8>,
+        compression: CompressionMode,
     ) -> Result<std::sync::mpsc::Receiver<Result<u64>>> {
         let (result_tx, result_rx) = std::sync::mpsc::channel();
 
@@ -205,6 +220,7 @@ impl LoaderPool {
                 table,
                 columns,
                 data,
+                compression,
                 result_tx,
             })
             .map_err(|_| anyhow::anyhow!("Loader pool shut down"))?;
@@ -292,6 +308,8 @@ pub struct ImportConfig {
     pub max_message_size: usize,
     /// Whether to collect and display timing metrics
     pub collect_metrics: bool,
+    /// Whether to show a report of slowest tables after import
+    pub show_report: bool,
     /// Debug: simulate crash after N tables (for testing resume)
     #[cfg(feature = "test-utils")]
     pub fail_after_tables: Option<usize>,
@@ -430,6 +448,8 @@ pub async fn run_import(config: ImportConfig) -> Result<()> {
     // Disable foreign key checks for import
     local_conn.query_drop("SET FOREIGN_KEY_CHECKS = 0")?;
     local_conn.query_drop("SET UNIQUE_CHECKS = 0")?;
+    // Allow inserting 0 into auto-increment columns (e.g. store_website.website_id = 0)
+    local_conn.query_drop("SET SQL_MODE = 'NO_AUTO_VALUE_ON_ZERO'")?;
 
     // Create loader pool for parallel loading (if parallel > 1)
     let loader_pool = if config.parallel > 1 {
@@ -449,9 +469,9 @@ pub async fn run_import(config: ImportConfig) -> Result<()> {
     };
     send_message(&mut server, &creds_msg).await?;
 
-    // Run the import protocol
+    // Run the import protocol (takes ownership of server for split)
     let result = run_protocol(
-        &mut server,
+        server,
         &mut local_conn,
         loader_pool,
         plan,
@@ -489,6 +509,11 @@ pub async fn run_import(config: ImportConfig) -> Result<()> {
                 client_metrics.display(stats.server_metrics.as_ref());
             }
 
+            // Display report if enabled
+            if config.show_report {
+                display_report(&stats.table_durations);
+            }
+
             Ok(())
         }
         Err((e, pool)) => {
@@ -496,8 +521,6 @@ pub async fn run_import(config: ImportConfig) -> Result<()> {
             if let Some(pool) = pool {
                 pool.shutdown();
             }
-            // Try to send shutdown
-            let _ = send_message(&mut server, &ClientMessage::Shutdown).await;
             Err(e)
         }
     }
@@ -509,6 +532,8 @@ struct ImportStats {
     tables_imported_names: Vec<String>,
     rows_imported: u64,
     server_metrics: Option<ServerMetrics>,
+    /// Per-table durations: (name, rows, duration)
+    table_durations: Vec<(String, u64, Duration)>,
 }
 
 /// Apply aggregate overrides for the `get` command
@@ -625,7 +650,7 @@ fn cleanup_checkpoint(conn: &mut Conn) -> Result<()> {
 
 /// Run the import protocol with the remote server
 async fn run_protocol(
-    server: &mut RemoteProcess,
+    server: RemoteProcess,
     local_conn: &mut Conn,
     loader_pool: Option<LoaderPool>,
     plan: ExecutionPlan,
@@ -658,7 +683,7 @@ async fn run_protocol(
 
 /// Inner protocol implementation
 async fn run_protocol_inner(
-    server: &mut RemoteProcess,
+    mut server: RemoteProcess,
     local_conn: &mut Conn,
     loader_pool: &Option<LoaderPool>,
     plan: ExecutionPlan,
@@ -674,6 +699,7 @@ async fn run_protocol_inner(
         tables_imported_names: Vec::new(),
         rows_imported: 0,
         server_metrics: None,
+        table_durations: Vec::new(),
     };
 
     let mut client_metrics = ClientMetrics::new();
@@ -697,10 +723,10 @@ async fn run_protocol_inner(
         parallel,
         collect_metrics,
     };
-    send_message(server, &init_msg).await?;
+    send_message(&mut server, &init_msg).await?;
 
     // Wait for Ready
-    let ready_msg: ServerMessage = recv_message(server, max_message_size).await?;
+    let ready_msg: ServerMessage = recv_message(&mut server, max_message_size).await?;
     let (tables, negotiated_compression) = match ready_msg {
         ServerMessage::Ready {
             tables,
@@ -730,7 +756,7 @@ async fn run_protocol_inner(
     // Send Start message
     debug!("Starting data transfer");
     let start_msg = ClientMessage::Start { resume_from: None };
-    send_message(server, &start_msg).await?;
+    send_message(&mut server, &start_msg).await?;
 
     // Track tables with preserved backups
     let mut tables_with_preserves: Vec<String> = Vec::new();
@@ -749,10 +775,36 @@ async fn run_protocol_inner(
     // This bounds memory usage while allowing cross-table parallelism
     const MAX_PENDING_CHUNKS: usize = 100;
 
+    // Split the process into reader/writer halves and spawn a read-ahead task.
+    // This keeps the SSH pipe drained even while the main loop is busy processing,
+    // preventing backpressure from stalling the server.
+    let (mut reader, mut writer) = server.split();
+
+    // Spawn read-ahead task: continuously reads messages from SSH and buffers them.
+    // The bounded channel (32 messages) absorbs bursts so the server doesn't stall.
+    let (msg_tx, mut msg_rx) = tokio::sync::mpsc::channel::<Result<ServerMessage>>(32);
+    tokio::spawn(async move {
+        loop {
+            let result = recv_message_from_reader(&mut reader, max_message_size).await;
+            let is_done = result.as_ref().map(|m| matches!(m, ServerMessage::Done { .. })).unwrap_or(false);
+            let is_err = result.is_err();
+            if msg_tx.send(result).await.is_err() {
+                break; // Receiver dropped
+            }
+            if is_done || is_err {
+                break;
+            }
+        }
+    });
+
     loop {
-        // Time message receive
+        // Receive from the read-ahead buffer (not directly from SSH)
         let recv_start = Instant::now();
-        let msg: ServerMessage = recv_message(server, max_message_size).await?;
+        let msg = match msg_rx.recv().await {
+            Some(Ok(msg)) => msg,
+            Some(Err(e)) => return Err(e),
+            None => return Err(anyhow::anyhow!("Server connection closed unexpectedly")),
+        };
         if collect_metrics {
             client_metrics.add_recv_time(recv_start.elapsed());
         }
@@ -804,25 +856,21 @@ async fn run_protocol_inner(
                     debug!("Skipping data chunk for {} (already completed)", table);
                     // Still need to send ack
                     let ack_msg = ClientMessage::Ack { checkpoint };
-                    send_message(server, &ack_msg).await?;
+                    send_message_writer(&mut writer, &ack_msg).await?;
                     continue;
                 }
 
-                // Time decompression
-                let decompress_start = Instant::now();
-                let decompressed = maybe_decompress(tsv_data, negotiated_compression)?;
                 if collect_metrics {
-                    client_metrics.add_decompress_time(decompress_start.elapsed());
+                    client_metrics.add_compressed_bytes(tsv_data.len() as u64);
+                    // Read uncompressed size from zstd header (first 4 bytes)
+                    if matches!(negotiated_compression, CompressionMode::Zstd) && tsv_data.len() >= 4 {
+                        let uncompressed_len =
+                            u32::from_le_bytes([tsv_data[0], tsv_data[1], tsv_data[2], tsv_data[3]]) as u64;
+                        client_metrics.add_uncompressed_bytes(uncompressed_len);
+                    } else {
+                        client_metrics.add_uncompressed_bytes(tsv_data.len() as u64);
+                    }
                 }
-                let bytes_received = decompressed.len();
-                if collect_metrics {
-                    client_metrics.add_bytes_received(bytes_received as u64);
-                }
-
-                debug!(
-                    "Data chunk: {} rows, {} bytes for {}",
-                    row_count, bytes_received, table
-                );
 
                 // Get schema for this table
                 let schema = table_schemas
@@ -832,8 +880,8 @@ async fn run_protocol_inner(
 
                 // Load data into MySQL - use pool if available
                 if let Some(pool) = loader_pool {
-                    // Submit to loader pool for parallel processing
-                    let result_rx = pool.submit(table.clone(), schema, decompressed)?;
+                    // Submit compressed data to loader pool — workers decompress + load
+                    let result_rx = pool.submit(table.clone(), schema, tsv_data, negotiated_compression)?;
                     pending_loads.push((table.clone(), result_rx));
 
                     // If we have too many pending chunks, drain some to bound memory
@@ -874,7 +922,14 @@ async fn run_protocol_inner(
                         }
                     }
                 } else {
-                    // Load directly (sequential) - time the load
+                    // Sequential mode: decompress + load on main thread
+                    let decompress_start = Instant::now();
+                    let decompressed = maybe_decompress(tsv_data, negotiated_compression)?;
+                    if collect_metrics {
+                        client_metrics.add_decompress_time(decompress_start.elapsed());
+                        client_metrics.add_uncompressed_bytes(decompressed.len() as u64);
+                    }
+
                     let load_start = Instant::now();
                     let loaded = load_tsv_data(local_conn, &table, &schema, &decompressed)?;
                     if collect_metrics {
@@ -884,12 +939,12 @@ async fn run_protocol_inner(
                     stats.rows_imported += loaded;
                 }
 
-                // Update progress
-                progress.update_table(&table, row_count, bytes_received);
+                // Update progress (use compressed size for byte tracking)
+                progress.update_table(&table, row_count, 0);
 
                 // Send ack
                 let ack_msg = ClientMessage::Ack { checkpoint };
-                send_message(server, &ack_msg).await?;
+                send_message_writer(&mut writer, &ack_msg).await?;
             }
 
             ServerMessage::TableDone { table, row_count } => {
@@ -985,6 +1040,9 @@ async fn run_protocol_inner(
                 // Store server metrics
                 stats.server_metrics = server_metrics;
 
+                // Capture per-table durations before finishing progress
+                stats.table_durations = progress.table_durations().to_vec();
+
                 progress.finish();
 
                 // Log summary of aggregate vs full table imports
@@ -1059,7 +1117,7 @@ async fn run_protocol_inner(
     cleanup_checkpoint(local_conn)?;
 
     // Send shutdown
-    send_message(server, &ClientMessage::Shutdown).await?;
+    send_message_writer(&mut writer, &ClientMessage::Shutdown).await?;
 
     // Stop client metrics timing
     if collect_metrics {
@@ -1081,7 +1139,7 @@ async fn send_message(server: &mut RemoteProcess, msg: &ClientMessage) -> Result
     Ok(())
 }
 
-/// Receive a message from the server
+/// Receive a message from the server (uses unsplit RemoteProcess for pre-protocol exchange)
 async fn recv_message(
     server: &mut RemoteProcess,
     max_message_size: usize,
@@ -1116,6 +1174,52 @@ async fn recv_message(
         .map_err(|e| anyhow::anyhow!("Failed to decode message: {}", e))?;
 
     Ok(msg)
+}
+
+/// Receive a message from a ProcessReader (split read half)
+async fn recv_message_from_reader(
+    reader: &mut ProcessReader,
+    max_message_size: usize,
+) -> Result<ServerMessage> {
+    let mut len_bytes = [0u8; 4];
+    reader
+        .read_exact(&mut len_bytes)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to read message length: {}", e))?;
+    let len = u32::from_le_bytes(len_bytes) as usize;
+
+    if len > max_message_size {
+        return Err(anyhow::anyhow!(
+            "Message too large: {} bytes (max: {} bytes, ~{}MB). \
+             Consider using --max-message-size to increase the limit.",
+            len,
+            max_message_size,
+            max_message_size / (1024 * 1024)
+        ));
+    }
+
+    let mut buffer = vec![0u8; len];
+    reader
+        .read_exact(&mut buffer)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to read message body: {}", e))?;
+
+    let (msg, _) = bincode::decode_from_slice(&buffer, jibs_protocol::framing::bincode_config())
+        .map_err(|e| anyhow::anyhow!("Failed to decode message: {}", e))?;
+
+    Ok(msg)
+}
+
+/// Send a message using a ProcessWriter (split write half)
+async fn send_message_writer(writer: &mut ProcessWriter, msg: &ClientMessage) -> Result<()> {
+    let mut buffer = Vec::new();
+    write_message(&mut buffer, msg)
+        .map_err(|e| anyhow::anyhow!("Failed to serialize message: {}", e))?;
+    writer
+        .write(&buffer)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to send message: {}", e))?;
+    Ok(())
 }
 
 /// Deploy the server binary to the remote host if needed
@@ -1504,6 +1608,82 @@ fn backup_preserved_rows(
 
     info!("Backed up {} preserved rows from {} to {}", row_count, table, backup_table);
     Ok(true)
+}
+
+/// Display a report of tables sorted by import duration (slowest first)
+fn display_report(table_durations: &[(String, u64, Duration)]) {
+    if table_durations.is_empty() {
+        return;
+    }
+
+    let mut sorted: Vec<_> = table_durations.to_vec();
+    sorted.sort_by(|a, b| b.2.cmp(&a.2));
+
+    // Find the longest table name for column width
+    let max_name_len = sorted.iter().map(|(n, _, _)| n.len()).max().unwrap_or(20);
+    let name_width = max_name_len.max(5); // minimum "Table" header width
+
+    eprintln!();
+    eprintln!("=== Import Report ===");
+    eprintln!();
+    eprintln!(
+        "  {:<4} {:<width$}  {:>10}  {:>10}  {:>10}",
+        "#",
+        "Table",
+        "Rows",
+        "Duration",
+        "Rows/s",
+        width = name_width
+    );
+    eprintln!(
+        "  {:-<4} {:-<width$}  {:-<10}  {:-<10}  {:-<10}",
+        "",
+        "",
+        "",
+        "",
+        "",
+        width = name_width
+    );
+
+    for (i, (name, rows, duration)) in sorted.iter().enumerate() {
+        let secs = duration.as_secs_f64();
+        let rows_per_sec = if secs > 0.0 {
+            (*rows as f64 / secs) as u64
+        } else {
+            0
+        };
+
+        let duration_str = if secs >= 60.0 {
+            format!("{:.0}m {:.1}s", (secs / 60.0).floor(), secs % 60.0)
+        } else {
+            format!("{:.1}s", secs)
+        };
+
+        eprintln!(
+            "  {:<4} {:<width$}  {:>10}  {:>10}  {:>10}",
+            i + 1,
+            name,
+            format_number(*rows),
+            duration_str,
+            format_number(rows_per_sec),
+            width = name_width
+        );
+    }
+
+    eprintln!();
+}
+
+/// Format a number with thousand separators
+fn format_number(n: u64) -> String {
+    let s = n.to_string();
+    let mut result = String::new();
+    for (i, c) in s.chars().rev().enumerate() {
+        if i > 0 && i % 3 == 0 {
+            result.insert(0, ',');
+        }
+        result.insert(0, c);
+    }
+    result
 }
 
 /// Restore previously preserved rows from backup table after import

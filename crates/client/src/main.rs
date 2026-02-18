@@ -73,12 +73,8 @@ struct ConnectionArgs {
     #[arg(long, default_value = "1")]
     parallel: usize,
 
-    /// Force compression
-    #[arg(long, conflicts_with = "no_compress")]
-    compress: bool,
-
-    /// Disable compression
-    #[arg(long, conflicts_with = "compress")]
+    /// Disable compression (compression is enabled by default)
+    #[arg(long)]
     no_compress: bool,
 
     /// Path to SSH private key
@@ -108,6 +104,10 @@ struct ConnectionArgs {
     /// Print detailed timing metrics after import
     #[arg(long)]
     metrics: bool,
+
+    /// Print a report of slowest tables after import
+    #[arg(long)]
+    report: bool,
 }
 
 #[derive(Args)]
@@ -207,9 +207,7 @@ async fn main() -> Result<()> {
 async fn run_import(args: ImportArgs) -> Result<()> {
     use jibs_protocol::CompressionMode;
 
-    let compression = if args.connection.compress {
-        CompressionMode::Zstd
-    } else if args.connection.no_compress {
+    let compression = if args.connection.no_compress {
         CompressionMode::None
     } else {
         CompressionMode::Auto
@@ -234,6 +232,7 @@ async fn run_import(args: ImportArgs) -> Result<()> {
         host_key_verification,
         max_message_size: args.connection.max_message_size,
         collect_metrics: args.connection.metrics,
+        show_report: args.connection.report,
         #[cfg(feature = "test-utils")]
         fail_after_tables: args.fail_after_tables,
     };
@@ -247,9 +246,7 @@ async fn run_get(args: GetArgs) -> Result<()> {
     // Parse aggregate/where pairs from trailing args
     let aggregate_overrides = parse_aggregate_queries(&args.queries)?;
 
-    let compression = if args.connection.compress {
-        CompressionMode::Zstd
-    } else if args.connection.no_compress {
+    let compression = if args.connection.no_compress {
         CompressionMode::None
     } else {
         CompressionMode::Auto
@@ -274,6 +271,7 @@ async fn run_get(args: GetArgs) -> Result<()> {
         host_key_verification,
         max_message_size: args.connection.max_message_size,
         collect_metrics: args.connection.metrics,
+        show_report: args.connection.report,
         #[cfg(feature = "test-utils")]
         fail_after_tables: None,
     };
