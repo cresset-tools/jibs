@@ -165,10 +165,13 @@ impl<'a> DependencyTraverser<'a> {
         // Phase 1: Stream aggregate tables via BFS traversal.
         // This streams rows directly during traversal, only keeping PKs and FK values in memory.
         // Returns the set of tables that were touched by aggregates.
+        let phase1_start = Instant::now();
         let aggregate_tables = self.stream_aggregate_tables(compression, &mut checkpoint, writer)?;
+        self.metrics.set_aggregate_wall_time(phase1_start.elapsed());
 
         // Phase 2: Stream non-aggregate tables.
         // Collect the list of tables to stream with their metadata.
+        let phase2_start = Instant::now();
         let all_tables: Vec<String> = self.conn.get_all_table_names()?;
 
         let mut tables_to_stream: Vec<TableTask> = Vec::new();
@@ -234,6 +237,7 @@ impl<'a> DependencyTraverser<'a> {
                 mysql_url,
             )?;
         }
+        self.metrics.set_full_tables_wall_time(phase2_start.elapsed());
 
         Ok(aggregate_tables)
     }
@@ -401,7 +405,6 @@ impl<'a> DependencyTraverser<'a> {
         drop(tx);
 
         // Writer loop: drain channel and write to stdout
-        // Time the write operations
         for msg in rx {
             let write_start = Instant::now();
             write_message(writer, &msg)?;
@@ -465,20 +468,39 @@ impl<'a> DependencyTraverser<'a> {
         // Tables touched by aggregates
         let mut aggregate_tables: HashSet<String> = HashSet::new();
 
+        // Full tables skip BFS and get imported fully in Phase 2
+        let full_tables = &self.plan.full_tables;
+
         // Track which tables have had Schema sent and their total row counts
         let mut schemas_sent: HashSet<String> = HashSet::new();
         let mut table_row_counts: HashMap<String, u64> = HashMap::new();
 
         // Pre-cache schemas and PK columns for all tables that might be touched
         // (needed before we start streaming since we can't query metadata during iteration)
-        let all_table_names = self.conn.get_all_table_names()?;
-        for table_name in &all_table_names {
+        let all_table_names_vec = self.conn.get_all_table_names()?;
+        let all_table_names: HashSet<String> = all_table_names_vec.iter().cloned().collect();
+        for table_name in &all_table_names_vec {
             self.conn.get_column_defs(table_name)?;
         }
 
         let aggregates = self.plan.aggregates.clone();
         for aggregate in &aggregates {
             aggregate_tables.insert(aggregate.root_table.clone());
+
+            // Tables excluded from BFS for this aggregate (expand regex patterns)
+            let mut exclude_tables: HashSet<String> = aggregate.exclude_tables.iter().cloned().collect();
+            if !aggregate.exclude_patterns.is_empty() {
+                let regexes: Vec<regex::Regex> = aggregate
+                    .exclude_patterns
+                    .iter()
+                    .filter_map(|p| regex::Regex::new(p).ok())
+                    .collect();
+                for table_name in &all_table_names_vec {
+                    if regexes.iter().any(|re| re.is_match(table_name)) {
+                        exclude_tables.insert(table_name.clone());
+                    }
+                }
+            }
 
             // BFS pending set: coalesces FK values by (table, column, via_backward)
             // Processed level-by-level to allow merging entries targeting the same table+column
@@ -502,17 +524,38 @@ impl<'a> DependencyTraverser<'a> {
                 .cloned()
                 .unwrap_or_default();
 
-            // Prepare FK extraction info for the root table
-            let forward_relations: Vec<_> = self
-                .relations_by_source
-                .get(root_table.as_str())
-                .cloned()
-                .unwrap_or_default();
-            let backward_relations: Vec<_> = self
-                .relations_by_target
-                .get(root_table.as_str())
-                .cloned()
-                .unwrap_or_default();
+            // Prepare FK extraction info for the root table (pre-filtered)
+            // When root_only, skip FK extraction entirely — no BFS traversal
+            let forward_relations: Vec<_> = if aggregate.root_only {
+                vec![]
+            } else {
+                self.relations_by_source
+                    .get(root_table.as_str())
+                    .cloned()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|r| {
+                        all_table_names.contains(&r.from_table)
+                            && all_table_names.contains(&r.to_table)
+                            && !exclude_tables.contains(&r.to_table)
+                    })
+                    .collect()
+            };
+            let backward_relations: Vec<_> = if aggregate.root_only {
+                vec![]
+            } else {
+                self.relations_by_target
+                    .get(root_table.as_str())
+                    .cloned()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|r| {
+                        all_table_names.contains(&r.from_table)
+                            && all_table_names.contains(&r.to_table)
+                            && !exclude_tables.contains(&r.from_table)
+                    })
+                    .collect()
+            };
 
             let column_names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
             let mut tsv_writer = TsvWriter::new(
@@ -522,22 +565,33 @@ impl<'a> DependencyTraverser<'a> {
             );
             let mut chunk_row_count: u32 = 0;
 
-            // Accumulators for FK values to queue after streaming
-            let mut fk_accumulator: HashMap<(String, String, bool), Vec<MySqlValue>> =
-                HashMap::new();
+            // Accumulators for FK values — indexed by relation to avoid String cloning per row
+            let mut backward_fk_vecs: Vec<Vec<MySqlValue>> = vec![Vec::new(); backward_relations.len()];
+            let mut forward_fk_vecs: Vec<Vec<MySqlValue>> = vec![Vec::new(); forward_relations.len()];
+
+            // Pre-insert visited set for root table to avoid cloning table name per row
+            let visited_set = visited.entry(root_table.clone()).or_default();
 
             // Stream root table rows
+            let root_query_ms: u64;
+            let mut root_iterate_ns: u64 = 0;
+            let mut root_row_count: u64 = 0;
             {
                 // Time query execution
                 let query_start = Instant::now();
                 let result = self.conn.query_iter(&root_query)?;
-                self.metrics.add_query_time(query_start.elapsed());
+                let root_query_elapsed = query_start.elapsed();
+                self.metrics.add_query_time(root_query_elapsed);
+                root_query_ms = root_query_elapsed.as_millis() as u64;
 
                 for row_result in result {
                     // Time row iteration
                     let iterate_start = Instant::now();
                     let row: Row = row_result?;
-                    self.metrics.add_iterate_time(iterate_start.elapsed());
+                    let iter_elapsed = iterate_start.elapsed();
+                    self.metrics.add_iterate_time(iter_elapsed);
+                    root_iterate_ns += iter_elapsed.as_nanos() as u64;
+                    root_row_count += 1;
 
                     // Send schema on first row
                     if schemas_sent.insert(root_table.clone()) {
@@ -552,62 +606,42 @@ impl<'a> DependencyTraverser<'a> {
                         self.metrics.add_write_time(write_start.elapsed());
                     }
 
-                    // Dedup check
+                    // Dedup check + FK extraction
+                    let dedup_start = Instant::now();
                     let pk = extract_pk_from_row(&row, &pk_columns);
                     let pk_bytes = serialize_pk(&pk);
-                    let is_new = visited
-                        .entry(root_table.clone())
-                        .or_default()
-                        .insert(pk_bytes);
+                    let is_new = visited_set.insert(pk_bytes);
 
                     // Always extract backward FK values from root table rows,
                     // even for already-visited rows. A previous aggregate may have
                     // reached this table via forward traversal (which skips backward
                     // relations), so we need to ensure child tables are discovered.
-                    for relation in &backward_relations {
-                        if !all_table_names.contains(&relation.from_table) || !all_table_names.contains(&relation.to_table) {
-                            continue;
-                        }
+                    for (i, relation) in backward_relations.iter().enumerate() {
                         if let Some(Ok(v)) =
                             row.get_opt::<MySqlValue, _>(relation.to_column.as_str())
                         {
                             if !matches!(v, MySqlValue::NULL) {
-                                fk_accumulator
-                                    .entry((
-                                        relation.from_table.clone(),
-                                        relation.from_column.clone(),
-                                        true,
-                                    ))
-                                    .or_default()
-                                    .push(v);
+                                backward_fk_vecs[i].push(v);
                             }
                         }
                     }
 
                     if !is_new {
+                        self.metrics.add_dedup_time(dedup_start.elapsed());
                         continue; // Already visited — skip TSV and forward FK extraction
                     }
 
                     // Extract FK values for forward relations
-                    for relation in &forward_relations {
-                        if !all_table_names.contains(&relation.from_table) || !all_table_names.contains(&relation.to_table) {
-                            continue;
-                        }
+                    for (i, relation) in forward_relations.iter().enumerate() {
                         if let Some(Ok(v)) =
                             row.get_opt::<MySqlValue, _>(relation.from_column.as_str())
                         {
                             if !matches!(v, MySqlValue::NULL) {
-                                fk_accumulator
-                                    .entry((
-                                        relation.to_table.clone(),
-                                        relation.to_column.clone(),
-                                        false,
-                                    ))
-                                    .or_default()
-                                    .push(v);
+                                forward_fk_vecs[i].push(v);
                             }
                         }
                     }
+                    self.metrics.add_dedup_time(dedup_start.elapsed());
 
                     // Write TSV - time serialization
                     let serialize_start = Instant::now();
@@ -635,6 +669,16 @@ impl<'a> DependencyTraverser<'a> {
             }
             // QueryResult dropped here, conn is free
 
+            // Record per-query timing for root query
+            self.metrics.record_query(jibs_protocol::QueryTiming {
+                table: root_table.clone(),
+                column: String::new(),
+                num_values: 0,
+                query_ms: root_query_ms,
+                iterate_ms: root_iterate_ns / 1_000_000,
+                rows: root_row_count,
+            });
+
             // Flush remaining root table data
             if chunk_row_count > 0 {
                 flush_chunk(
@@ -648,14 +692,33 @@ impl<'a> DependencyTraverser<'a> {
                 )?;
             }
 
-            // Seed pending set from root table FK accumulator
-            for ((to_table, to_column, via_backward), values) in fk_accumulator.drain() {
-                let unique = dedupe_values(values);
-                if !unique.is_empty() {
-                    pending
-                        .entry((to_table, to_column, via_backward))
-                        .or_default()
-                        .extend(unique);
+            // Seed pending set from root table FK vecs
+            for (i, relation) in backward_relations.iter().enumerate() {
+                let values = std::mem::take(&mut backward_fk_vecs[i]);
+                if !values.is_empty() {
+                    let dedup_start = Instant::now();
+                    let unique = dedupe_values(values);
+                    self.metrics.add_dedup_time(dedup_start.elapsed());
+                    if !unique.is_empty() {
+                        pending
+                            .entry((relation.from_table.clone(), relation.from_column.clone(), true))
+                            .or_default()
+                            .extend(unique);
+                    }
+                }
+            }
+            for (i, relation) in forward_relations.iter().enumerate() {
+                let values = std::mem::take(&mut forward_fk_vecs[i]);
+                if !values.is_empty() {
+                    let dedup_start = Instant::now();
+                    let unique = dedupe_values(values);
+                    self.metrics.add_dedup_time(dedup_start.elapsed());
+                    if !unique.is_empty() {
+                        pending
+                            .entry((relation.to_table.clone(), relation.to_column.clone(), false))
+                            .or_default()
+                            .extend(unique);
+                    }
                 }
             }
 
@@ -664,10 +727,18 @@ impl<'a> DependencyTraverser<'a> {
             // and splits large value sets into batches of MAX_IN_VALUES.
             while !pending.is_empty() {
                 let current_level: Vec<_> = pending.drain().collect();
-                let mut fk_accumulator: HashMap<(String, String, bool), Vec<MySqlValue>> =
-                    HashMap::new();
 
                 for ((table, column, reached_via_backward), fk_values) in current_level {
+                    // Skip full_tables — they will be imported in full by Phase 2
+                    if full_tables.contains(&table) {
+                        continue;
+                    }
+
+                    // Skip tables excluded from this aggregate's BFS
+                    if exclude_tables.contains(&table) {
+                        continue;
+                    }
+
                     aggregate_tables.insert(table.clone());
 
                     if self.plan.excluded_tables.contains(&table) {
@@ -688,17 +759,31 @@ impl<'a> DependencyTraverser<'a> {
                         .cloned()
                         .unwrap_or_default();
 
-                    // Prepare FK extraction info
+                    // Prepare FK extraction info (pre-filtered)
                     let forward_relations: Vec<_> = self
                         .relations_by_source
                         .get(table.as_str())
                         .cloned()
-                        .unwrap_or_default();
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|r| {
+                            all_table_names.contains(&r.from_table)
+                                && all_table_names.contains(&r.to_table)
+                                && !exclude_tables.contains(&r.to_table)
+                        })
+                        .collect();
                     let backward_relations: Vec<_> = if reached_via_backward {
                         self.relations_by_target
                             .get(table.as_str())
                             .cloned()
                             .unwrap_or_default()
+                            .into_iter()
+                            .filter(|r| {
+                                all_table_names.contains(&r.from_table)
+                                    && all_table_names.contains(&r.to_table)
+                                    && !exclude_tables.contains(&r.from_table)
+                            })
+                            .collect()
                     } else {
                         vec![]
                     };
@@ -712,10 +797,26 @@ impl<'a> DependencyTraverser<'a> {
                     );
                     let mut chunk_row_count: u32 = 0;
 
+                    // FK accumulators indexed by relation (avoids String cloning per row)
+                    let mut fwd_fk_vecs: Vec<Vec<MySqlValue>> = vec![Vec::new(); forward_relations.len()];
+                    let mut bwd_fk_vecs: Vec<Vec<MySqlValue>> = vec![Vec::new(); backward_relations.len()];
+
+                    // Pre-get visited set for this table
+                    let visited_set = visited.entry(table.clone()).or_default();
+
+                    // Pre-get row count entry
+                    let row_count_entry = table_row_counts.entry(table.clone()).or_default();
+
                     // Dedupe and batch the FK values
+                    let dedup_start = Instant::now();
                     let unique_values = dedupe_values(fk_values);
+                    self.metrics.add_dedup_time(dedup_start.elapsed());
 
                     for batch in unique_values.chunks(MAX_IN_VALUES) {
+                        let batch_len = batch.len() as u32;
+                        let batch_query_ms: u64;
+                        let mut batch_iterate_ns: u64 = 0;
+                        let mut batch_row_count: u64 = 0;
                         // Build and execute the IN query with streaming
                         {
                             let placeholders: Vec<&str> =
@@ -734,24 +835,54 @@ impl<'a> DependencyTraverser<'a> {
                                 &query,
                                 mysql::Params::Positional(params),
                             )?;
-                            self.metrics.add_query_time(query_start.elapsed());
+                            let batch_query_elapsed = query_start.elapsed();
+                            self.metrics.add_query_time(batch_query_elapsed);
+                            batch_query_ms = batch_query_elapsed.as_millis() as u64;
 
                             for row_result in result {
                                 // Time row iteration
                                 let iterate_start = Instant::now();
                                 let row: Row = row_result?;
-                                self.metrics.add_iterate_time(iterate_start.elapsed());
+                                let iter_elapsed = iterate_start.elapsed();
+                                self.metrics.add_iterate_time(iter_elapsed);
+                                batch_iterate_ns += iter_elapsed.as_nanos() as u64;
+                                batch_row_count += 1;
 
-                                // Dedup check
+                                // Dedup check + FK extraction
+                                let dedup_start = Instant::now();
                                 let pk = extract_pk_from_row(&row, &pk_columns);
                                 let pk_bytes = serialize_pk(&pk);
-                                if !visited
-                                    .entry(table.clone())
-                                    .or_default()
-                                    .insert(pk_bytes)
-                                {
+                                if !visited_set.insert(pk_bytes) {
+                                    self.metrics.add_dedup_time(dedup_start.elapsed());
                                     continue; // Already visited
                                 }
+
+                                // Extract FK values for forward relations
+                                for (i, relation) in forward_relations.iter().enumerate() {
+                                    if let Some(Ok(v)) = row
+                                        .get_opt::<MySqlValue, _>(
+                                            relation.from_column.as_str(),
+                                        )
+                                    {
+                                        if !matches!(v, MySqlValue::NULL) {
+                                            fwd_fk_vecs[i].push(v);
+                                        }
+                                    }
+                                }
+
+                                // Extract FK values for backward relations
+                                for (i, relation) in backward_relations.iter().enumerate() {
+                                    if let Some(Ok(v)) = row
+                                        .get_opt::<MySqlValue, _>(
+                                            relation.to_column.as_str(),
+                                        )
+                                    {
+                                        if !matches!(v, MySqlValue::NULL) {
+                                            bwd_fk_vecs[i].push(v);
+                                        }
+                                    }
+                                }
+                                self.metrics.add_dedup_time(dedup_start.elapsed());
 
                                 // Send schema on first new row for this table
                                 if schemas_sent.insert(table.clone()) {
@@ -766,55 +897,13 @@ impl<'a> DependencyTraverser<'a> {
                                     self.metrics.add_write_time(write_start.elapsed());
                                 }
 
-                                // Extract FK values for forward relations
-                                for relation in &forward_relations {
-                                    if let Some(Ok(v)) = row
-                                        .get_opt::<MySqlValue, _>(
-                                            relation.from_column.as_str(),
-                                        )
-                                    {
-                                        if !matches!(v, MySqlValue::NULL) {
-                                            fk_accumulator
-                                                .entry((
-                                                    relation.to_table.clone(),
-                                                    relation.to_column.clone(),
-                                                    false,
-                                                ))
-                                                .or_default()
-                                                .push(v);
-                                        }
-                                    }
-                                }
-
-                                // Extract FK values for backward relations
-                                for relation in &backward_relations {
-                                    if let Some(Ok(v)) = row
-                                        .get_opt::<MySqlValue, _>(
-                                            relation.to_column.as_str(),
-                                        )
-                                    {
-                                        if !matches!(v, MySqlValue::NULL) {
-                                            fk_accumulator
-                                                .entry((
-                                                    relation.from_table.clone(),
-                                                    relation.from_column.clone(),
-                                                    true,
-                                                ))
-                                                .or_default()
-                                                .push(v);
-                                        }
-                                    }
-                                }
-
                                 // Write TSV - time serialization
                                 let serialize_start = Instant::now();
                                 tsv_writer.write_row(&row)?;
                                 self.metrics.add_serialize_time(serialize_start.elapsed());
 
                                 chunk_row_count += 1;
-                                *table_row_counts
-                                    .entry(table.clone())
-                                    .or_default() += 1;
+                                *row_count_entry += 1;
 
                                 if chunk_row_count >= CHUNK_ROW_LIMIT as u32
                                     || tsv_writer.buffer_size() >= CHUNK_BYTE_LIMIT
@@ -833,6 +922,16 @@ impl<'a> DependencyTraverser<'a> {
                             }
                         }
                         // QueryResult dropped, conn is free
+
+                        // Record per-query timing for this batch
+                        self.metrics.record_query(jibs_protocol::QueryTiming {
+                            table: table.clone(),
+                            column: column.clone(),
+                            num_values: batch_len,
+                            query_ms: batch_query_ms,
+                            iterate_ms: batch_iterate_ns / 1_000_000,
+                            rows: batch_row_count,
+                        });
                     }
 
                     // Flush remaining data for this table+column group
@@ -847,16 +946,35 @@ impl<'a> DependencyTraverser<'a> {
                             &self.metrics,
                         )?;
                     }
-                }
 
-                // Coalesce accumulated FK values into the next level's pending set
-                for ((to_table, to_column, via_backward), values) in fk_accumulator.drain() {
-                    let unique = dedupe_values(values);
-                    if !unique.is_empty() {
-                        pending
-                            .entry((to_table, to_column, via_backward))
-                            .or_default()
-                            .extend(unique);
+                    // Coalesce FK values into next level's pending set
+                    for (i, relation) in forward_relations.iter().enumerate() {
+                        let values = std::mem::take(&mut fwd_fk_vecs[i]);
+                        if !values.is_empty() {
+                            let dedup_start = Instant::now();
+                            let unique = dedupe_values(values);
+                            self.metrics.add_dedup_time(dedup_start.elapsed());
+                            if !unique.is_empty() {
+                                pending
+                                    .entry((relation.to_table.clone(), relation.to_column.clone(), false))
+                                    .or_default()
+                                    .extend(unique);
+                            }
+                        }
+                    }
+                    for (i, relation) in backward_relations.iter().enumerate() {
+                        let values = std::mem::take(&mut bwd_fk_vecs[i]);
+                        if !values.is_empty() {
+                            let dedup_start = Instant::now();
+                            let unique = dedupe_values(values);
+                            self.metrics.add_dedup_time(dedup_start.elapsed());
+                            if !unique.is_empty() {
+                                pending
+                                    .entry((relation.from_table.clone(), relation.from_column.clone(), true))
+                                    .or_default()
+                                    .extend(unique);
+                            }
+                        }
                     }
                 }
             }

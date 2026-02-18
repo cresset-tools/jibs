@@ -101,7 +101,7 @@ fn run() -> Result<()> {
     let stdout = io::stdout();
 
     let mut reader = BufReader::new(stdin.lock());
-    let mut writer = BufWriter::new(stdout.lock());
+    let mut writer = BufWriter::with_capacity(256 * 1024, stdout.lock());
 
     // Read first message - could be Credentials or Init (backward compatibility)
     let first_msg: ClientMessage = read_message(&mut reader)?;
@@ -168,9 +168,26 @@ fn run() -> Result<()> {
             added += 1;
         }
     }
+    // Filter out ignored relations
+    let ignored_count = if !plan.ignored_relations.is_empty() {
+        let before = plan.relations.len();
+        let ignored = &plan.ignored_relations;
+        plan.relations.retain(|r| {
+            !ignored.iter().any(|ir| {
+                ir.from_table == r.from_table
+                    && ir.from_column == r.from_column
+                    && ir.to_table == r.to_table
+                    && ir.to_column == r.to_column
+            })
+        });
+        before - plan.relations.len()
+    } else {
+        0
+    };
+
     eprintln!(
-        "Relations: {} explicit, {} discovered from FK constraints",
-        explicit_count, added
+        "Relations: {} explicit, {} discovered from FK constraints, {} ignored",
+        explicit_count, added, ignored_count
     );
 
     // Negotiate compression
@@ -238,11 +255,7 @@ fn run() -> Result<()> {
 
 fn negotiate_compression(client_pref: CompressionMode) -> CompressionMode {
     match client_pref {
-        CompressionMode::Auto => {
-            // For now, default to no compression
-            // TODO: benchmark and decide
-            CompressionMode::None
-        }
+        CompressionMode::Auto => CompressionMode::Zstd,
         other => other,
     }
 }

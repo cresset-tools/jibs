@@ -4,12 +4,12 @@
 //! during the import process.
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use jibs_protocol::ServerMetrics;
+use jibs_protocol::{QueryTiming, ServerMetrics};
 
 /// Thread-safe metrics accumulator for server-side timing
-#[derive(Default)]
 pub struct MetricsCollector {
     /// Time spent executing MySQL queries
     query_time_ns: AtomicU64,
@@ -25,6 +25,32 @@ pub struct MetricsCollector {
     bytes_sent: AtomicU64,
     /// Whether metrics collection is enabled
     enabled: bool,
+    /// Time spent on dedup and FK extraction during aggregate BFS
+    dedup_time_ns: AtomicU64,
+    /// Wall-clock time for aggregate BFS (Phase 1)
+    aggregate_wall_ns: AtomicU64,
+    /// Wall-clock time for full table streaming (Phase 2)
+    full_tables_wall_ns: AtomicU64,
+    /// Per-query timing records for aggregate BFS queries
+    query_timings: Mutex<Vec<QueryTiming>>,
+}
+
+impl Default for MetricsCollector {
+    fn default() -> Self {
+        Self {
+            query_time_ns: AtomicU64::new(0),
+            iterate_time_ns: AtomicU64::new(0),
+            serialize_time_ns: AtomicU64::new(0),
+            write_time_ns: AtomicU64::new(0),
+            rows_sent: AtomicU64::new(0),
+            bytes_sent: AtomicU64::new(0),
+            enabled: false,
+            dedup_time_ns: AtomicU64::new(0),
+            aggregate_wall_ns: AtomicU64::new(0),
+            full_tables_wall_ns: AtomicU64::new(0),
+            query_timings: Mutex::new(Vec::new()),
+        }
+    }
 }
 
 impl MetricsCollector {
@@ -102,6 +128,38 @@ impl MetricsCollector {
         }
     }
 
+    /// Add dedup/FK extraction time
+    #[inline]
+    pub fn add_dedup_time(&self, duration: Duration) {
+        if self.enabled {
+            self.dedup_time_ns
+                .fetch_add(duration.as_nanos() as u64, Ordering::Relaxed);
+        }
+    }
+
+    /// Set wall-clock time for aggregate BFS traversal (Phase 1)
+    pub fn set_aggregate_wall_time(&self, duration: Duration) {
+        if self.enabled {
+            self.aggregate_wall_ns
+                .store(duration.as_nanos() as u64, Ordering::Relaxed);
+        }
+    }
+
+    /// Set wall-clock time for full table streaming (Phase 2)
+    pub fn set_full_tables_wall_time(&self, duration: Duration) {
+        if self.enabled {
+            self.full_tables_wall_ns
+                .store(duration.as_nanos() as u64, Ordering::Relaxed);
+        }
+    }
+
+    /// Record timing for a single aggregate BFS query
+    pub fn record_query(&self, timing: QueryTiming) {
+        if self.enabled {
+            self.query_timings.lock().unwrap().push(timing);
+        }
+    }
+
     /// Convert to protocol ServerMetrics
     pub fn to_server_metrics(&self) -> Option<ServerMetrics> {
         if !self.enabled {
@@ -115,6 +173,10 @@ impl MetricsCollector {
             write_time_ms: self.write_time_ns.load(Ordering::Relaxed) / 1_000_000,
             rows_sent: self.rows_sent.load(Ordering::Relaxed),
             bytes_sent: self.bytes_sent.load(Ordering::Relaxed),
+            dedup_time_ms: self.dedup_time_ns.load(Ordering::Relaxed) / 1_000_000,
+            aggregate_wall_ms: self.aggregate_wall_ns.load(Ordering::Relaxed) / 1_000_000,
+            full_tables_wall_ms: self.full_tables_wall_ns.load(Ordering::Relaxed) / 1_000_000,
+            query_timings: std::mem::take(&mut *self.query_timings.lock().unwrap()),
         })
     }
 }

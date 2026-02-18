@@ -300,87 +300,129 @@ fn escape_identifier(s: &str) -> String {
     s.replace('`', "``")
 }
 
-/// Convert a MySQL Value to a TSV-safe string
-pub fn mysql_value_to_tsv(value: &MySqlValue) -> String {
+/// Write a MySQL Value directly to a buffer in TSV format (zero-allocation hot path)
+pub fn write_tsv_value(buf: &mut Vec<u8>, value: &MySqlValue) {
     match value {
-        MySqlValue::NULL => "\\N".to_string(),
+        MySqlValue::NULL => buf.extend_from_slice(b"\\N"),
         MySqlValue::Bytes(b) => {
-            // Check if it's valid UTF-8
-            if let Ok(s) = std::str::from_utf8(b) {
-                escape_tsv_string(s)
+            // Check if it's valid UTF-8 (only matters for hex fallback)
+            if std::str::from_utf8(b).is_ok() {
+                escape_tsv_bytes(buf, b);
             } else {
                 // Binary data: hex encode
-                format!("0x{}", hex::encode(b))
+                buf.extend_from_slice(b"0x");
+                buf.extend_from_slice(hex::encode(b).as_bytes());
             }
         }
-        MySqlValue::Int(i) => i.to_string(),
-        MySqlValue::UInt(u) => u.to_string(),
-        MySqlValue::Float(f) => f.to_string(),
-        MySqlValue::Double(d) => d.to_string(),
+        MySqlValue::Int(i) => {
+            let mut itoa_buf = itoa::Buffer::new();
+            buf.extend_from_slice(itoa_buf.format(*i).as_bytes());
+        }
+        MySqlValue::UInt(u) => {
+            let mut itoa_buf = itoa::Buffer::new();
+            buf.extend_from_slice(itoa_buf.format(*u).as_bytes());
+        }
+        MySqlValue::Float(f) => {
+            let mut ryu_buf = ryu::Buffer::new();
+            buf.extend_from_slice(ryu_buf.format(*f).as_bytes());
+        }
+        MySqlValue::Double(d) => {
+            let mut ryu_buf = ryu::Buffer::new();
+            buf.extend_from_slice(ryu_buf.format(*d).as_bytes());
+        }
         MySqlValue::Date(y, m, d, h, mi, s, us) => {
+            use std::io::Write;
             if *h == 0 && *mi == 0 && *s == 0 && *us == 0 {
-                format!("{:04}-{:02}-{:02}", y, m, d)
+                let _ = write!(buf, "{:04}-{:02}-{:02}", y, m, d);
             } else if *us == 0 {
-                format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", y, m, d, h, mi, s)
+                let _ = write!(buf, "{:04}-{:02}-{:02} {:02}:{:02}:{:02}", y, m, d, h, mi, s);
             } else {
-                format!(
+                let _ = write!(
+                    buf,
                     "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:06}",
                     y, m, d, h, mi, s, us
-                )
+                );
             }
         }
         MySqlValue::Time(neg, d, h, m, s, us) => {
-            let sign = if *neg { "-" } else { "" };
+            use std::io::Write;
             let total_hours = (*d as u32) * 24 + (*h as u32);
+            if *neg {
+                buf.push(b'-');
+            }
             if *us == 0 {
-                format!("{}{:02}:{:02}:{:02}", sign, total_hours, m, s)
+                let _ = write!(buf, "{:02}:{:02}:{:02}", total_hours, m, s);
             } else {
-                format!("{}{:02}:{:02}:{:02}.{:06}", sign, total_hours, m, s, us)
+                let _ = write!(buf, "{:02}:{:02}:{:02}.{:06}", total_hours, m, s, us);
             }
         }
     }
 }
 
-/// Escape a string for TSV format
-pub fn escape_tsv_string(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '\\' => result.push_str("\\\\"),
-            '\t' => result.push_str("\\t"),
-            '\n' => result.push_str("\\n"),
-            '\r' => result.push_str("\\r"),
-            '\0' => result.push_str("\\0"),
-            _ => result.push(c),
+/// Escape bytes for TSV format, writing directly to output buffer (zero-allocation)
+///
+/// Only ASCII special characters need escaping: \t, \n, \r, \\, \0
+/// We scan for clean segments and copy them in bulk.
+pub fn escape_tsv_bytes(buf: &mut Vec<u8>, bytes: &[u8]) {
+    let mut start = 0;
+    for (i, &b) in bytes.iter().enumerate() {
+        let replacement = match b {
+            b'\\' => &b"\\\\"[..],
+            b'\t' => &b"\\t"[..],
+            b'\n' => &b"\\n"[..],
+            b'\r' => &b"\\r"[..],
+            b'\0' => &b"\\0"[..],
+            _ => continue,
+        };
+        // Flush the clean segment before this special byte
+        if start < i {
+            buf.extend_from_slice(&bytes[start..i]);
         }
+        buf.extend_from_slice(replacement);
+        start = i + 1;
     }
-    result
+    // Flush remaining clean segment
+    if start < bytes.len() {
+        buf.extend_from_slice(&bytes[start..]);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_escape_tsv_string() {
-        assert_eq!(escape_tsv_string("hello"), "hello");
-        assert_eq!(escape_tsv_string("hello\tworld"), "hello\\tworld");
-        assert_eq!(escape_tsv_string("line1\nline2"), "line1\\nline2");
-        assert_eq!(escape_tsv_string("back\\slash"), "back\\\\slash");
-        assert_eq!(escape_tsv_string("a\tb\nc\\d"), "a\\tb\\nc\\\\d");
+    fn escape_to_string(input: &[u8]) -> String {
+        let mut buf = Vec::new();
+        escape_tsv_bytes(&mut buf, input);
+        String::from_utf8(buf).unwrap()
+    }
+
+    fn value_to_string(value: &MySqlValue) -> String {
+        let mut buf = Vec::new();
+        write_tsv_value(&mut buf, value);
+        String::from_utf8(buf).unwrap()
     }
 
     #[test]
-    fn test_mysql_value_to_tsv() {
-        assert_eq!(mysql_value_to_tsv(&MySqlValue::NULL), "\\N");
-        assert_eq!(mysql_value_to_tsv(&MySqlValue::Int(42)), "42");
-        assert_eq!(mysql_value_to_tsv(&MySqlValue::UInt(100)), "100");
+    fn test_escape_tsv_bytes() {
+        assert_eq!(escape_to_string(b"hello"), "hello");
+        assert_eq!(escape_to_string(b"hello\tworld"), "hello\\tworld");
+        assert_eq!(escape_to_string(b"line1\nline2"), "line1\\nline2");
+        assert_eq!(escape_to_string(b"back\\slash"), "back\\\\slash");
+        assert_eq!(escape_to_string(b"a\tb\nc\\d"), "a\\tb\\nc\\\\d");
+    }
+
+    #[test]
+    fn test_write_tsv_value() {
+        assert_eq!(value_to_string(&MySqlValue::NULL), "\\N");
+        assert_eq!(value_to_string(&MySqlValue::Int(42)), "42");
+        assert_eq!(value_to_string(&MySqlValue::UInt(100)), "100");
         assert_eq!(
-            mysql_value_to_tsv(&MySqlValue::Bytes(b"hello".to_vec())),
+            value_to_string(&MySqlValue::Bytes(b"hello".to_vec())),
             "hello"
         );
         assert_eq!(
-            mysql_value_to_tsv(&MySqlValue::Bytes(b"hello\tworld".to_vec())),
+            value_to_string(&MySqlValue::Bytes(b"hello\tworld".to_vec())),
             "hello\\tworld"
         );
     }
