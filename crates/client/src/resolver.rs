@@ -168,6 +168,10 @@ impl Resolver {
             }
         }
 
+        // Finalize any newly collected variables so they're available
+        // when processing statements (e.g. aggregate limits using $var)
+        self.finalize_variables()?;
+
         // Third: process other statements from import
         for (stmt, _span) in &program.statements {
             self.process_statement(stmt)?;
