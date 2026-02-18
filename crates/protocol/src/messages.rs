@@ -59,6 +59,22 @@ pub struct ServerMetrics {
     pub query_timings: Vec<QueryTiming>,
 }
 
+/// What the server decided to do with each table
+#[derive(Debug, Clone, Encode, Decode)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum TableDisposition {
+    /// Imported via aggregate BFS (partial import based on relations)
+    Aggregate,
+    /// Imported as a full table copy
+    Full,
+    /// Table exists but has zero rows
+    Empty,
+    /// Excluded by config (structure created but no data)
+    Excluded,
+    /// Skipped because it was already completed (resume)
+    Resumed,
+}
+
 /// Messages sent from client to server
 #[derive(Debug, Clone, Encode, Decode)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -113,8 +129,8 @@ pub enum ServerMessage {
     TableDone { table: String, row_count: u64 },
     /// All data transferred
     Done {
-        /// Tables that were imported via aggregate BFS (partial imports)
-        aggregate_tables: Vec<String>,
+        /// What the server decided for each table
+        table_dispositions: Vec<(String, TableDisposition)>,
         /// Performance metrics (only populated if --metrics flag was used)
         metrics: Option<ServerMetrics>,
     },

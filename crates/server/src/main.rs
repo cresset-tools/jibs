@@ -207,8 +207,8 @@ fn run() -> Result<()> {
         ClientMessage::Start { resume_from } => {
             let mut traverser = DependencyTraverser::new(&mut conn, &plan, collect_metrics)?;
 
-            let aggregate_tables = match traverser.stream_all_tables(resume_from, compression, &mut writer, parallel, &mysql_url) {
-                Ok(tables) => tables,
+            let table_dispositions = match traverser.stream_all_tables(resume_from, compression, &mut writer, parallel, &mysql_url) {
+                Ok(dispositions) => dispositions,
                 Err(e) => {
                     let error_msg = ServerMessage::Error {
                         message: e.to_string(),
@@ -223,9 +223,7 @@ fn run() -> Result<()> {
             let metrics = traverser.get_metrics();
 
             // Send completion message
-            let mut agg_list: Vec<String> = aggregate_tables.into_iter().collect();
-            agg_list.sort();
-            write_message(&mut writer, &ServerMessage::Done { aggregate_tables: agg_list, metrics })?;
+            write_message(&mut writer, &ServerMessage::Done { table_dispositions, metrics })?;
         }
         ClientMessage::Shutdown => {
             return Ok(());
