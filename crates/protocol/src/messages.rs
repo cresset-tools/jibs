@@ -49,6 +49,12 @@ pub struct ServerMetrics {
     pub aggregate_serialize_ms: u64,
     /// Write time during aggregate phase only (ms)
     pub aggregate_write_ms: u64,
+    /// Time spent on zstd compression (ms)
+    pub compress_time_ms: u64,
+    /// Compression time during aggregate phase only (ms)
+    pub aggregate_compress_ms: u64,
+    /// Time spent pre-caching table schemas (ms)
+    pub schema_cache_time_ms: u64,
     /// Per-query timing for aggregate BFS queries
     pub query_timings: Vec<QueryTiming>,
 }

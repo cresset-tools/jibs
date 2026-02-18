@@ -83,7 +83,8 @@ impl ClientMetrics {
 
         // Server metrics
         if let Some(sm) = server_metrics {
-            let server_total_ms = sm.query_time_ms + sm.iterate_time_ms + sm.serialize_time_ms + sm.write_time_ms;
+            let server_total_ms = sm.query_time_ms + sm.iterate_time_ms + sm.serialize_time_ms
+                + sm.compress_time_ms + sm.write_time_ms;
             println!("Server (remote):");
             println!(
                 "  Query execution:     {:>8} ({:>3}%)",
@@ -99,6 +100,11 @@ impl ClientMetrics {
                 "  TSV serialization:   {:>8} ({:>3}%)",
                 format_duration_ms(sm.serialize_time_ms),
                 percent(sm.serialize_time_ms, server_total_ms)
+            );
+            println!(
+                "  Compression:         {:>8} ({:>3}%)",
+                format_duration_ms(sm.compress_time_ms),
+                percent(sm.compress_time_ms, server_total_ms)
             );
             let write_pct = percent(sm.write_time_ms, server_total_ms);
             let backpressure_note = if write_pct > 30 { " <- backpressure" } else { "" };
@@ -148,6 +154,10 @@ impl ClientMetrics {
                     "  TSV serialization:     {:>6}",
                     format_duration_ms(sm.aggregate_serialize_ms),
                 );
+                println!(
+                    "  Compression:           {:>6}",
+                    format_duration_ms(sm.aggregate_compress_ms),
+                );
                 let agg_write_pct = if sm.aggregate_wall_ms > 0 {
                     percent(sm.aggregate_write_ms, sm.aggregate_wall_ms)
                 } else {
@@ -160,7 +170,14 @@ impl ClientMetrics {
                     agg_write_pct,
                     agg_write_note,
                 );
-                let accounted = mysql_total + sm.dedup_time_ms + sm.aggregate_serialize_ms + sm.aggregate_write_ms;
+                if sm.schema_cache_time_ms > 0 {
+                    println!(
+                        "  Schema pre-cache:      {:>6}",
+                        format_duration_ms(sm.schema_cache_time_ms),
+                    );
+                }
+                let accounted = mysql_total + sm.dedup_time_ms + sm.aggregate_serialize_ms
+                    + sm.aggregate_write_ms + sm.aggregate_compress_ms + sm.schema_cache_time_ms;
                 if sm.aggregate_wall_ms > accounted {
                     println!(
                         "  Overhead:              {:>6}",

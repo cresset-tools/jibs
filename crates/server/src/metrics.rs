@@ -35,6 +35,12 @@ pub struct MetricsCollector {
     aggregate_serialize_ns: AtomicU64,
     /// Write time during aggregate phase only
     aggregate_write_ns: AtomicU64,
+    /// Time spent on zstd compression
+    compress_time_ns: AtomicU64,
+    /// Compression time during aggregate phase only
+    aggregate_compress_ns: AtomicU64,
+    /// Time spent pre-caching table schemas
+    schema_cache_time_ns: AtomicU64,
     /// Per-query timing records for aggregate BFS queries
     query_timings: Mutex<Vec<QueryTiming>>,
 }
@@ -54,6 +60,9 @@ impl Default for MetricsCollector {
             full_tables_wall_ns: AtomicU64::new(0),
             aggregate_serialize_ns: AtomicU64::new(0),
             aggregate_write_ns: AtomicU64::new(0),
+            compress_time_ns: AtomicU64::new(0),
+            aggregate_compress_ns: AtomicU64::new(0),
+            schema_cache_time_ns: AtomicU64::new(0),
             query_timings: Mutex::new(Vec::new()),
         }
     }
@@ -143,6 +152,23 @@ impl MetricsCollector {
         }
     }
 
+    /// Add compression time
+    #[inline]
+    pub fn add_compress_time(&self, duration: Duration) {
+        if self.enabled {
+            self.compress_time_ns
+                .fetch_add(duration.as_nanos() as u64, Ordering::Relaxed);
+        }
+    }
+
+    /// Set schema cache time
+    pub fn set_schema_cache_time(&self, duration: Duration) {
+        if self.enabled {
+            self.schema_cache_time_ns
+                .store(duration.as_nanos() as u64, Ordering::Relaxed);
+        }
+    }
+
     /// Set wall-clock time for aggregate BFS traversal (Phase 1)
     pub fn set_aggregate_wall_time(&self, duration: Duration) {
         if self.enabled {
@@ -169,6 +195,10 @@ impl MetricsCollector {
             );
             self.aggregate_write_ns.store(
                 self.write_time_ns.load(Ordering::Relaxed),
+                Ordering::Relaxed,
+            );
+            self.aggregate_compress_ns.store(
+                self.compress_time_ns.load(Ordering::Relaxed),
                 Ordering::Relaxed,
             );
         }
@@ -199,6 +229,9 @@ impl MetricsCollector {
             full_tables_wall_ms: self.full_tables_wall_ns.load(Ordering::Relaxed) / 1_000_000,
             aggregate_serialize_ms: self.aggregate_serialize_ns.load(Ordering::Relaxed) / 1_000_000,
             aggregate_write_ms: self.aggregate_write_ns.load(Ordering::Relaxed) / 1_000_000,
+            compress_time_ms: self.compress_time_ns.load(Ordering::Relaxed) / 1_000_000,
+            aggregate_compress_ms: self.aggregate_compress_ns.load(Ordering::Relaxed) / 1_000_000,
+            schema_cache_time_ms: self.schema_cache_time_ns.load(Ordering::Relaxed) / 1_000_000,
             query_timings: std::mem::take(&mut *self.query_timings.lock().unwrap()),
         })
     }
