@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::io::IsTerminal;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 
@@ -30,6 +30,8 @@ struct TableState {
     rows_received: u64,
     /// Estimated total rows (may be adjusted)
     estimated_rows: u64,
+    /// When this table started importing
+    start_time: Instant,
 }
 
 /// Progress tracking for import operations
@@ -54,6 +56,8 @@ pub struct ImportProgress {
     stats: ProgressStats,
     /// Rolling window of (timestamp, cumulative_bytes) for throughput calculation
     throughput_samples: VecDeque<(Instant, u64)>,
+    /// Completed tables: (name, rows, duration)
+    completed_tables: Vec<(String, u64, Duration)>,
 }
 
 impl ImportProgress {
@@ -101,6 +105,7 @@ impl ImportProgress {
                 bytes_total: 0,
             },
             throughput_samples: VecDeque::new(),
+            completed_tables: Vec::new(),
         }
     }
 
@@ -132,6 +137,7 @@ impl ImportProgress {
                 bar,
                 rows_received: 0,
                 estimated_rows,
+                start_time: Instant::now(),
             },
         );
 
@@ -177,6 +183,11 @@ impl ImportProgress {
 
         // Clean up the table state
         if let Some(state) = self.table_states.remove(name) {
+            self.completed_tables.push((
+                name.to_string(),
+                final_rows,
+                state.start_time.elapsed(),
+            ));
             if let Some(bar) = state.bar {
                 bar.set_position(final_rows);
                 bar.set_message(format!("{} rows", format_number(final_rows)));
@@ -331,6 +342,11 @@ impl ImportProgress {
                     .set_message(format!("{:.1} MB/s", mb_per_sec));
             }
         }
+    }
+
+    /// Get completed table durations: (name, rows, duration)
+    pub fn table_durations(&self) -> &[(String, u64, Duration)] {
+        &self.completed_tables
     }
 
     /// Suspend progress bars for logging
