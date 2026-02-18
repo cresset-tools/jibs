@@ -58,10 +58,14 @@ fn flush_chunk<W: Write>(
     metrics.add_bytes_sent(bytes);
     metrics.add_rows_sent(chunk_row_count as u64);
 
+    let compress_start = Instant::now();
+    let compressed = maybe_compress(tsv_data, compression);
+    metrics.add_compress_time(compress_start.elapsed());
+
     let msg = ServerMessage::Data {
         table: table.to_string(),
         row_count: chunk_row_count,
-        tsv_data: maybe_compress(tsv_data, compression),
+        tsv_data: compressed,
         checkpoint: checkpoint.clone(),
     };
 
@@ -478,11 +482,13 @@ impl<'a> DependencyTraverser<'a> {
 
         // Pre-cache schemas and PK columns for all tables that might be touched
         // (needed before we start streaming since we can't query metadata during iteration)
+        let schema_start = Instant::now();
         let all_table_names_vec = self.conn.get_all_table_names()?;
         let all_table_names: HashSet<String> = all_table_names_vec.iter().cloned().collect();
         for table_name in &all_table_names_vec {
             self.conn.get_column_defs(table_name)?;
         }
+        self.metrics.set_schema_cache_time(schema_start.elapsed());
 
         let aggregates = self.plan.aggregates.clone();
         for aggregate in &aggregates {
@@ -1206,10 +1212,13 @@ fn stream_full_table_to_channel(
             }
 
             let checkpoint = shared_checkpoint.lock().unwrap().clone();
+            let compress_start = Instant::now();
+            let compressed = maybe_compress(tsv_data, compression);
+            metrics.add_compress_time(compress_start.elapsed());
             let msg = ServerMessage::Data {
                 table: table.to_string(),
                 row_count: chunk_row_count,
-                tsv_data: maybe_compress(tsv_data, compression),
+                tsv_data: compressed,
                 checkpoint,
             };
             tx.send(msg).map_err(|_| {
@@ -1235,10 +1244,13 @@ fn stream_full_table_to_channel(
         }
 
         let checkpoint = shared_checkpoint.lock().unwrap().clone();
+        let compress_start = Instant::now();
+        let compressed = maybe_compress(tsv_data, compression);
+        metrics.add_compress_time(compress_start.elapsed());
         let msg = ServerMessage::Data {
             table: table.to_string(),
             row_count: chunk_row_count,
-            tsv_data: maybe_compress(tsv_data, compression),
+            tsv_data: compressed,
             checkpoint,
         };
         tx.send(msg).map_err(|_| {
