@@ -1017,7 +1017,7 @@ async fn run_protocol_inner(
                 }
             }
 
-            ServerMessage::Done { aggregate_tables: server_aggregate_tables, metrics: server_metrics } => {
+            ServerMessage::Done { table_dispositions, metrics: server_metrics } => {
                 // Wait for all remaining pending loads to complete before finishing
                 if !pending_loads.is_empty() {
                     debug!(
@@ -1045,26 +1045,21 @@ async fn run_protocol_inner(
 
                 progress.finish();
 
-                // Log summary of aggregate vs full table imports
-                if !server_aggregate_tables.is_empty() {
-                    info!(
-                        "Imported via aggregates ({}):\n  {}",
-                        server_aggregate_tables.len(),
-                        server_aggregate_tables.join(", ")
-                    );
-                    let agg_set: std::collections::HashSet<&str> = server_aggregate_tables.iter().map(|s| s.as_str()).collect();
-                    let mut full_tables: Vec<&str> = stats.tables_imported_names.iter()
-                        .filter(|t| !agg_set.contains(t.as_str()))
-                        .map(|t| t.as_str())
-                        .collect();
-                    full_tables.sort();
-                    if !full_tables.is_empty() {
-                        info!(
-                            "Imported full tables ({}):\n  {}",
-                            full_tables.len(),
-                            full_tables.join(", ")
-                        );
-                    }
+                // Log table report: show all server tables with their import disposition
+                {
+                    use jibs_protocol::TableDisposition;
+                    let lines: Vec<String> = table_dispositions.iter().map(|(name, disp)| {
+                        let label = match disp {
+                            TableDisposition::Aggregate => "aggregate",
+                            TableDisposition::Full => "full",
+                            TableDisposition::Empty => "full, 0 rows on remote",
+                            TableDisposition::Excluded => "excluded",
+                            TableDisposition::Resumed => "resumed",
+                        };
+                        format!("  {} ({})", name, label)
+                    }).collect();
+
+                    info!("Tables ({}):\n{}", table_dispositions.len(), lines.join("\n"));
                 }
 
                 break;

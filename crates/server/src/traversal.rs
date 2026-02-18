@@ -9,7 +9,7 @@ use mysql::{Row, Value as MySqlValue};
 
 use jibs_protocol::{
     framing::write_message, AnonymizeRule, Checkpoint, ColumnDef, CompressionMode, ExecutionPlan,
-    Relation, ResolvedAggregate, ServerMessage, ServerMetrics, SortDirection,
+    Relation, ResolvedAggregate, ServerMessage, ServerMetrics, SortDirection, TableDisposition,
 };
 
 use crate::error::{Result, ServerError};
@@ -163,8 +163,9 @@ impl<'a> DependencyTraverser<'a> {
         writer: &mut W,
         parallel: u32,
         mysql_url: &str,
-    ) -> Result<HashSet<String>> {
+    ) -> Result<Vec<(String, TableDisposition)>> {
         let mut checkpoint = resume_from.unwrap_or_default();
+        let mut dispositions: Vec<(String, TableDisposition)> = Vec::new();
 
         // Phase 1: Stream aggregate tables via BFS traversal.
         // This streams rows directly during traversal, only keeping PKs and FK values in memory.
@@ -182,15 +183,19 @@ impl<'a> DependencyTraverser<'a> {
         let mut tables_to_stream: Vec<TableTask> = Vec::new();
         for table in all_tables {
             if self.plan.ignored_tables.contains(&table) {
+                // Ignored tables are not even in the Ready message, skip silently
                 continue;
             }
             if self.plan.excluded_tables.contains(&table) {
+                dispositions.push((table, TableDisposition::Excluded));
                 continue;
             }
             if aggregate_tables.contains(&table) {
+                dispositions.push((table, TableDisposition::Aggregate));
                 continue;
             }
             if checkpoint.should_skip_table(&table) {
+                dispositions.push((table, TableDisposition::Resumed));
                 continue;
             }
 
@@ -221,19 +226,23 @@ impl<'a> DependencyTraverser<'a> {
                     writer,
                 )?;
 
+                write_message(
+                    writer,
+                    &ServerMessage::TableDone {
+                        table: task.table.clone(),
+                        row_count: total_rows,
+                    },
+                )?;
                 if total_rows > 0 {
-                    write_message(
-                        writer,
-                        &ServerMessage::TableDone {
-                            table: task.table.clone(),
-                            row_count: total_rows,
-                        },
-                    )?;
+                    dispositions.push((task.table, TableDisposition::Full));
+                } else {
+                    dispositions.push((task.table, TableDisposition::Empty));
                 }
             }
         } else {
-            // Parallel path
-            self.stream_full_tables_parallel(
+            // Parallel path - collect table names before moving into parallel fn
+            let table_names: Vec<String> = tables_to_stream.iter().map(|t| t.table.clone()).collect();
+            let streamed = self.stream_full_tables_parallel(
                 tables_to_stream,
                 compression,
                 &mut checkpoint,
@@ -241,10 +250,19 @@ impl<'a> DependencyTraverser<'a> {
                 parallel as usize,
                 mysql_url,
             )?;
+            // streamed is the set of tables that actually had rows
+            for name in table_names {
+                if streamed.contains(&name) {
+                    dispositions.push((name, TableDisposition::Full));
+                } else {
+                    dispositions.push((name, TableDisposition::Empty));
+                }
+            }
         }
         self.metrics.set_full_tables_wall_time(phase2_start.elapsed());
 
-        Ok(aggregate_tables)
+        dispositions.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(dispositions)
     }
 
     /// Stream all rows from a non-aggregate table directly from a MySQL query.
@@ -263,7 +281,17 @@ impl<'a> DependencyTraverser<'a> {
             TsvWriter::new(column_names, anonymization, self.plan.fakers.clone());
         let mut total_rows: u64 = 0;
         let mut chunk_row_count: u32 = 0;
-        let mut schema_sent = false;
+
+        // Always send schema so the table is created locally even if empty
+        let write_start = Instant::now();
+        write_message(
+            writer,
+            &ServerMessage::Schema {
+                table: table.to_string(),
+                columns: columns.to_vec(),
+            },
+        )?;
+        self.metrics.add_write_time(write_start.elapsed());
 
         let query = format!("SELECT * FROM `{}`", table);
 
@@ -277,20 +305,6 @@ impl<'a> DependencyTraverser<'a> {
             let iterate_start = Instant::now();
             let row: Row = row_result?;
             self.metrics.add_iterate_time(iterate_start.elapsed());
-
-            // Send schema before first row
-            if !schema_sent {
-                let write_start = Instant::now();
-                write_message(
-                    writer,
-                    &ServerMessage::Schema {
-                        table: table.to_string(),
-                        columns: columns.to_vec(),
-                    },
-                )?;
-                self.metrics.add_write_time(write_start.elapsed());
-                schema_sent = true;
-            }
 
             // Time serialization
             let serialize_start = Instant::now();
@@ -345,7 +359,7 @@ impl<'a> DependencyTraverser<'a> {
         writer: &mut W,
         num_workers: usize,
         mysql_url: &str,
-    ) -> Result<()> {
+    ) -> Result<HashSet<String>> {
         let num_workers = num_workers.min(tables.len());
 
         // Distribute tables round-robin across workers
@@ -410,7 +424,13 @@ impl<'a> DependencyTraverser<'a> {
         drop(tx);
 
         // Writer loop: drain channel and write to stdout
+        let mut streamed_tables: HashSet<String> = HashSet::new();
         for msg in rx {
+            if let ServerMessage::TableDone { ref table, row_count } = msg {
+                if row_count > 0 {
+                    streamed_tables.insert(table.clone());
+                }
+            }
             let write_start = Instant::now();
             write_message(writer, &msg)?;
             self.metrics.add_write_time(write_start.elapsed());
@@ -448,7 +468,7 @@ impl<'a> DependencyTraverser<'a> {
             checkpoint.completed_tables.insert(table.clone());
         }
 
-        Ok(())
+        Ok(streamed_tables)
     }
 
     /// Stream all rows reachable from aggregates via BFS relation traversal.
@@ -1158,7 +1178,15 @@ fn stream_full_table_to_channel(
     let mut tsv_writer = TsvWriter::new(column_names, anonymization, fakers.clone());
     let mut total_rows: u64 = 0;
     let mut chunk_row_count: u32 = 0;
-    let mut schema_sent = false;
+
+    // Always send schema so the table is created locally even if empty
+    tx.send(ServerMessage::Schema {
+        table: table.to_string(),
+        columns: columns.to_vec(),
+    })
+    .map_err(|_| {
+        crate::error::ServerError::Protocol("Channel closed".to_string())
+    })?;
 
     let query = format!("SELECT * FROM `{}`", table);
 
@@ -1172,18 +1200,6 @@ fn stream_full_table_to_channel(
         let iterate_start = Instant::now();
         let row: Row = row_result?;
         metrics.add_iterate_time(iterate_start.elapsed());
-
-        // Send schema before first row
-        if !schema_sent {
-            tx.send(ServerMessage::Schema {
-                table: table.to_string(),
-                columns: columns.to_vec(),
-            })
-            .map_err(|_| {
-                crate::error::ServerError::Protocol("Channel closed".to_string())
-            })?;
-            schema_sent = true;
-        }
 
         // Time serialization
         let serialize_start = Instant::now();
@@ -1258,16 +1274,14 @@ fn stream_full_table_to_channel(
         })?;
     }
 
-    // Send TableDone
-    if total_rows > 0 {
-        tx.send(ServerMessage::TableDone {
-            table: table.to_string(),
-            row_count: total_rows,
-        })
-        .map_err(|_| {
-            crate::error::ServerError::Protocol("Channel closed".to_string())
-        })?;
-    }
+    // Send TableDone (always, even for empty tables so the client marks them complete)
+    tx.send(ServerMessage::TableDone {
+        table: table.to_string(),
+        row_count: total_rows,
+    })
+    .map_err(|_| {
+        crate::error::ServerError::Protocol("Channel closed".to_string())
+    })?;
 
     Ok(())
 }
