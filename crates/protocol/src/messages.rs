@@ -45,6 +45,10 @@ pub struct ServerMetrics {
     pub aggregate_wall_ms: u64,
     /// Wall-clock time for full table streaming (Phase 2) in ms
     pub full_tables_wall_ms: u64,
+    /// Serialize time during aggregate phase only (ms)
+    pub aggregate_serialize_ms: u64,
+    /// Write time during aggregate phase only (ms)
+    pub aggregate_write_ms: u64,
     /// Per-query timing for aggregate BFS queries
     pub query_timings: Vec<QueryTiming>,
 }
