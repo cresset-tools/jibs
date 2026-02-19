@@ -347,10 +347,15 @@ impl<'a> DependencyTraverser<'a> {
         let result = self.conn.query_iter(&query)?;
         self.metrics.add_query_time(query_start.elapsed());
 
-        for row_result in result {
-            // Time row iteration (fetch from network/buffer)
+        let mut result_iter = result.into_iter();
+        loop {
+            // Time row fetch + parse (the actual MySQL read from TCP)
             let iterate_start = Instant::now();
-            let row: Row = row_result?;
+            let row: Row = match result_iter.next() {
+                Some(Ok(row)) => row,
+                Some(Err(e)) => return Err(e.into()),
+                None => break,
+            };
             self.metrics.add_iterate_time(iterate_start.elapsed());
 
             // Time serialization
@@ -623,10 +628,15 @@ impl<'a> DependencyTraverser<'a> {
                 self.metrics.add_query_time(root_query_elapsed);
                 root_query_ms = root_query_elapsed.as_millis() as u64;
 
-                for row_result in result {
-                    // Time row iteration
+                let mut result_iter = result.into_iter();
+                loop {
+                    // Time row fetch + parse (the actual MySQL read from TCP)
                     let iterate_start = Instant::now();
-                    let row: Row = row_result?;
+                    let row: Row = match result_iter.next() {
+                        Some(Ok(row)) => row,
+                        Some(Err(e)) => return Err(e.into()),
+                        None => break,
+                    };
                     let iter_elapsed = iterate_start.elapsed();
                     self.metrics.add_iterate_time(iter_elapsed);
                     root_iterate_ns += iter_elapsed.as_nanos() as u64;
@@ -855,10 +865,15 @@ impl<'a> DependencyTraverser<'a> {
                             self.metrics.add_query_time(batch_query_elapsed);
                             batch_query_ms = batch_query_elapsed.as_millis() as u64;
 
-                            for row_result in result {
-                                // Time row iteration
+                            let mut result_iter = result.into_iter();
+                            loop {
+                                // Time row fetch + parse (the actual MySQL read from TCP)
                                 let iterate_start = Instant::now();
-                                let row: Row = row_result?;
+                                let row: Row = match result_iter.next() {
+                                    Some(Ok(row)) => row,
+                                    Some(Err(e)) => return Err(e.into()),
+                                    None => break,
+                                };
                                 let iter_elapsed = iterate_start.elapsed();
                                 self.metrics.add_iterate_time(iter_elapsed);
                                 batch_iterate_ns += iter_elapsed.as_nanos() as u64;
@@ -1179,10 +1194,15 @@ fn stream_full_table_to_channel(
     let result = conn.query_iter(&query)?;
     metrics.add_query_time(query_start.elapsed());
 
-    for row_result in result {
-        // Time row iteration
+    let mut result_iter = result.into_iter();
+    loop {
+        // Time row fetch + parse (the actual MySQL read from TCP)
         let iterate_start = Instant::now();
-        let row: Row = row_result?;
+        let row: Row = match result_iter.next() {
+            Some(Ok(row)) => row,
+            Some(Err(e)) => return Err(e.into()),
+            None => break,
+        };
         metrics.add_iterate_time(iterate_start.elapsed());
 
         // Time serialization
