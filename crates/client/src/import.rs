@@ -399,17 +399,28 @@ impl LoadAccum {
 
 type PendingLoad = (String, std::sync::mpsc::Receiver<Result<LoadResult>>);
 
-/// Drain completed loads without blocking, returns remaining pending loads
+/// Info needed to finalize a table after all its loads complete
+struct DeferredTableDone {
+    row_count: u64,
+}
+
+/// Drain completed loads without blocking, returns remaining pending loads.
+/// Also finalizes any deferred tables whose loads have all completed.
 fn drain_completed_loads(
     pending_loads: Vec<PendingLoad>,
-    rows_imported: &mut u64,
     load_accum: &mut LoadAccum,
+    deferred: &mut HashMap<String, DeferredTableDone>,
+    local_conn: &mut Conn,
+    progress: &mut ImportProgress,
+    stats: &mut ImportStats,
+    table_schemas: &mut HashMap<String, Arc<Vec<ColumnDef>>>,
+    fail_after_tables: Option<usize>,
 ) -> Result<Vec<PendingLoad>> {
     let mut still_pending = Vec::new();
     for (table, rx) in pending_loads {
         match rx.try_recv() {
             Ok(Ok(result)) => {
-                *rows_imported += result.rows;
+                stats.rows_imported += result.rows;
                 load_accum.add(&result);
             }
             Ok(Err(e)) => return Err(anyhow::anyhow!("Loader error for {}: {}", table, e)),
@@ -419,7 +430,59 @@ fn drain_completed_loads(
             }
         }
     }
+
+    // Check if any deferred tables can now be checkpointed
+    finalize_completed_tables(&still_pending, deferred, local_conn, progress, stats, table_schemas)?;
+
+    if let Some(fail_after) = fail_after_tables {
+        if stats.tables_imported >= fail_after {
+            return Err(anyhow::anyhow!(
+                "[DEBUG] Simulated crash after {} tables (--fail-after-tables)",
+                fail_after
+            ));
+        }
+    }
+
     Ok(still_pending)
+}
+
+/// Finalize tables whose loads have all completed (non-blocking).
+/// A table is ready when it's in `deferred` and has no entries in `pending_loads`.
+fn finalize_completed_tables(
+    pending_loads: &[PendingLoad],
+    deferred: &mut HashMap<String, DeferredTableDone>,
+    local_conn: &mut Conn,
+    progress: &mut ImportProgress,
+    stats: &mut ImportStats,
+    table_schemas: &mut HashMap<String, Arc<Vec<ColumnDef>>>,
+) -> Result<()> {
+    if deferred.is_empty() {
+        return Ok(());
+    }
+
+    // Build set of tables that still have pending loads
+    let mut pending_tables: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for (table, _) in pending_loads {
+        pending_tables.insert(table.as_str());
+    }
+
+    // Finalize any deferred tables with no remaining loads
+    let ready: Vec<String> = deferred
+        .keys()
+        .filter(|t| !pending_tables.contains(t.as_str()))
+        .cloned()
+        .collect();
+
+    for table in ready {
+        let info = deferred.remove(&table).unwrap();
+        progress.finish_table(&table, info.row_count);
+        stats.tables_imported += 1;
+        stats.tables_imported_names.push(table.clone());
+        table_schemas.remove(&table);
+        Checkpoint::mark_complete(local_conn, &table, info.row_count)?;
+    }
+
+    Ok(())
 }
 
 /// Wait for a specific load to complete (blocking)
@@ -434,47 +497,32 @@ fn wait_for_load(
     }
 }
 
-/// Wait for all loads for a specific table, drain others non-blocking
-fn wait_for_table_loads(
-    pending_loads: Vec<PendingLoad>,
-    target_table: &str,
-    rows_imported: &mut u64,
-    load_accum: &mut LoadAccum,
-) -> Result<Vec<PendingLoad>> {
-    let mut still_pending = Vec::new();
-    for (table, rx) in pending_loads {
-        if table == target_table {
-            let result = wait_for_load(&table, &rx)?;
-            *rows_imported += result.rows;
-            load_accum.add(&result);
-        } else {
-            match rx.try_recv() {
-                Ok(Ok(result)) => {
-                    *rows_imported += result.rows;
-                    load_accum.add(&result);
-                }
-                Ok(Err(e)) => return Err(anyhow::anyhow!("Loader error for {}: {}", table, e)),
-                Err(std::sync::mpsc::TryRecvError::Empty) => still_pending.push((table, rx)),
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    return Err(anyhow::anyhow!("Loader worker died for {}", table))
-                }
-            }
-        }
-    }
-    Ok(still_pending)
-}
-
-/// Wait for all remaining pending loads to complete (blocking)
+/// Wait for all remaining pending loads to complete (blocking),
+/// then finalize all deferred tables.
 fn wait_for_all_loads(
     pending_loads: Vec<PendingLoad>,
-    rows_imported: &mut u64,
     load_accum: &mut LoadAccum,
+    deferred: &mut HashMap<String, DeferredTableDone>,
+    local_conn: &mut Conn,
+    progress: &mut ImportProgress,
+    stats: &mut ImportStats,
+    table_schemas: &mut HashMap<String, Arc<Vec<ColumnDef>>>,
 ) -> Result<()> {
     for (table, rx) in pending_loads {
         let result = wait_for_load(&table, &rx)?;
-        *rows_imported += result.rows;
+        stats.rows_imported += result.rows;
         load_accum.add(&result);
     }
+
+    // Finalize all remaining deferred tables (no loads left)
+    for (table, info) in deferred.drain() {
+        progress.finish_table(&table, info.row_count);
+        stats.tables_imported += 1;
+        stats.tables_imported_names.push(table.clone());
+        table_schemas.remove(&table);
+        Checkpoint::mark_complete(local_conn, &table, info.row_count)?;
+    }
+
     Ok(())
 }
 
@@ -951,6 +999,10 @@ async fn run_protocol_inner(
     let mut pending_ddls: HashMap<String, std::sync::mpsc::Receiver<Result<DdlResult>>> =
         HashMap::new();
 
+    // Tables where TableDone has been received but not all loads have completed yet.
+    // These get checkpointed once their loads finish (checked during non-blocking drains).
+    let mut deferred_table_dones: HashMap<String, DeferredTableDone> = HashMap::new();
+
     // Accumulator for parallel worker timing
     let mut load_accum = LoadAccum::new();
 
@@ -1105,8 +1157,13 @@ async fn run_protocol_inner(
                         let wait_start = Instant::now();
                         pending_loads = drain_completed_loads(
                             pending_loads,
-                            &mut stats.rows_imported,
                             &mut load_accum,
+                            &mut deferred_table_dones,
+                            local_conn,
+                            &mut progress,
+                            &mut stats,
+                            &mut table_schemas,
+                            config.fail_after_tables,
                         )?;
 
                         // If still too many, block on the oldest one
@@ -1166,45 +1223,26 @@ async fn run_protocol_inner(
                     }
                 }
 
-                // IMPORTANT: Before marking the table complete in checkpoint, we must ensure
-                // all data chunks for THIS table have been loaded. Otherwise, if we crash
-                // after marking complete but before loads finish, we'd skip incomplete data
-                // on resume.
-                //
-                // Strategy:
-                // 1. Wait (blocking) for all pending loads for THIS table
-                // 2. Non-blocking drain of loads for OTHER tables (keep parallelism)
-                // Wait for all pending loads for THIS table, drain others non-blocking
+                // Defer checkpoint: instead of blocking the main loop waiting for
+                // this table's loads, record it as "done" and checkpoint it later
+                // when its loads complete (checked during non-blocking drains).
+                // This keeps the main loop free to receive and submit more work.
+                deferred_table_dones.insert(table.clone(), DeferredTableDone { row_count });
+
+                // Non-blocking drain to finalize any tables that are already done
                 let wait_start = Instant::now();
-                pending_loads = wait_for_table_loads(
+                pending_loads = drain_completed_loads(
                     pending_loads,
-                    &table,
-                    &mut stats.rows_imported,
                     &mut load_accum,
+                    &mut deferred_table_dones,
+                    local_conn,
+                    &mut progress,
+                    &mut stats,
+                    &mut table_schemas,
+                    config.fail_after_tables,
                 )?;
                 if config.collect_metrics {
                     client_metrics.add_wait_loads_time(wait_start.elapsed());
-                }
-
-                progress.finish_table(&table, row_count);
-                stats.tables_imported += 1;
-                stats.tables_imported_names.push(table.clone());
-
-                // Clean up schema for this table
-                table_schemas.remove(&table);
-
-                // Mark table as complete in checkpoint
-                // Safe to do now - all chunks for this table have been loaded
-                Checkpoint::mark_complete(local_conn, &table, row_count)?;
-
-                // Debug: simulate crash for testing resume
-                if let Some(fail_after) = config.fail_after_tables {
-                    if stats.tables_imported >= fail_after {
-                        return Err(anyhow::anyhow!(
-                            "[DEBUG] Simulated crash after {} tables (--fail-after-tables)",
-                            fail_after
-                        ));
-                    }
                 }
             }
 
@@ -1221,8 +1259,8 @@ async fn run_protocol_inner(
                     }
                 }
 
-                // Wait for all remaining pending loads to complete before finishing
-                if !pending_loads.is_empty() {
+                // Wait for all remaining pending loads and finalize deferred tables
+                {
                     debug!(
                         "Waiting for {} remaining pending loads before Done",
                         pending_loads.len()
@@ -1230,13 +1268,16 @@ async fn run_protocol_inner(
                     let wait_start = Instant::now();
                     wait_for_all_loads(
                         pending_loads,
-                        &mut stats.rows_imported,
                         &mut load_accum,
+                        &mut deferred_table_dones,
+                        local_conn,
+                        &mut progress,
+                        &mut stats,
+                        &mut table_schemas,
                     )?;
                     if config.collect_metrics {
                         client_metrics.add_wait_loads_time(wait_start.elapsed());
                     }
-                    // pending_loads is moved, no need to clear
                 }
 
                 // Transfer parallel worker timing to client metrics
