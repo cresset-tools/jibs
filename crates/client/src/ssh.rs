@@ -373,6 +373,15 @@ impl SshSession {
         let ssh_config = Config {
             window_size: 32 * 1024 * 1024,    // 32 MB (vs 2 MB default)
             maximum_packet_size: 65535,         // max allowed (vs 32 KB default)
+            preferred: russh::Preferred {
+                // Prefer AES-GCM: hardware-accelerated on ARM64 (NEON) and x86 (AES-NI)
+                cipher: std::borrow::Cow::Borrowed(&[
+                    russh::cipher::AES_256_GCM,
+                    russh::cipher::CHACHA20_POLY1305,
+                    russh::cipher::AES_256_CTR,
+                ]),
+                ..russh::Preferred::DEFAULT
+            },
             ..Config::default()
         };
 
