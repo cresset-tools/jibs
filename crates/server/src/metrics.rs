@@ -41,6 +41,12 @@ pub struct MetricsCollector {
     aggregate_compress_ns: AtomicU64,
     /// Time spent pre-caching table schemas
     schema_cache_time_ns: AtomicU64,
+    /// Number of data messages sent
+    message_count: AtomicU64,
+    /// Total compressed bytes in data messages
+    total_compressed_bytes: AtomicU64,
+    /// Time spent on inter-level dedupe_values() calls
+    interlevel_dedup_time_ns: AtomicU64,
     /// Per-query timing records for aggregate BFS queries
     query_timings: Mutex<Vec<QueryTiming>>,
 }
@@ -63,6 +69,9 @@ impl Default for MetricsCollector {
             compress_time_ns: AtomicU64::new(0),
             aggregate_compress_ns: AtomicU64::new(0),
             schema_cache_time_ns: AtomicU64::new(0),
+            message_count: AtomicU64::new(0),
+            total_compressed_bytes: AtomicU64::new(0),
+            interlevel_dedup_time_ns: AtomicU64::new(0),
             query_timings: Mutex::new(Vec::new()),
         }
     }
@@ -169,6 +178,25 @@ impl MetricsCollector {
         }
     }
 
+    /// Track a data message being sent (count + compressed size)
+    #[inline]
+    pub fn add_message(&self, compressed_bytes: u64) {
+        if self.enabled {
+            self.message_count.fetch_add(1, Ordering::Relaxed);
+            self.total_compressed_bytes
+                .fetch_add(compressed_bytes, Ordering::Relaxed);
+        }
+    }
+
+    /// Add inter-level dedup time (dedupe_values between BFS levels)
+    #[inline]
+    pub fn add_interlevel_dedup_time(&self, duration: Duration) {
+        if self.enabled {
+            self.interlevel_dedup_time_ns
+                .fetch_add(duration.as_nanos() as u64, Ordering::Relaxed);
+        }
+    }
+
     /// Set wall-clock time for aggregate BFS traversal (Phase 1)
     pub fn set_aggregate_wall_time(&self, duration: Duration) {
         if self.enabled {
@@ -232,6 +260,10 @@ impl MetricsCollector {
             compress_time_ms: self.compress_time_ns.load(Ordering::Relaxed) / 1_000_000,
             aggregate_compress_ms: self.aggregate_compress_ns.load(Ordering::Relaxed) / 1_000_000,
             schema_cache_time_ms: self.schema_cache_time_ns.load(Ordering::Relaxed) / 1_000_000,
+            message_count: self.message_count.load(Ordering::Relaxed),
+            total_compressed_bytes: self.total_compressed_bytes.load(Ordering::Relaxed),
+            aggregate_interlevel_dedup_ms: self.interlevel_dedup_time_ns.load(Ordering::Relaxed)
+                / 1_000_000,
             query_timings: std::mem::take(&mut *self.query_timings.lock().unwrap()),
         })
     }
