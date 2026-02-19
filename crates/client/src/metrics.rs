@@ -26,6 +26,20 @@ pub struct ClientMetrics {
     pub wall_time: Duration,
     /// Start time for wall clock measurement
     start_time: Option<Instant>,
+    /// Time spent on DDL (CREATE TABLE) statements
+    pub ddl_time: Duration,
+    /// Time spent blocking on parallel load completion
+    pub wait_loads_time: Duration,
+    /// Number of data messages received
+    pub message_count: u64,
+    /// Sum of read-ahead channel depth at each recv (for computing average)
+    pub channel_depth_sum: u64,
+    /// Number of channel depth samples
+    pub channel_depth_samples: u64,
+    /// Cumulative decompress time across parallel workers
+    pub parallel_decompress_time: Duration,
+    /// Cumulative LOAD DATA time across parallel workers
+    pub parallel_load_time: Duration,
 }
 
 impl ClientMetrics {
@@ -73,6 +87,37 @@ impl ClientMetrics {
     /// Add uncompressed bytes (after decompression)
     pub fn add_uncompressed_bytes(&mut self, count: u64) {
         self.uncompressed_bytes += count;
+    }
+
+    /// Add DDL (CREATE TABLE) time
+    pub fn add_ddl_time(&mut self, duration: Duration) {
+        self.ddl_time += duration;
+    }
+
+    /// Add time spent waiting for parallel loads to complete
+    pub fn add_wait_loads_time(&mut self, duration: Duration) {
+        self.wait_loads_time += duration;
+    }
+
+    /// Count a data message received
+    pub fn add_message(&mut self) {
+        self.message_count += 1;
+    }
+
+    /// Record read-ahead channel depth at time of recv
+    pub fn record_channel_depth(&mut self, depth: usize) {
+        self.channel_depth_sum += depth as u64;
+        self.channel_depth_samples += 1;
+    }
+
+    /// Add cumulative parallel worker decompress time
+    pub fn add_parallel_decompress_time(&mut self, duration: Duration) {
+        self.parallel_decompress_time += duration;
+    }
+
+    /// Add cumulative parallel worker LOAD DATA time
+    pub fn add_parallel_load_time(&mut self, duration: Duration) {
+        self.parallel_load_time += duration;
     }
 
     /// Display metrics summary
@@ -150,6 +195,12 @@ impl ClientMetrics {
                     "  Dedup + FK extract:    {:>6}",
                     format_duration_ms(sm.dedup_time_ms),
                 );
+                if sm.aggregate_interlevel_dedup_ms > 0 {
+                    println!(
+                        "  Inter-level dedup:     {:>6}",
+                        format_duration_ms(sm.aggregate_interlevel_dedup_ms),
+                    );
+                }
                 println!(
                     "  TSV serialization:     {:>6}",
                     format_duration_ms(sm.aggregate_serialize_ms),
@@ -176,7 +227,8 @@ impl ClientMetrics {
                         format_duration_ms(sm.schema_cache_time_ms),
                     );
                 }
-                let accounted = mysql_total + sm.dedup_time_ms + sm.aggregate_serialize_ms
+                let accounted = mysql_total + sm.dedup_time_ms + sm.aggregate_interlevel_dedup_ms
+                    + sm.aggregate_serialize_ms
                     + sm.aggregate_write_ms + sm.aggregate_compress_ms + sm.schema_cache_time_ms;
                 if sm.aggregate_wall_ms > accounted {
                     println!(
@@ -225,29 +277,79 @@ impl ClientMetrics {
             }
         }
 
-        // Client metrics
-        let client_total = self.recv_time + self.decompress_time + self.load_time;
-        let client_total_ms = client_total.as_millis() as u64;
+        // Client metrics — use wall time as denominator for meaningful percentages
+        let wall_ms = self.wall_time.as_millis() as u64;
 
         println!("Client (local):");
+        let recv_pct = percent(self.recv_time.as_millis() as u64, wall_ms);
+        let recv_note = if recv_pct > 70 { " <- waiting for server" } else { "" };
         println!(
-            "  Message receive:     {:>8} ({:>3}%)",
+            "  Message receive:     {:>8} ({:>3}%){}",
             format_duration(self.recv_time),
-            percent(self.recv_time.as_millis() as u64, client_total_ms)
+            recv_pct,
+            recv_note
         );
         println!(
-            "  Decompression:       {:>8} ({:>3}%)",
-            format_duration(self.decompress_time),
-            percent(self.decompress_time.as_millis() as u64, client_total_ms)
+            "  DDL (CREATE TABLE):  {:>8} ({:>3}%)",
+            format_duration(self.ddl_time),
+            percent(self.ddl_time.as_millis() as u64, wall_ms)
         );
-        let load_pct = percent(self.load_time.as_millis() as u64, client_total_ms);
-        let load_note = if load_pct > 40 { " <- bottleneck" } else { "" };
-        println!(
-            "  LOAD DATA:           {:>8} ({:>3}%){}",
-            format_duration(self.load_time),
-            load_pct,
-            load_note
-        );
+        if self.wait_loads_time.as_millis() > 0 {
+            println!(
+                "  Wait for loads:      {:>8} ({:>3}%)",
+                format_duration(self.wait_loads_time),
+                percent(self.wait_loads_time.as_millis() as u64, wall_ms)
+            );
+        }
+
+        // Sequential mode timings
+        if self.decompress_time.as_millis() > 0 || self.load_time.as_millis() > 0 {
+            println!(
+                "  Decompression:       {:>8} ({:>3}%)",
+                format_duration(self.decompress_time),
+                percent(self.decompress_time.as_millis() as u64, wall_ms)
+            );
+            let load_pct = percent(self.load_time.as_millis() as u64, wall_ms);
+            let load_note = if load_pct > 40 { " <- bottleneck" } else { "" };
+            println!(
+                "  LOAD DATA:           {:>8} ({:>3}%){}",
+                format_duration(self.load_time),
+                load_pct,
+                load_note
+            );
+        }
+
+        // Parallel worker cumulative timings
+        if self.parallel_decompress_time.as_millis() > 0
+            || self.parallel_load_time.as_millis() > 0
+        {
+            println!("  Parallel workers (cumulative):");
+            println!(
+                "    Decompress:        {:>8}",
+                format_duration(self.parallel_decompress_time)
+            );
+            println!(
+                "    LOAD DATA:         {:>8}",
+                format_duration(self.parallel_load_time)
+            );
+        }
+
+        // Read-ahead buffer depth
+        if self.channel_depth_samples > 0 {
+            let avg_depth =
+                self.channel_depth_sum as f64 / self.channel_depth_samples as f64;
+            let bound_note = if avg_depth < 1.0 {
+                "server-bound"
+            } else if avg_depth > 28.0 {
+                "client-bound"
+            } else {
+                "balanced"
+            };
+            println!(
+                "  Read-ahead buffer:   avg {:.1}/32 ({})",
+                avg_depth, bound_note
+            );
+        }
         println!();
 
         // Transfer stats
@@ -268,6 +370,23 @@ impl ClientMetrics {
             "Transfer: {:.1} MB compressed / {:.1} MB uncompressed ({:.1}x ratio) at {:.1} MB/s",
             compressed_mb, uncompressed_mb, ratio, throughput
         );
+
+        // Message stats (from server metrics if available)
+        if let Some(sm) = server_metrics {
+            if sm.message_count > 0 {
+                let avg_kb = if sm.message_count > 0 {
+                    (sm.total_compressed_bytes as f64 / sm.message_count as f64) / 1024.0
+                } else {
+                    0.0
+                };
+                println!(
+                    "Messages: {} (avg {:.1} KB compressed)",
+                    format_rows(sm.message_count),
+                    avg_kb
+                );
+            }
+        }
+
         println!("Rows: {}", format_rows(self.rows_loaded));
         println!("Wall time: {}", format_duration(self.wall_time));
     }

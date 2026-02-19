@@ -25,15 +25,28 @@ use crate::ssh::{get_server_path, ProcessReader, ProcessWriter, RemoteProcess, S
 // Loader Pool - manages parallel MySQL connections for data loading
 // ============================================================================
 
+/// Result from a DDL (CREATE TABLE) operation
+struct DdlResult {
+    ddl_ns: u64,
+}
+
 /// Work item for loader workers
-struct LoadWork {
-    table: String,
-    columns: Arc<Vec<ColumnDef>>,
-    /// Raw data — may be compressed depending on `compression`
-    data: Vec<u8>,
-    /// Compression mode for this chunk
-    compression: CompressionMode,
-    result_tx: std::sync::mpsc::Sender<Result<u64>>,
+enum LoadWork {
+    /// Create (or recreate) a table — must complete before any LoadData for the same table
+    CreateTable {
+        table: String,
+        columns: Vec<ColumnDef>,
+        anon_rules: Option<Vec<jibs_protocol::AnonymizeRule>>,
+        result_tx: std::sync::mpsc::Sender<Result<DdlResult>>,
+    },
+    /// Decompress + LOAD DATA for a chunk of rows
+    LoadData {
+        table: String,
+        columns: Arc<Vec<ColumnDef>>,
+        data: Vec<u8>,
+        compression: CompressionMode,
+        result_tx: std::sync::mpsc::Sender<Result<LoadResult>>,
+    },
 }
 
 /// Worker initialization result
@@ -120,20 +133,58 @@ impl LoaderPool {
                         Err(_) => break, // Channel closed
                     };
 
-                    let LoadWork {
-                        table,
-                        columns,
-                        data,
-                        compression,
-                        result_tx,
-                    } = work;
+                    match work {
+                        LoadWork::CreateTable {
+                            table,
+                            columns,
+                            anon_rules,
+                            result_tx,
+                        } => {
+                            let result = (|| -> Result<DdlResult> {
+                                let ddl_start = Instant::now();
+                                create_table(
+                                    &mut conn,
+                                    &table,
+                                    &columns,
+                                    anon_rules.as_ref(),
+                                )?;
+                                Ok(DdlResult {
+                                    ddl_ns: ddl_start.elapsed().as_nanos() as u64,
+                                })
+                            })();
+                            let _ = result_tx.send(result);
+                        }
+                        LoadWork::LoadData {
+                            table,
+                            columns,
+                            data,
+                            compression,
+                            result_tx,
+                        } => {
+                            let result = (|| -> Result<LoadResult> {
+                                let decompress_start = Instant::now();
+                                let decompressed = maybe_decompress(data, compression)?;
+                                let decompress_ns =
+                                    decompress_start.elapsed().as_nanos() as u64;
 
-                    // Decompress + load data
-                    let result = (|| -> Result<u64> {
-                        let decompressed = maybe_decompress(data, compression)?;
-                        load_tsv_data_with_conn(&mut conn, &table, &columns, &decompressed)
-                    })();
-                    let _ = result_tx.send(result);
+                                let load_start = Instant::now();
+                                let rows = load_tsv_data_with_conn(
+                                    &mut conn,
+                                    &table,
+                                    &columns,
+                                    &decompressed,
+                                )?;
+                                let load_ns = load_start.elapsed().as_nanos() as u64;
+
+                                Ok(LoadResult {
+                                    rows,
+                                    decompress_ns,
+                                    load_ns,
+                                })
+                            })();
+                            let _ = result_tx.send(result);
+                        }
+                    }
                 }
 
                 debug!("Loader worker {} shutting down", worker_id);
@@ -204,6 +255,27 @@ impl LoaderPool {
         })
     }
 
+    /// Submit a CREATE TABLE job to the pool, returns a receiver for the result.
+    fn submit_ddl(
+        &self,
+        table: String,
+        columns: Vec<ColumnDef>,
+        anon_rules: Option<Vec<jibs_protocol::AnonymizeRule>>,
+    ) -> Result<std::sync::mpsc::Receiver<Result<DdlResult>>> {
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+
+        self.work_tx
+            .send(LoadWork::CreateTable {
+                table,
+                columns,
+                anon_rules,
+                result_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("Loader pool shut down"))?;
+
+        Ok(result_rx)
+    }
+
     /// Submit data for loading, returns a receiver for the result.
     /// Data may be compressed — workers decompress before loading.
     fn submit(
@@ -212,11 +284,11 @@ impl LoaderPool {
         columns: Arc<Vec<ColumnDef>>,
         data: Vec<u8>,
         compression: CompressionMode,
-    ) -> Result<std::sync::mpsc::Receiver<Result<u64>>> {
+    ) -> Result<std::sync::mpsc::Receiver<Result<LoadResult>>> {
         let (result_tx, result_rx) = std::sync::mpsc::channel();
 
         self.work_tx
-            .send(LoadWork {
+            .send(LoadWork::LoadData {
                 table,
                 columns,
                 data,
@@ -298,17 +370,48 @@ struct ProtocolConfig {
 // Pending Load Helpers - manage parallel loader pool results
 // ============================================================================
 
-type PendingLoad = (String, std::sync::mpsc::Receiver<Result<u64>>);
+/// Result from a parallel load worker including timing info
+struct LoadResult {
+    rows: u64,
+    decompress_ns: u64,
+    load_ns: u64,
+}
+
+/// Accumulator for parallel worker timing (separate from row counts)
+struct LoadAccum {
+    decompress_ns: u64,
+    load_ns: u64,
+}
+
+impl LoadAccum {
+    fn new() -> Self {
+        Self {
+            decompress_ns: 0,
+            load_ns: 0,
+        }
+    }
+
+    fn add(&mut self, result: &LoadResult) {
+        self.decompress_ns += result.decompress_ns;
+        self.load_ns += result.load_ns;
+    }
+}
+
+type PendingLoad = (String, std::sync::mpsc::Receiver<Result<LoadResult>>);
 
 /// Drain completed loads without blocking, returns remaining pending loads
 fn drain_completed_loads(
     pending_loads: Vec<PendingLoad>,
     rows_imported: &mut u64,
+    load_accum: &mut LoadAccum,
 ) -> Result<Vec<PendingLoad>> {
     let mut still_pending = Vec::new();
     for (table, rx) in pending_loads {
         match rx.try_recv() {
-            Ok(Ok(loaded)) => *rows_imported += loaded,
+            Ok(Ok(result)) => {
+                *rows_imported += result.rows;
+                load_accum.add(&result);
+            }
             Ok(Err(e)) => return Err(anyhow::anyhow!("Loader error for {}: {}", table, e)),
             Err(std::sync::mpsc::TryRecvError::Empty) => still_pending.push((table, rx)),
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
@@ -320,9 +423,12 @@ fn drain_completed_loads(
 }
 
 /// Wait for a specific load to complete (blocking)
-fn wait_for_load(table: &str, rx: &std::sync::mpsc::Receiver<Result<u64>>) -> Result<u64> {
+fn wait_for_load(
+    table: &str,
+    rx: &std::sync::mpsc::Receiver<Result<LoadResult>>,
+) -> Result<LoadResult> {
     match rx.recv() {
-        Ok(Ok(loaded)) => Ok(loaded),
+        Ok(Ok(result)) => Ok(result),
         Ok(Err(e)) => Err(anyhow::anyhow!("Loader error for {}: {}", table, e)),
         Err(_) => Err(anyhow::anyhow!("Loader worker died for {}", table)),
     }
@@ -333,14 +439,20 @@ fn wait_for_table_loads(
     pending_loads: Vec<PendingLoad>,
     target_table: &str,
     rows_imported: &mut u64,
+    load_accum: &mut LoadAccum,
 ) -> Result<Vec<PendingLoad>> {
     let mut still_pending = Vec::new();
     for (table, rx) in pending_loads {
         if table == target_table {
-            *rows_imported += wait_for_load(&table, &rx)?;
+            let result = wait_for_load(&table, &rx)?;
+            *rows_imported += result.rows;
+            load_accum.add(&result);
         } else {
             match rx.try_recv() {
-                Ok(Ok(loaded)) => *rows_imported += loaded,
+                Ok(Ok(result)) => {
+                    *rows_imported += result.rows;
+                    load_accum.add(&result);
+                }
                 Ok(Err(e)) => return Err(anyhow::anyhow!("Loader error for {}: {}", table, e)),
                 Err(std::sync::mpsc::TryRecvError::Empty) => still_pending.push((table, rx)),
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
@@ -353,9 +465,15 @@ fn wait_for_table_loads(
 }
 
 /// Wait for all remaining pending loads to complete (blocking)
-fn wait_for_all_loads(pending_loads: Vec<PendingLoad>, rows_imported: &mut u64) -> Result<()> {
+fn wait_for_all_loads(
+    pending_loads: Vec<PendingLoad>,
+    rows_imported: &mut u64,
+    load_accum: &mut LoadAccum,
+) -> Result<()> {
     for (table, rx) in pending_loads {
-        *rows_imported += wait_for_load(&table, &rx)?;
+        let result = wait_for_load(&table, &rx)?;
+        *rows_imported += result.rows;
+        load_accum.add(&result);
     }
     Ok(())
 }
@@ -826,7 +944,15 @@ async fn run_protocol_inner(
 
     // Track pending load results globally (not per-table) to avoid blocking at table boundaries
     // Each entry is (table_name, result_receiver)
-    let mut pending_loads: Vec<(String, std::sync::mpsc::Receiver<Result<u64>>)> = Vec::new();
+    let mut pending_loads: Vec<PendingLoad> = Vec::new();
+
+    // Track pending DDL (CREATE TABLE) operations dispatched to the loader pool.
+    // When a Data message arrives, we wait for DDL completion before submitting load.
+    let mut pending_ddls: HashMap<String, std::sync::mpsc::Receiver<Result<DdlResult>>> =
+        HashMap::new();
+
+    // Accumulator for parallel worker timing
+    let mut load_accum = LoadAccum::new();
 
     // Maximum number of pending chunks before we start draining
     // This bounds memory usage while allowing cross-table parallelism
@@ -836,6 +962,10 @@ async fn run_protocol_inner(
     // This keeps the SSH pipe drained even while the main loop is busy processing,
     // preventing backpressure from stalling the server.
     let (mut reader, mut writer) = server.split();
+
+    // Channel depth tracking for metrics
+    let channel_depth = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let channel_depth_sender = std::sync::Arc::clone(&channel_depth);
 
     // Spawn read-ahead task: continuously reads messages from SSH and buffers them.
     // The bounded channel (32 messages) absorbs bursts so the server doesn't stall.
@@ -849,6 +979,7 @@ async fn run_protocol_inner(
             if msg_tx.send(result).await.is_err() {
                 break; // Receiver dropped
             }
+            channel_depth_sender.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if is_done || is_err {
                 break;
             }
@@ -865,6 +996,9 @@ async fn run_protocol_inner(
         };
         if config.collect_metrics {
             client_metrics.add_recv_time(recv_start.elapsed());
+            // Track read-ahead channel depth (value before we consumed this message)
+            let depth = channel_depth.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            client_metrics.record_channel_depth(depth);
         }
 
         match msg {
@@ -897,10 +1031,23 @@ async fn run_protocol_inner(
                 }
 
                 // Get anonymization rules for this table
-                let anon_rules = plan.anonymization.get(&table);
+                let anon_rules = plan.anonymization.get(&table).cloned();
 
-                // Create table in local MySQL (drops existing table)
-                create_table(local_conn, &table, &columns, anon_rules)?;
+                // Dispatch CREATE TABLE to loader pool (parallel) or run synchronously
+                if let Some(pool) = loader_pool {
+                    let ddl_rx = pool.submit_ddl(
+                        table.clone(),
+                        columns,
+                        anon_rules,
+                    )?;
+                    pending_ddls.insert(table, ddl_rx);
+                } else {
+                    let ddl_start = Instant::now();
+                    create_table(local_conn, &table, &columns, anon_rules.as_ref())?;
+                    if config.collect_metrics {
+                        client_metrics.add_ddl_time(ddl_start.elapsed());
+                    }
+                }
             }
 
             ServerMessage::Data {
@@ -918,6 +1065,7 @@ async fn run_protocol_inner(
 
                 if config.collect_metrics {
                     client_metrics.add_compressed_bytes(tsv_data.len() as u64);
+                    client_metrics.add_message();
                     // Read uncompressed size from zstd header (first 4 bytes)
                     if matches!(negotiated_compression, CompressionMode::Zstd) && tsv_data.len() >= 4 {
                         let uncompressed_len =
@@ -936,20 +1084,42 @@ async fn run_protocol_inner(
 
                 // Load data into MySQL - use pool if available
                 if let Some(pool) = loader_pool {
+                    // Ensure CREATE TABLE has completed before loading data
+                    if let Some(ddl_rx) = pending_ddls.remove(&table) {
+                        let ddl_result = ddl_rx
+                            .recv()
+                            .map_err(|_| anyhow::anyhow!("DDL worker died for {}", table))?
+                            .map_err(|e| anyhow::anyhow!("DDL error for {}: {}", table, e))?;
+                        if config.collect_metrics {
+                            client_metrics
+                                .add_ddl_time(Duration::from_nanos(ddl_result.ddl_ns));
+                        }
+                    }
+
                     // Submit compressed data to loader pool — workers decompress + load
                     let result_rx = pool.submit(table.clone(), schema, tsv_data, negotiated_compression)?;
                     pending_loads.push((table.clone(), result_rx));
 
                     // If we have too many pending chunks, drain some to bound memory
                     if pending_loads.len() > MAX_PENDING_CHUNKS {
-                        pending_loads = drain_completed_loads(pending_loads, &mut stats.rows_imported)?;
+                        let wait_start = Instant::now();
+                        pending_loads = drain_completed_loads(
+                            pending_loads,
+                            &mut stats.rows_imported,
+                            &mut load_accum,
+                        )?;
 
                         // If still too many, block on the oldest one
                         if pending_loads.len() > MAX_PENDING_CHUNKS {
                             if let Some((tbl, rx)) = pending_loads.first() {
-                                stats.rows_imported += wait_for_load(tbl, rx)?;
+                                let result = wait_for_load(tbl, rx)?;
+                                stats.rows_imported += result.rows;
+                                load_accum.add(&result);
                             }
                             pending_loads.remove(0);
+                        }
+                        if config.collect_metrics {
+                            client_metrics.add_wait_loads_time(wait_start.elapsed());
                         }
                     }
                 } else {
@@ -984,6 +1154,18 @@ async fn run_protocol_inner(
                     continue;
                 }
 
+                // Ensure DDL completed for this table (handles 0-row tables
+                // where no Data message triggered the DDL wait)
+                if let Some(ddl_rx) = pending_ddls.remove(&table) {
+                    let ddl_result = ddl_rx
+                        .recv()
+                        .map_err(|_| anyhow::anyhow!("DDL worker died for {}", table))?
+                        .map_err(|e| anyhow::anyhow!("DDL error for {}: {}", table, e))?;
+                    if config.collect_metrics {
+                        client_metrics.add_ddl_time(Duration::from_nanos(ddl_result.ddl_ns));
+                    }
+                }
+
                 // IMPORTANT: Before marking the table complete in checkpoint, we must ensure
                 // all data chunks for THIS table have been loaded. Otherwise, if we crash
                 // after marking complete but before loads finish, we'd skip incomplete data
@@ -993,11 +1175,16 @@ async fn run_protocol_inner(
                 // 1. Wait (blocking) for all pending loads for THIS table
                 // 2. Non-blocking drain of loads for OTHER tables (keep parallelism)
                 // Wait for all pending loads for THIS table, drain others non-blocking
+                let wait_start = Instant::now();
                 pending_loads = wait_for_table_loads(
                     pending_loads,
                     &table,
                     &mut stats.rows_imported,
+                    &mut load_accum,
                 )?;
+                if config.collect_metrics {
+                    client_metrics.add_wait_loads_time(wait_start.elapsed());
+                }
 
                 progress.finish_table(&table, row_count);
                 stats.tables_imported += 1;
@@ -1022,14 +1209,44 @@ async fn run_protocol_inner(
             }
 
             ServerMessage::Done { table_dispositions, metrics: server_metrics } => {
+                // Drain any remaining pending DDLs
+                for (tbl, ddl_rx) in pending_ddls.drain() {
+                    let ddl_result = ddl_rx
+                        .recv()
+                        .map_err(|_| anyhow::anyhow!("DDL worker died for {}", tbl))?
+                        .map_err(|e| anyhow::anyhow!("DDL error for {}: {}", tbl, e))?;
+                    if config.collect_metrics {
+                        client_metrics
+                            .add_ddl_time(Duration::from_nanos(ddl_result.ddl_ns));
+                    }
+                }
+
                 // Wait for all remaining pending loads to complete before finishing
                 if !pending_loads.is_empty() {
                     debug!(
                         "Waiting for {} remaining pending loads before Done",
                         pending_loads.len()
                     );
-                    wait_for_all_loads(pending_loads, &mut stats.rows_imported)?;
+                    let wait_start = Instant::now();
+                    wait_for_all_loads(
+                        pending_loads,
+                        &mut stats.rows_imported,
+                        &mut load_accum,
+                    )?;
+                    if config.collect_metrics {
+                        client_metrics.add_wait_loads_time(wait_start.elapsed());
+                    }
                     // pending_loads is moved, no need to clear
+                }
+
+                // Transfer parallel worker timing to client metrics
+                if config.collect_metrics {
+                    client_metrics.add_parallel_decompress_time(Duration::from_nanos(
+                        load_accum.decompress_ns,
+                    ));
+                    client_metrics
+                        .add_parallel_load_time(Duration::from_nanos(load_accum.load_ns));
+                    client_metrics.add_rows_loaded(stats.rows_imported);
                 }
 
                 // Store server metrics

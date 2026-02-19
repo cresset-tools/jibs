@@ -54,6 +54,12 @@ pub struct ServerMetrics {
     pub aggregate_compress_ms: u64,
     /// Time spent pre-caching table schemas (ms)
     pub schema_cache_time_ms: u64,
+    /// Number of data messages sent
+    pub message_count: u64,
+    /// Total bytes of compressed data across all messages
+    pub total_compressed_bytes: u64,
+    /// Time spent on inter-level dedupe_values() in aggregate BFS (ms)
+    pub aggregate_interlevel_dedup_ms: u64,
     /// Per-query timing for aggregate BFS queries
     pub query_timings: Vec<QueryTiming>,
 }

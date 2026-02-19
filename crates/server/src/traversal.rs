@@ -5,6 +5,7 @@ use std::io::Write;
 use std::sync::{mpsc, Arc};
 use std::time::Instant;
 
+use jibs_protocol::framing::write_message_noflush;
 use mysql::{Row, Value as MySqlValue};
 
 use jibs_protocol::{
@@ -35,8 +36,8 @@ struct TableTask {
 // Streaming helpers
 // ============================================================================
 
-/// Flush a TSV buffer as a Data message if non-empty.
-fn flush_chunk<W: Write>(
+/// Write a TSV buffer as a Data message if non-empty.
+fn write_chunk<W: Write>(
     table: &str,
     tsv_writer: &mut TsvWriter,
     chunk_row_count: u32,
@@ -59,16 +60,18 @@ fn flush_chunk<W: Write>(
     let compressed = maybe_compress(tsv_data, compression);
     metrics.add_compress_time(compress_start.elapsed());
 
+    let compressed_len = compressed.len() as u64;
     let msg = ServerMessage::Data {
         table: table.to_string(),
         row_count: chunk_row_count,
         tsv_data: compressed,
     };
 
-    // Time the write operation (includes flush)
+    // Time the write operation
     let write_start = Instant::now();
-    write_message(writer, &msg)?;
+    write_message_noflush(writer, &msg)?;
     metrics.add_write_time(write_start.elapsed());
+    metrics.add_message(compressed_len);
 
     Ok(())
 }
@@ -361,7 +364,7 @@ impl<'a> DependencyTraverser<'a> {
             if chunk_row_count >= CHUNK_ROW_LIMIT as u32
                 || tsv_writer.buffer_size() >= CHUNK_BYTE_LIMIT
             {
-                flush_chunk(
+                write_chunk(
                     table,
                     &mut tsv_writer,
                     chunk_row_count,
@@ -375,7 +378,7 @@ impl<'a> DependencyTraverser<'a> {
 
         // Flush remaining data
         if chunk_row_count > 0 {
-            flush_chunk(
+            write_chunk(
                 table,
                 &mut tsv_writer,
                 chunk_row_count,
@@ -460,6 +463,8 @@ impl<'a> DependencyTraverser<'a> {
         drop(tx);
 
         // Writer loop: drain channel and write to stdout
+        // Uses noflush to let the BufWriter coalesce writes; the 256KB buffer
+        // auto-flushes, and we do an explicit flush after the loop.
         let mut streamed_tables: HashSet<String> = HashSet::new();
         for msg in rx {
             if let ServerMessage::TableDone { ref table, row_count } = msg {
@@ -468,9 +473,10 @@ impl<'a> DependencyTraverser<'a> {
                 }
             }
             let write_start = Instant::now();
-            write_message(writer, &msg)?;
+            write_message_noflush(writer, &msg)?;
             self.metrics.add_write_time(write_start.elapsed());
         }
+        writer.flush()?;
 
         // Join all workers and propagate first error
         let mut first_error: Option<ServerError> = None;
@@ -687,7 +693,7 @@ impl<'a> DependencyTraverser<'a> {
                     if chunk_row_count >= CHUNK_ROW_LIMIT as u32
                         || tsv_writer.buffer_size() >= CHUNK_BYTE_LIMIT
                     {
-                        flush_chunk(
+                        write_chunk(
                             root_table,
                             &mut tsv_writer,
                             chunk_row_count,
@@ -713,7 +719,7 @@ impl<'a> DependencyTraverser<'a> {
 
             // Flush remaining root table data
             if chunk_row_count > 0 {
-                flush_chunk(
+                write_chunk(
                     root_table,
                     &mut tsv_writer,
                     chunk_row_count,
@@ -729,7 +735,7 @@ impl<'a> DependencyTraverser<'a> {
                 if !values.is_empty() {
                     let dedup_start = Instant::now();
                     let unique = dedupe_values(values);
-                    self.metrics.add_dedup_time(dedup_start.elapsed());
+                    self.metrics.add_interlevel_dedup_time(dedup_start.elapsed());
                     if !unique.is_empty() {
                         pending
                             .entry((relation.from_table.clone(), relation.from_column.clone(), true))
@@ -743,7 +749,7 @@ impl<'a> DependencyTraverser<'a> {
                 if !values.is_empty() {
                     let dedup_start = Instant::now();
                     let unique = dedupe_values(values);
-                    self.metrics.add_dedup_time(dedup_start.elapsed());
+                    self.metrics.add_interlevel_dedup_time(dedup_start.elapsed());
                     if !unique.is_empty() {
                         pending
                             .entry((relation.to_table.clone(), relation.to_column.clone(), false))
@@ -820,7 +826,7 @@ impl<'a> DependencyTraverser<'a> {
                     // Dedupe and batch the FK values
                     let dedup_start = Instant::now();
                     let unique_values = dedupe_values(fk_values);
-                    self.metrics.add_dedup_time(dedup_start.elapsed());
+                    self.metrics.add_interlevel_dedup_time(dedup_start.elapsed());
 
                     for batch in unique_values.chunks(MAX_IN_VALUES) {
                         let batch_len = batch.len() as u32;
@@ -918,7 +924,7 @@ impl<'a> DependencyTraverser<'a> {
                                 if chunk_row_count >= CHUNK_ROW_LIMIT as u32
                                     || tsv_writer.buffer_size() >= CHUNK_BYTE_LIMIT
                                 {
-                                    flush_chunk(
+                                    write_chunk(
                                         &table,
                                         &mut tsv_writer,
                                         chunk_row_count,
@@ -945,7 +951,7 @@ impl<'a> DependencyTraverser<'a> {
 
                     // Flush remaining data for this table+column group
                     if chunk_row_count > 0 {
-                        flush_chunk(
+                        write_chunk(
                             &table,
                             &mut tsv_writer,
                             chunk_row_count,
@@ -961,7 +967,7 @@ impl<'a> DependencyTraverser<'a> {
                         if !values.is_empty() {
                             let dedup_start = Instant::now();
                             let unique = dedupe_values(values);
-                            self.metrics.add_dedup_time(dedup_start.elapsed());
+                            self.metrics.add_interlevel_dedup_time(dedup_start.elapsed());
                             if !unique.is_empty() {
                                 pending
                                     .entry((relation.to_table.clone(), relation.to_column.clone(), false))
@@ -975,7 +981,7 @@ impl<'a> DependencyTraverser<'a> {
                         if !values.is_empty() {
                             let dedup_start = Instant::now();
                             let unique = dedupe_values(values);
-                            self.metrics.add_dedup_time(dedup_start.elapsed());
+                            self.metrics.add_interlevel_dedup_time(dedup_start.elapsed());
                             if !unique.is_empty() {
                                 pending
                                     .entry((relation.from_table.clone(), relation.from_column.clone(), true))
@@ -1201,6 +1207,7 @@ fn stream_full_table_to_channel(
             let compress_start = Instant::now();
             let compressed = maybe_compress(tsv_data, compression);
             metrics.add_compress_time(compress_start.elapsed());
+            let compressed_len = compressed.len() as u64;
             let msg = ServerMessage::Data {
                 table: table.to_string(),
                 row_count: chunk_row_count,
@@ -1208,6 +1215,7 @@ fn stream_full_table_to_channel(
             };
             tx.send(msg)
                 .map_err(|_| crate::error::ServerError::Protocol("Channel closed".to_string()))?;
+            metrics.add_message(compressed_len);
             chunk_row_count = 0;
         }
     }
@@ -1224,6 +1232,7 @@ fn stream_full_table_to_channel(
         let compress_start = Instant::now();
         let compressed = maybe_compress(tsv_data, compression);
         metrics.add_compress_time(compress_start.elapsed());
+        let compressed_len = compressed.len() as u64;
         let msg = ServerMessage::Data {
             table: table.to_string(),
             row_count: chunk_row_count,
@@ -1231,6 +1240,7 @@ fn stream_full_table_to_channel(
         };
         tx.send(msg)
             .map_err(|_| crate::error::ServerError::Protocol("Channel closed".to_string()))?;
+        metrics.add_message(compressed_len);
     }
 
     // Send TableDone (always, even for empty tables so the client marks them complete)
