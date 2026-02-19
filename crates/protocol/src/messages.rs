@@ -2,7 +2,6 @@
 
 use bincode::{Decode, Encode};
 
-use crate::checkpoint::Checkpoint;
 use crate::plan::{ColumnDef, CompressionMode, ExecutionPlan, TableInfo};
 
 /// Timing for a single query executed during aggregate BFS traversal
@@ -71,8 +70,6 @@ pub enum TableDisposition {
     Empty,
     /// Excluded by config (structure created but no data)
     Excluded,
-    /// Skipped because it was already completed (resume)
-    Resumed,
 }
 
 /// Messages sent from client to server
@@ -94,12 +91,10 @@ pub enum ClientMessage {
         /// Whether to collect detailed timing metrics
         collect_metrics: bool,
     },
-    /// Start streaming data (optionally resume from checkpoint)
-    Start {
-        resume_from: Option<Checkpoint>,
-    },
+    /// Start streaming data
+    Start,
     /// Acknowledge receipt of chunk (for flow control)
-    Ack { checkpoint: Checkpoint },
+    Ack,
     /// Graceful shutdown
     Shutdown,
 }
@@ -123,7 +118,6 @@ pub enum ServerMessage {
         table: String,
         row_count: u32,
         tsv_data: Vec<u8>,
-        checkpoint: Checkpoint,
     },
     /// Table fully transferred
     TableDone { table: String, row_count: u64 },

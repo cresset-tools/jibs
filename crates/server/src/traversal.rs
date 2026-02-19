@@ -2,14 +2,14 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc};
 use std::time::Instant;
 
 use mysql::{Row, Value as MySqlValue};
 
 use jibs_protocol::{
-    framing::write_message, AnonymizeRule, Checkpoint, ColumnDef, CompressionMode, ExecutionPlan,
-    Relation, ResolvedAggregate, ServerMessage, ServerMetrics, SortDirection, TableDisposition,
+    framing::write_message, AnonymizeRule, ColumnDef, CompressionMode, ExecutionPlan, Relation,
+    ResolvedAggregate, ServerMessage, ServerMetrics, SortDirection, TableDisposition,
 };
 
 use crate::error::{Result, ServerError};
@@ -41,7 +41,6 @@ fn flush_chunk<W: Write>(
     tsv_writer: &mut TsvWriter,
     chunk_row_count: u32,
     compression: CompressionMode,
-    checkpoint: &mut Checkpoint,
     writer: &mut W,
     metrics: &MetricsCollector,
 ) -> Result<()> {
@@ -51,8 +50,6 @@ fn flush_chunk<W: Write>(
 
     let tsv_data = tsv_writer.take_buffer();
     let bytes = tsv_data.len() as u64;
-    checkpoint.bytes_transferred += bytes;
-    checkpoint.rows_transferred += chunk_row_count as u64;
 
     // Track bytes sent for metrics
     metrics.add_bytes_sent(bytes);
@@ -66,7 +63,6 @@ fn flush_chunk<W: Write>(
         table: table.to_string(),
         row_count: chunk_row_count,
         tsv_data: compressed,
-        checkpoint: checkpoint.clone(),
     };
 
     // Time the write operation (includes flush)
@@ -154,24 +150,21 @@ impl<'a> DependencyTraverser<'a> {
     /// 3. Excluded tables: skip data (structure only)
     /// 4. Ignored tables: skip entirely
     ///
-    /// If `resume_from` is provided, skip tables already completed.
     /// If `parallel > 1`, Phase 2 uses worker threads with their own MySQL connections.
     pub fn stream_all_tables<W: Write>(
         &mut self,
-        resume_from: Option<Checkpoint>,
         compression: CompressionMode,
         writer: &mut W,
         parallel: u32,
         mysql_url: &str,
     ) -> Result<Vec<(String, TableDisposition)>> {
-        let mut checkpoint = resume_from.unwrap_or_default();
         let mut dispositions: Vec<(String, TableDisposition)> = Vec::new();
 
         // Phase 1: Stream aggregate tables via BFS traversal.
         // This streams rows directly during traversal, only keeping PKs and FK values in memory.
         // Returns the set of tables that were touched by aggregates.
         let phase1_start = Instant::now();
-        let aggregate_tables = self.stream_aggregate_tables(compression, &mut checkpoint, writer)?;
+        let aggregate_tables = self.stream_aggregate_tables(compression, writer)?;
         self.metrics.set_aggregate_wall_time(phase1_start.elapsed());
         self.metrics.snapshot_aggregate_phase();
 
@@ -192,10 +185,6 @@ impl<'a> DependencyTraverser<'a> {
             }
             if aggregate_tables.contains(&table) {
                 dispositions.push((table, TableDisposition::Aggregate));
-                continue;
-            }
-            if checkpoint.should_skip_table(&table) {
-                dispositions.push((table, TableDisposition::Resumed));
                 continue;
             }
 
@@ -222,7 +211,6 @@ impl<'a> DependencyTraverser<'a> {
                     &task.columns,
                     task.anonymization,
                     compression,
-                    &mut checkpoint,
                     writer,
                 )?;
 
@@ -245,7 +233,6 @@ impl<'a> DependencyTraverser<'a> {
             let streamed = self.stream_full_tables_parallel(
                 tables_to_stream,
                 compression,
-                &mut checkpoint,
                 writer,
                 parallel as usize,
                 mysql_url,
@@ -273,7 +260,6 @@ impl<'a> DependencyTraverser<'a> {
         columns: &[ColumnDef],
         anonymization: Vec<jibs_protocol::AnonymizeRule>,
         compression: CompressionMode,
-        checkpoint: &mut Checkpoint,
         writer: &mut W,
     ) -> Result<u64> {
         let column_names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
@@ -322,7 +308,6 @@ impl<'a> DependencyTraverser<'a> {
                     &mut tsv_writer,
                     chunk_row_count,
                     compression,
-                    checkpoint,
                     writer,
                     &self.metrics,
                 )?;
@@ -337,7 +322,6 @@ impl<'a> DependencyTraverser<'a> {
                 &mut tsv_writer,
                 chunk_row_count,
                 compression,
-                checkpoint,
                 writer,
                 &self.metrics,
             )?;
@@ -355,7 +339,6 @@ impl<'a> DependencyTraverser<'a> {
         &self,
         tables: Vec<TableTask>,
         compression: CompressionMode,
-        checkpoint: &mut Checkpoint,
         writer: &mut W,
         num_workers: usize,
         mysql_url: &str,
@@ -371,9 +354,6 @@ impl<'a> DependencyTraverser<'a> {
         // Bounded channel: workers send messages, main thread writes them
         let (tx, rx) = mpsc::sync_channel::<ServerMessage>(num_workers * 4);
 
-        // Shared checkpoint for workers to update bytes/rows counters
-        let shared_checkpoint = Arc::new(Mutex::new(checkpoint.clone()));
-
         // Clone data workers need
         let fakers = self.plan.fakers.clone();
         let mysql_url = mysql_url.to_string();
@@ -385,7 +365,6 @@ impl<'a> DependencyTraverser<'a> {
             let tx = tx.clone();
             let fakers = fakers.clone();
             let mysql_url = mysql_url.clone();
-            let shared_checkpoint = Arc::clone(&shared_checkpoint);
             let metrics = Arc::clone(&metrics);
 
             let handle = std::thread::spawn(move || -> Result<()> {
@@ -399,7 +378,6 @@ impl<'a> DependencyTraverser<'a> {
                         task.anonymization,
                         compression,
                         &fakers,
-                        &shared_checkpoint,
                         &tx,
                         &metrics,
                     );
@@ -459,15 +437,6 @@ impl<'a> DependencyTraverser<'a> {
             return Err(e);
         }
 
-        // Update checkpoint from shared state
-        let final_checkpoint = shared_checkpoint.lock().unwrap();
-        checkpoint.bytes_transferred = final_checkpoint.bytes_transferred;
-        checkpoint.rows_transferred = final_checkpoint.rows_transferred;
-        // Merge completed tables
-        for table in &final_checkpoint.completed_tables {
-            checkpoint.completed_tables.insert(table.clone());
-        }
-
         Ok(streamed_tables)
     }
 
@@ -484,7 +453,6 @@ impl<'a> DependencyTraverser<'a> {
     fn stream_aggregate_tables<W: Write>(
         &mut self,
         compression: CompressionMode,
-        checkpoint: &mut Checkpoint,
         writer: &mut W,
     ) -> Result<HashSet<String>> {
         // Track visited rows per table (only PKs, not full rows)
@@ -686,7 +654,6 @@ impl<'a> DependencyTraverser<'a> {
                             &mut tsv_writer,
                             chunk_row_count,
                             compression,
-                            checkpoint,
                             writer,
                             &self.metrics,
                         )?;
@@ -713,7 +680,6 @@ impl<'a> DependencyTraverser<'a> {
                     &mut tsv_writer,
                     chunk_row_count,
                     compression,
-                    checkpoint,
                     writer,
                     &self.metrics,
                 )?;
@@ -940,7 +906,6 @@ impl<'a> DependencyTraverser<'a> {
                                         &mut tsv_writer,
                                         chunk_row_count,
                                         compression,
-                                        checkpoint,
                                         writer,
                                         &self.metrics,
                                     )?;
@@ -968,7 +933,6 @@ impl<'a> DependencyTraverser<'a> {
                             &mut tsv_writer,
                             chunk_row_count,
                             compression,
-                            checkpoint,
                             writer,
                             &self.metrics,
                         )?;
@@ -1170,7 +1134,6 @@ fn stream_full_table_to_channel(
     anonymization: Vec<AnonymizeRule>,
     compression: CompressionMode,
     fakers: &HashMap<String, Vec<String>>,
-    shared_checkpoint: &Arc<Mutex<Checkpoint>>,
     tx: &mpsc::SyncSender<ServerMessage>,
     metrics: &Arc<MetricsCollector>,
 ) -> Result<()> {
@@ -1184,9 +1147,7 @@ fn stream_full_table_to_channel(
         table: table.to_string(),
         columns: columns.to_vec(),
     })
-    .map_err(|_| {
-        crate::error::ServerError::Protocol("Channel closed".to_string())
-    })?;
+    .map_err(|_| crate::error::ServerError::Protocol("Channel closed".to_string()))?;
 
     let query = format!("SELECT * FROM `{}`", table);
 
@@ -1220,14 +1181,6 @@ fn stream_full_table_to_channel(
             metrics.add_bytes_sent(bytes);
             metrics.add_rows_sent(chunk_row_count as u64);
 
-            // Update shared checkpoint
-            {
-                let mut cp = shared_checkpoint.lock().unwrap();
-                cp.bytes_transferred += bytes;
-                cp.rows_transferred += chunk_row_count as u64;
-            }
-
-            let checkpoint = shared_checkpoint.lock().unwrap().clone();
             let compress_start = Instant::now();
             let compressed = maybe_compress(tsv_data, compression);
             metrics.add_compress_time(compress_start.elapsed());
@@ -1235,11 +1188,9 @@ fn stream_full_table_to_channel(
                 table: table.to_string(),
                 row_count: chunk_row_count,
                 tsv_data: compressed,
-                checkpoint,
             };
-            tx.send(msg).map_err(|_| {
-                crate::error::ServerError::Protocol("Channel closed".to_string())
-            })?;
+            tx.send(msg)
+                .map_err(|_| crate::error::ServerError::Protocol("Channel closed".to_string()))?;
             chunk_row_count = 0;
         }
     }
@@ -1253,13 +1204,6 @@ fn stream_full_table_to_channel(
         metrics.add_bytes_sent(bytes);
         metrics.add_rows_sent(chunk_row_count as u64);
 
-        {
-            let mut cp = shared_checkpoint.lock().unwrap();
-            cp.bytes_transferred += bytes;
-            cp.rows_transferred += chunk_row_count as u64;
-        }
-
-        let checkpoint = shared_checkpoint.lock().unwrap().clone();
         let compress_start = Instant::now();
         let compressed = maybe_compress(tsv_data, compression);
         metrics.add_compress_time(compress_start.elapsed());
@@ -1267,11 +1211,9 @@ fn stream_full_table_to_channel(
             table: table.to_string(),
             row_count: chunk_row_count,
             tsv_data: compressed,
-            checkpoint,
         };
-        tx.send(msg).map_err(|_| {
-            crate::error::ServerError::Protocol("Channel closed".to_string())
-        })?;
+        tx.send(msg)
+            .map_err(|_| crate::error::ServerError::Protocol("Channel closed".to_string()))?;
     }
 
     // Send TableDone (always, even for empty tables so the client marks them complete)
@@ -1279,9 +1221,7 @@ fn stream_full_table_to_channel(
         table: table.to_string(),
         row_count: total_rows,
     })
-    .map_err(|_| {
-        crate::error::ServerError::Protocol("Channel closed".to_string())
-    })?;
+    .map_err(|_| crate::error::ServerError::Protocol("Channel closed".to_string()))?;
 
     Ok(())
 }
