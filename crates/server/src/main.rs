@@ -204,10 +204,10 @@ fn run() -> Result<()> {
     let msg: ClientMessage = read_message(&mut reader)?;
 
     match msg {
-        ClientMessage::Start { resume_from } => {
+        ClientMessage::Start => {
             let mut traverser = DependencyTraverser::new(&mut conn, &plan, collect_metrics)?;
 
-            let table_dispositions = match traverser.stream_all_tables(resume_from, compression, &mut writer, parallel, &mysql_url) {
+            let table_dispositions = match traverser.stream_all_tables(compression, &mut writer, parallel, &mysql_url) {
                 Ok(dispositions) => dispositions,
                 Err(e) => {
                     let error_msg = ServerMessage::Error {
@@ -239,7 +239,7 @@ fn run() -> Result<()> {
     loop {
         match read_message(&mut reader)? {
             ClientMessage::Shutdown => break,
-            ClientMessage::Ack { .. } => continue,
+            ClientMessage::Ack => continue,
             _ => {
                 return Err(ServerError::Protocol(
                     "Expected Ack or Shutdown".to_string(),

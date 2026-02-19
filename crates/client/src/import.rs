@@ -755,8 +755,7 @@ async fn run_protocol_inner(
 
     // Send Start message
     debug!("Starting data transfer");
-    let start_msg = ClientMessage::Start { resume_from: None };
-    send_message(&mut server, &start_msg).await?;
+    send_message(&mut server, &ClientMessage::Start).await?;
 
     // Track tables with preserved backups
     let mut tables_with_preserves: Vec<String> = Vec::new();
@@ -849,14 +848,12 @@ async fn run_protocol_inner(
                 table,
                 row_count,
                 tsv_data,
-                checkpoint,
             } => {
                 // Skip data for already-completed tables
                 if skipped_tables.contains(&table) {
                     debug!("Skipping data chunk for {} (already completed)", table);
                     // Still need to send ack
-                    let ack_msg = ClientMessage::Ack { checkpoint };
-                    send_message_writer(&mut writer, &ack_msg).await?;
+                    send_message_writer(&mut writer, &ClientMessage::Ack).await?;
                     continue;
                 }
 
@@ -943,8 +940,7 @@ async fn run_protocol_inner(
                 progress.update_table(&table, row_count, 0);
 
                 // Send ack
-                let ack_msg = ClientMessage::Ack { checkpoint };
-                send_message_writer(&mut writer, &ack_msg).await?;
+                send_message_writer(&mut writer, &ClientMessage::Ack).await?;
             }
 
             ServerMessage::TableDone { table, row_count } => {
@@ -1054,7 +1050,6 @@ async fn run_protocol_inner(
                             TableDisposition::Full => "full",
                             TableDisposition::Empty => "full, 0 rows on remote",
                             TableDisposition::Excluded => "excluded",
-                            TableDisposition::Resumed => "resumed",
                         };
                         format!("  {} ({})", name, label)
                     }).collect();
