@@ -142,6 +142,46 @@ impl<'a> DependencyTraverser<'a> {
         self.metrics.to_server_metrics()
     }
 
+    /// Get forward relations from a table, filtered by valid tables and exclusions
+    fn get_forward_relations(
+        &self,
+        table: &str,
+        all_tables: &HashSet<String>,
+        exclude_tables: &HashSet<String>,
+    ) -> Vec<&'a Relation> {
+        self.relations_by_source
+            .get(table)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| {
+                all_tables.contains(&r.from_table)
+                    && all_tables.contains(&r.to_table)
+                    && !exclude_tables.contains(&r.to_table)
+            })
+            .collect()
+    }
+
+    /// Get backward relations to a table, filtered by valid tables and exclusions
+    fn get_backward_relations(
+        &self,
+        table: &str,
+        all_tables: &HashSet<String>,
+        exclude_tables: &HashSet<String>,
+    ) -> Vec<&'a Relation> {
+        self.relations_by_target
+            .get(table)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| {
+                all_tables.contains(&r.from_table)
+                    && all_tables.contains(&r.to_table)
+                    && !exclude_tables.contains(&r.from_table)
+            })
+            .collect()
+    }
+
     /// Stream all tables, processing one table at a time to avoid loading all rows into memory.
     ///
     /// Logic:
@@ -521,35 +561,15 @@ impl<'a> DependencyTraverser<'a> {
 
             // Prepare FK extraction info for the root table (pre-filtered)
             // When root_only, skip FK extraction entirely — no BFS traversal
-            let forward_relations: Vec<_> = if aggregate.root_only {
+            let forward_relations = if aggregate.root_only {
                 vec![]
             } else {
-                self.relations_by_source
-                    .get(root_table.as_str())
-                    .cloned()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter(|r| {
-                        all_table_names.contains(&r.from_table)
-                            && all_table_names.contains(&r.to_table)
-                            && !exclude_tables.contains(&r.to_table)
-                    })
-                    .collect()
+                self.get_forward_relations(root_table, &all_table_names, &exclude_tables)
             };
-            let backward_relations: Vec<_> = if aggregate.root_only {
+            let backward_relations = if aggregate.root_only {
                 vec![]
             } else {
-                self.relations_by_target
-                    .get(root_table.as_str())
-                    .cloned()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter(|r| {
-                        all_table_names.contains(&r.from_table)
-                            && all_table_names.contains(&r.to_table)
-                            && !exclude_tables.contains(&r.from_table)
-                    })
-                    .collect()
+                self.get_backward_relations(root_table, &all_table_names, &exclude_tables)
             };
 
             let column_names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
@@ -753,30 +773,9 @@ impl<'a> DependencyTraverser<'a> {
                         .unwrap_or_default();
 
                     // Prepare FK extraction info (pre-filtered)
-                    let forward_relations: Vec<_> = self
-                        .relations_by_source
-                        .get(table.as_str())
-                        .cloned()
-                        .unwrap_or_default()
-                        .into_iter()
-                        .filter(|r| {
-                            all_table_names.contains(&r.from_table)
-                                && all_table_names.contains(&r.to_table)
-                                && !exclude_tables.contains(&r.to_table)
-                        })
-                        .collect();
-                    let backward_relations: Vec<_> = if reached_via_backward {
-                        self.relations_by_target
-                            .get(table.as_str())
-                            .cloned()
-                            .unwrap_or_default()
-                            .into_iter()
-                            .filter(|r| {
-                                all_table_names.contains(&r.from_table)
-                                    && all_table_names.contains(&r.to_table)
-                                    && !exclude_tables.contains(&r.from_table)
-                            })
-                            .collect()
+                    let forward_relations = self.get_forward_relations(&table, &all_table_names, &exclude_tables);
+                    let backward_relations = if reached_via_backward {
+                        self.get_backward_relations(&table, &all_table_names, &exclude_tables)
                     } else {
                         vec![]
                     };

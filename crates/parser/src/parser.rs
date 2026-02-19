@@ -346,18 +346,26 @@ where
 
     let root_only_clause = just(Token::RootOnly).to(true);
 
+    // Combine all clauses inside the braces
+    let body = root_clause
+        .then(where_clause.or_not())
+        .then(order_by_clause.or_not())
+        .then(limit_clause.or_not())
+        .then(exclude_clause.or_not())
+        .then(root_only_clause.or_not())
+        .delimited_by(just(Token::LBrace), just(Token::RBrace));
+
     just(Token::Aggregate)
         .ignore_then(ident())
-        .then(
-            root_clause
-                .then(where_clause.or_not())
-                .then(order_by_clause.or_not())
-                .then(limit_clause.or_not())
-                .then(exclude_clause.or_not())
-                .then(root_only_clause.or_not())
-                .delimited_by(just(Token::LBrace), just(Token::RBrace))
-        )
-        .map(|(name, (((((root, where_clause), order_by), limit), exclude_tables), root_only))| {
+        .then(body)
+        .map(|(name, clauses)| {
+            // Unpack nested tuples step by step for readability
+            let (rest, root_only) = clauses;
+            let (rest, exclude_tables) = rest;
+            let (rest, limit) = rest;
+            let (rest, order_by) = rest;
+            let (root, where_clause) = rest;
+
             StatementKind::Aggregate(AggregateBlock {
                 name,
                 root,

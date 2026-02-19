@@ -284,6 +284,82 @@ fn load_tsv_data_with_conn(
 // Import Configuration and Main Entry Point
 // ============================================================================
 
+/// Protocol-specific configuration passed to run_protocol
+struct ProtocolConfig {
+    compression: CompressionMode,
+    is_resume: bool,
+    max_message_size: usize,
+    fail_after_tables: Option<usize>,
+    parallel: u32,
+    collect_metrics: bool,
+}
+
+// ============================================================================
+// Pending Load Helpers - manage parallel loader pool results
+// ============================================================================
+
+type PendingLoad = (String, std::sync::mpsc::Receiver<Result<u64>>);
+
+/// Drain completed loads without blocking, returns remaining pending loads
+fn drain_completed_loads(
+    pending_loads: Vec<PendingLoad>,
+    rows_imported: &mut u64,
+) -> Result<Vec<PendingLoad>> {
+    let mut still_pending = Vec::new();
+    for (table, rx) in pending_loads {
+        match rx.try_recv() {
+            Ok(Ok(loaded)) => *rows_imported += loaded,
+            Ok(Err(e)) => return Err(anyhow::anyhow!("Loader error for {}: {}", table, e)),
+            Err(std::sync::mpsc::TryRecvError::Empty) => still_pending.push((table, rx)),
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                return Err(anyhow::anyhow!("Loader worker died for {}", table))
+            }
+        }
+    }
+    Ok(still_pending)
+}
+
+/// Wait for a specific load to complete (blocking)
+fn wait_for_load(table: &str, rx: &std::sync::mpsc::Receiver<Result<u64>>) -> Result<u64> {
+    match rx.recv() {
+        Ok(Ok(loaded)) => Ok(loaded),
+        Ok(Err(e)) => Err(anyhow::anyhow!("Loader error for {}: {}", table, e)),
+        Err(_) => Err(anyhow::anyhow!("Loader worker died for {}", table)),
+    }
+}
+
+/// Wait for all loads for a specific table, drain others non-blocking
+fn wait_for_table_loads(
+    pending_loads: Vec<PendingLoad>,
+    target_table: &str,
+    rows_imported: &mut u64,
+) -> Result<Vec<PendingLoad>> {
+    let mut still_pending = Vec::new();
+    for (table, rx) in pending_loads {
+        if table == target_table {
+            *rows_imported += wait_for_load(&table, &rx)?;
+        } else {
+            match rx.try_recv() {
+                Ok(Ok(loaded)) => *rows_imported += loaded,
+                Ok(Err(e)) => return Err(anyhow::anyhow!("Loader error for {}: {}", table, e)),
+                Err(std::sync::mpsc::TryRecvError::Empty) => still_pending.push((table, rx)),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    return Err(anyhow::anyhow!("Loader worker died for {}", table))
+                }
+            }
+        }
+    }
+    Ok(still_pending)
+}
+
+/// Wait for all remaining pending loads to complete (blocking)
+fn wait_for_all_loads(pending_loads: Vec<PendingLoad>, rows_imported: &mut u64) -> Result<()> {
+    for (table, rx) in pending_loads {
+        *rows_imported += wait_for_load(&table, &rx)?;
+    }
+    Ok(())
+}
+
 /// Configuration for an import operation
 pub struct ImportConfig {
     /// Path to the .jibs configuration file (None = import all tables)
@@ -404,7 +480,7 @@ pub async fn run_import(config: ImportConfig) -> Result<()> {
 
     // Check for existing state from a previous interrupted import
     let existing_backups = find_backup_tables(&mut local_conn)?;
-    let has_checkpoint = checkpoint_exists(&mut local_conn)?;
+    let has_checkpoint = Checkpoint::exists(&mut local_conn)?;
     let has_previous_state = !existing_backups.is_empty() || has_checkpoint;
 
     if has_previous_state {
@@ -415,7 +491,7 @@ pub async fn run_import(config: ImportConfig) -> Result<()> {
                 local_conn.query_drop(format!("DROP TABLE `{}`", backup_table))?;
                 info!("  Dropped {}", backup_table);
             }
-            cleanup_checkpoint(&mut local_conn)?;
+            Checkpoint::cleanup(&mut local_conn)?;
             if has_checkpoint {
                 info!("  Dropped checkpoint table");
             }
@@ -426,7 +502,7 @@ pub async fn run_import(config: ImportConfig) -> Result<()> {
                 state_parts.push(format!("backup tables: {}", existing_backups.join(", ")));
             }
             if has_checkpoint {
-                let completed = get_completed_tables(&mut local_conn)?;
+                let completed = Checkpoint::get_completed(&mut local_conn)?;
                 state_parts.push(format!("checkpoint ({} tables completed)", completed.len()));
             }
             return Err(anyhow::anyhow!(
@@ -436,7 +512,7 @@ pub async fn run_import(config: ImportConfig) -> Result<()> {
                 state_parts.join("\n  ")
             ));
         } else {
-            let completed = get_completed_tables(&mut local_conn)?;
+            let completed = Checkpoint::get_completed(&mut local_conn)?;
             info!(
                 "Resuming import: {} tables already completed, {} backup tables",
                 completed.len(),
@@ -470,22 +546,18 @@ pub async fn run_import(config: ImportConfig) -> Result<()> {
     send_message(&mut server, &creds_msg).await?;
 
     // Run the import protocol (takes ownership of server for split)
-    let result = run_protocol(
-        server,
-        &mut local_conn,
-        loader_pool,
-        plan,
-        config.compression,
-        config.resume,
-        config.max_message_size,
+    let protocol_config = ProtocolConfig {
+        compression: config.compression,
+        is_resume: config.resume,
+        max_message_size: config.max_message_size,
         #[cfg(feature = "test-utils")]
-        config.fail_after_tables,
+        fail_after_tables: config.fail_after_tables,
         #[cfg(not(feature = "test-utils"))]
-        None,
-        config.parallel as u32,
-        config.collect_metrics,
-    )
-    .await;
+        fail_after_tables: None,
+        parallel: config.parallel as u32,
+        collect_metrics: config.collect_metrics,
+    };
+    let result = run_protocol(server, &mut local_conn, loader_pool, plan, protocol_config).await;
 
     // Re-enable checks
     local_conn.query_drop("SET FOREIGN_KEY_CHECKS = 1")?;
@@ -598,54 +670,63 @@ fn find_backup_tables(conn: &mut Conn) -> Result<Vec<String>> {
     Ok(tables)
 }
 
-/// Check if checkpoint table exists
-fn checkpoint_exists(conn: &mut Conn) -> Result<bool> {
-    let exists: Option<String> = conn.query_first(format!(
-        "SELECT TABLE_NAME FROM information_schema.TABLES \
-         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = '{}'",
-        CHECKPOINT_TABLE
-    ))?;
-    Ok(exists.is_some())
-}
+// ============================================================================
+// Checkpoint - tracks import progress for resume functionality
+// ============================================================================
 
-/// Create the checkpoint table
-fn create_checkpoint_table(conn: &mut Conn) -> Result<()> {
-    conn.query_drop(format!(
-        "CREATE TABLE IF NOT EXISTS `{}` (
-            table_name VARCHAR(255) PRIMARY KEY,
-            row_count BIGINT UNSIGNED NOT NULL,
-            completed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )",
-        CHECKPOINT_TABLE
-    ))?;
-    Ok(())
-}
+/// Checkpoint manager for tracking import progress
+struct Checkpoint;
 
-/// Get set of completed tables from checkpoint
-fn get_completed_tables(conn: &mut Conn) -> Result<std::collections::HashSet<String>> {
-    if !checkpoint_exists(conn)? {
-        return Ok(std::collections::HashSet::new());
+impl Checkpoint {
+    /// Check if checkpoint table exists
+    fn exists(conn: &mut Conn) -> Result<bool> {
+        let exists: Option<String> = conn.query_first(format!(
+            "SELECT TABLE_NAME FROM information_schema.TABLES \
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = '{}'",
+            CHECKPOINT_TABLE
+        ))?;
+        Ok(exists.is_some())
     }
-    let tables: Vec<String> = conn.query_map(
-        format!("SELECT table_name FROM `{}`", CHECKPOINT_TABLE),
-        |name: String| name,
-    )?;
-    Ok(tables.into_iter().collect())
-}
 
-/// Mark a table as complete in the checkpoint
-fn mark_table_complete(conn: &mut Conn, table: &str, row_count: u64) -> Result<()> {
-    conn.query_drop(format!(
-        "INSERT INTO `{}` (table_name, row_count) VALUES ('{}', {})",
-        CHECKPOINT_TABLE, table, row_count
-    ))?;
-    Ok(())
-}
+    /// Create the checkpoint table
+    fn create(conn: &mut Conn) -> Result<()> {
+        conn.query_drop(format!(
+            "CREATE TABLE IF NOT EXISTS `{}` (
+                table_name VARCHAR(255) PRIMARY KEY,
+                row_count BIGINT UNSIGNED NOT NULL,
+                completed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )",
+            CHECKPOINT_TABLE
+        ))?;
+        Ok(())
+    }
 
-/// Clean up the checkpoint table
-fn cleanup_checkpoint(conn: &mut Conn) -> Result<()> {
-    conn.query_drop(format!("DROP TABLE IF EXISTS `{}`", CHECKPOINT_TABLE))?;
-    Ok(())
+    /// Get set of completed tables from checkpoint
+    fn get_completed(conn: &mut Conn) -> Result<std::collections::HashSet<String>> {
+        if !Self::exists(conn)? {
+            return Ok(std::collections::HashSet::new());
+        }
+        let tables: Vec<String> = conn.query_map(
+            format!("SELECT table_name FROM `{}`", CHECKPOINT_TABLE),
+            |name: String| name,
+        )?;
+        Ok(tables.into_iter().collect())
+    }
+
+    /// Mark a table as complete in the checkpoint
+    fn mark_complete(conn: &mut Conn, table: &str, row_count: u64) -> Result<()> {
+        conn.query_drop(format!(
+            "INSERT INTO `{}` (table_name, row_count) VALUES ('{}', {})",
+            CHECKPOINT_TABLE, table, row_count
+        ))?;
+        Ok(())
+    }
+
+    /// Clean up the checkpoint table
+    fn cleanup(conn: &mut Conn) -> Result<()> {
+        conn.query_drop(format!("DROP TABLE IF EXISTS `{}`", CHECKPOINT_TABLE))?;
+        Ok(())
+    }
 }
 
 /// Run the import protocol with the remote server
@@ -654,28 +735,10 @@ async fn run_protocol(
     local_conn: &mut Conn,
     loader_pool: Option<LoaderPool>,
     plan: ExecutionPlan,
-    compression: CompressionMode,
-    is_resume: bool,
-    max_message_size: usize,
-    fail_after_tables: Option<usize>,
-    parallel: u32,
-    collect_metrics: bool,
+    config: ProtocolConfig,
 ) -> std::result::Result<(ImportStats, ClientMetrics, Option<LoaderPool>), (anyhow::Error, Option<LoaderPool>)> {
     // Wrap the inner logic to handle errors while preserving the loader pool
-    match run_protocol_inner(
-        server,
-        local_conn,
-        &loader_pool,
-        plan,
-        compression,
-        is_resume,
-        max_message_size,
-        fail_after_tables,
-        parallel,
-        collect_metrics,
-    )
-    .await
-    {
+    match run_protocol_inner(server, local_conn, &loader_pool, plan, &config).await {
         Ok((stats, client_metrics)) => Ok((stats, client_metrics, loader_pool)),
         Err(e) => Err((e, loader_pool)),
     }
@@ -687,12 +750,7 @@ async fn run_protocol_inner(
     local_conn: &mut Conn,
     loader_pool: &Option<LoaderPool>,
     plan: ExecutionPlan,
-    compression: CompressionMode,
-    is_resume: bool,
-    max_message_size: usize,
-    fail_after_tables: Option<usize>,
-    parallel: u32,
-    collect_metrics: bool,
+    config: &ProtocolConfig,
 ) -> Result<(ImportStats, ClientMetrics)> {
     let mut stats = ImportStats {
         tables_imported: 0,
@@ -703,14 +761,14 @@ async fn run_protocol_inner(
     };
 
     let mut client_metrics = ClientMetrics::new();
-    if collect_metrics {
+    if config.collect_metrics {
         client_metrics.start();
     }
 
     // Set up checkpointing
-    create_checkpoint_table(local_conn)?;
-    let completed_tables = if is_resume {
-        get_completed_tables(local_conn)?
+    Checkpoint::create(local_conn)?;
+    let completed_tables = if config.is_resume {
+        Checkpoint::get_completed(local_conn)?
     } else {
         std::collections::HashSet::new()
     };
@@ -719,14 +777,14 @@ async fn run_protocol_inner(
     debug!("Sending execution plan to server");
     let init_msg = ClientMessage::Init {
         plan: plan.clone(),
-        compression,
-        parallel,
-        collect_metrics,
+        compression: config.compression,
+        parallel: config.parallel,
+        collect_metrics: config.collect_metrics,
     };
     send_message(&mut server, &init_msg).await?;
 
     // Wait for Ready
-    let ready_msg: ServerMessage = recv_message(&mut server, max_message_size).await?;
+    let ready_msg: ServerMessage = recv_message(&mut server, config.max_message_size).await?;
     let (tables, negotiated_compression) = match ready_msg {
         ServerMessage::Ready {
             tables,
@@ -781,6 +839,7 @@ async fn run_protocol_inner(
 
     // Spawn read-ahead task: continuously reads messages from SSH and buffers them.
     // The bounded channel (32 messages) absorbs bursts so the server doesn't stall.
+    let max_message_size = config.max_message_size;
     let (msg_tx, mut msg_rx) = tokio::sync::mpsc::channel::<Result<ServerMessage>>(32);
     tokio::spawn(async move {
         loop {
@@ -804,7 +863,7 @@ async fn run_protocol_inner(
             Some(Err(e)) => return Err(e),
             None => return Err(anyhow::anyhow!("Server connection closed unexpectedly")),
         };
-        if collect_metrics {
+        if config.collect_metrics {
             client_metrics.add_recv_time(recv_start.elapsed());
         }
 
@@ -857,7 +916,7 @@ async fn run_protocol_inner(
                     continue;
                 }
 
-                if collect_metrics {
+                if config.collect_metrics {
                     client_metrics.add_compressed_bytes(tsv_data.len() as u64);
                     // Read uncompressed size from zstd header (first 4 bytes)
                     if matches!(negotiated_compression, CompressionMode::Zstd) && tsv_data.len() >= 4 {
@@ -882,38 +941,13 @@ async fn run_protocol_inner(
                     pending_loads.push((table.clone(), result_rx));
 
                     // If we have too many pending chunks, drain some to bound memory
-                    // Use try_recv to collect completed loads without blocking
                     if pending_loads.len() > MAX_PENDING_CHUNKS {
-                        let mut still_pending = Vec::new();
-                        for (tbl, rx) in pending_loads.drain(..) {
-                            match rx.try_recv() {
-                                Ok(Ok(loaded)) => stats.rows_imported += loaded,
-                                Ok(Err(e)) => {
-                                    return Err(anyhow::anyhow!("Loader error for {}: {}", tbl, e));
-                                }
-                                Err(std::sync::mpsc::TryRecvError::Empty) => {
-                                    // Still pending, keep it
-                                    still_pending.push((tbl, rx));
-                                }
-                                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                                    return Err(anyhow::anyhow!("Loader worker died for {}", tbl));
-                                }
-                            }
-                        }
-                        pending_loads = still_pending;
+                        pending_loads = drain_completed_loads(pending_loads, &mut stats.rows_imported)?;
 
                         // If still too many, block on the oldest one
                         if pending_loads.len() > MAX_PENDING_CHUNKS {
                             if let Some((tbl, rx)) = pending_loads.first() {
-                                match rx.recv() {
-                                    Ok(Ok(loaded)) => stats.rows_imported += loaded,
-                                    Ok(Err(e)) => {
-                                        return Err(anyhow::anyhow!("Loader error for {}: {}", tbl, e));
-                                    }
-                                    Err(_) => {
-                                        return Err(anyhow::anyhow!("Loader worker died for {}", tbl));
-                                    }
-                                }
+                                stats.rows_imported += wait_for_load(tbl, rx)?;
                             }
                             pending_loads.remove(0);
                         }
@@ -922,14 +956,14 @@ async fn run_protocol_inner(
                     // Sequential mode: decompress + load on main thread
                     let decompress_start = Instant::now();
                     let decompressed = maybe_decompress(tsv_data, negotiated_compression)?;
-                    if collect_metrics {
+                    if config.collect_metrics {
                         client_metrics.add_decompress_time(decompress_start.elapsed());
                         client_metrics.add_uncompressed_bytes(decompressed.len() as u64);
                     }
 
                     let load_start = Instant::now();
                     let loaded = load_tsv_data(local_conn, &table, &schema, &decompressed)?;
-                    if collect_metrics {
+                    if config.collect_metrics {
                         client_metrics.add_load_time(load_start.elapsed());
                         client_metrics.add_rows_loaded(loaded);
                     }
@@ -958,38 +992,12 @@ async fn run_protocol_inner(
                 // Strategy:
                 // 1. Wait (blocking) for all pending loads for THIS table
                 // 2. Non-blocking drain of loads for OTHER tables (keep parallelism)
-                {
-                    let mut still_pending = Vec::new();
-                    for (tbl, rx) in pending_loads.drain(..) {
-                        if tbl == table {
-                            // This table's chunk - must wait for it
-                            match rx.recv() {
-                                Ok(Ok(loaded)) => stats.rows_imported += loaded,
-                                Ok(Err(e)) => {
-                                    return Err(anyhow::anyhow!("Loader error for {}: {}", tbl, e));
-                                }
-                                Err(_) => {
-                                    return Err(anyhow::anyhow!("Loader worker died for {}", tbl));
-                                }
-                            }
-                        } else {
-                            // Other table's chunk - try non-blocking
-                            match rx.try_recv() {
-                                Ok(Ok(loaded)) => stats.rows_imported += loaded,
-                                Ok(Err(e)) => {
-                                    return Err(anyhow::anyhow!("Loader error for {}: {}", tbl, e));
-                                }
-                                Err(std::sync::mpsc::TryRecvError::Empty) => {
-                                    still_pending.push((tbl, rx));
-                                }
-                                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                                    return Err(anyhow::anyhow!("Loader worker died for {}", tbl));
-                                }
-                            }
-                        }
-                    }
-                    pending_loads = still_pending;
-                }
+                // Wait for all pending loads for THIS table, drain others non-blocking
+                pending_loads = wait_for_table_loads(
+                    pending_loads,
+                    &table,
+                    &mut stats.rows_imported,
+                )?;
 
                 progress.finish_table(&table, row_count);
                 stats.tables_imported += 1;
@@ -1000,10 +1008,10 @@ async fn run_protocol_inner(
 
                 // Mark table as complete in checkpoint
                 // Safe to do now - all chunks for this table have been loaded
-                mark_table_complete(local_conn, &table, row_count)?;
+                Checkpoint::mark_complete(local_conn, &table, row_count)?;
 
                 // Debug: simulate crash for testing resume
-                if let Some(fail_after) = fail_after_tables {
+                if let Some(fail_after) = config.fail_after_tables {
                     if stats.tables_imported >= fail_after {
                         return Err(anyhow::anyhow!(
                             "[DEBUG] Simulated crash after {} tables (--fail-after-tables)",
@@ -1020,17 +1028,8 @@ async fn run_protocol_inner(
                         "Waiting for {} remaining pending loads before Done",
                         pending_loads.len()
                     );
-                    for (tbl, rx) in pending_loads.drain(..) {
-                        match rx.recv() {
-                            Ok(Ok(loaded)) => stats.rows_imported += loaded,
-                            Ok(Err(e)) => {
-                                return Err(anyhow::anyhow!("Loader error for {}: {}", tbl, e));
-                            }
-                            Err(_) => {
-                                return Err(anyhow::anyhow!("Loader worker died for {}", tbl));
-                            }
-                        }
-                    }
+                    wait_for_all_loads(pending_loads, &mut stats.rows_imported)?;
+                    // pending_loads is moved, no need to clear
                 }
 
                 // Store server metrics
@@ -1104,13 +1103,13 @@ async fn run_protocol_inner(
     }
 
     // Clean up checkpoint table on successful completion
-    cleanup_checkpoint(local_conn)?;
+    Checkpoint::cleanup(local_conn)?;
 
     // Send shutdown
     send_message_writer(&mut writer, &ClientMessage::Shutdown).await?;
 
     // Stop client metrics timing
-    if collect_metrics {
+    if config.collect_metrics {
         client_metrics.stop();
     }
 
@@ -1129,12 +1128,32 @@ async fn send_message(server: &mut RemoteProcess, msg: &ClientMessage) -> Result
     Ok(())
 }
 
+/// Validate message length and return error if too large
+fn validate_message_length(len: usize, max_size: usize) -> Result<()> {
+    if len > max_size {
+        return Err(anyhow::anyhow!(
+            "Message too large: {} bytes (max: {} bytes, ~{}MB). \
+             Consider using --max-message-size to increase the limit.",
+            len,
+            max_size,
+            max_size / (1024 * 1024)
+        ));
+    }
+    Ok(())
+}
+
+/// Decode a server message from a buffer
+fn decode_server_message(buffer: &[u8]) -> Result<ServerMessage> {
+    let (msg, _) = bincode::decode_from_slice(buffer, jibs_protocol::framing::bincode_config())
+        .map_err(|e| anyhow::anyhow!("Failed to decode message: {}", e))?;
+    Ok(msg)
+}
+
 /// Receive a message from the server (uses unsplit RemoteProcess for pre-protocol exchange)
 async fn recv_message(
     server: &mut RemoteProcess,
     max_message_size: usize,
 ) -> Result<ServerMessage> {
-    // Read length prefix
     let mut len_bytes = [0u8; 4];
     server
         .read_exact(&mut len_bytes)
@@ -1142,28 +1161,15 @@ async fn recv_message(
         .map_err(|e| anyhow::anyhow!("Failed to read message length: {}", e))?;
     let len = u32::from_le_bytes(len_bytes) as usize;
 
-    if len > max_message_size {
-        return Err(anyhow::anyhow!(
-            "Message too large: {} bytes (max: {} bytes, ~{}MB). \
-             Consider using --max-message-size to increase the limit.",
-            len,
-            max_message_size,
-            max_message_size / (1024 * 1024)
-        ));
-    }
+    validate_message_length(len, max_message_size)?;
 
-    // Read message body
     let mut buffer = vec![0u8; len];
     server
         .read_exact(&mut buffer)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to read message body: {}", e))?;
 
-    // Decode
-    let (msg, _) = bincode::decode_from_slice(&buffer, jibs_protocol::framing::bincode_config())
-        .map_err(|e| anyhow::anyhow!("Failed to decode message: {}", e))?;
-
-    Ok(msg)
+    decode_server_message(&buffer)
 }
 
 /// Receive a message from a ProcessReader (split read half)
@@ -1178,15 +1184,7 @@ async fn recv_message_from_reader(
         .map_err(|e| anyhow::anyhow!("Failed to read message length: {}", e))?;
     let len = u32::from_le_bytes(len_bytes) as usize;
 
-    if len > max_message_size {
-        return Err(anyhow::anyhow!(
-            "Message too large: {} bytes (max: {} bytes, ~{}MB). \
-             Consider using --max-message-size to increase the limit.",
-            len,
-            max_message_size,
-            max_message_size / (1024 * 1024)
-        ));
-    }
+    validate_message_length(len, max_message_size)?;
 
     let mut buffer = vec![0u8; len];
     reader
@@ -1194,10 +1192,7 @@ async fn recv_message_from_reader(
         .await
         .map_err(|e| anyhow::anyhow!("Failed to read message body: {}", e))?;
 
-    let (msg, _) = bincode::decode_from_slice(&buffer, jibs_protocol::framing::bincode_config())
-        .map_err(|e| anyhow::anyhow!("Failed to decode message: {}", e))?;
-
-    Ok(msg)
+    decode_server_message(&buffer)
 }
 
 /// Send a message using a ProcessWriter (split write half)
