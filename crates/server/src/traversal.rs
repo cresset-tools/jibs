@@ -220,6 +220,24 @@ impl<'a> DependencyTraverser<'a> {
                 continue;
             }
             if self.plan.excluded_tables.contains(&table) {
+                // Send schema so the client creates the empty table
+                let columns = self.conn.get_column_defs(&table)?;
+                let write_start = Instant::now();
+                write_message(
+                    writer,
+                    &ServerMessage::Schema {
+                        table: table.clone(),
+                        columns,
+                    },
+                )?;
+                write_message(
+                    writer,
+                    &ServerMessage::TableDone {
+                        table: table.clone(),
+                        row_count: 0,
+                    },
+                )?;
+                self.metrics.add_write_time(write_start.elapsed());
                 dispositions.push((table, TableDisposition::Excluded));
                 continue;
             }
