@@ -108,93 +108,67 @@ pub enum Value {
     Null,
 }
 
+/// Macro to generate array accessor methods for Value
+macro_rules! impl_value_array_accessor {
+    ($method:ident, $variant:ident, $inner:ty) => {
+        pub fn $method(&self) -> Option<&[$inner]> {
+            match self {
+                Value::$variant(arr) => Some(arr),
+                _ => None,
+            }
+        }
+    };
+}
+
+/// Macro to generate scalar accessor methods for Value
+macro_rules! impl_value_scalar_accessor {
+    ($method:ident, $variant:ident, $inner:ty) => {
+        pub fn $method(&self) -> Option<$inner> {
+            match self {
+                Value::$variant(v) => Some(*v),
+                _ => None,
+            }
+        }
+    };
+}
+
 impl Value {
     /// Convert the value to a string representation
     pub fn as_string(&self) -> String {
         match self {
             Value::String(s) => s.clone(),
-            Value::StringArray(arr) => format!("[{}]", arr.join(", ")),
             Value::Int(i) => i.to_string(),
-            Value::IntArray(arr) => {
-                format!(
-                    "[{}]",
-                    arr.iter()
-                        .map(|i| i.to_string())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )
-            }
             Value::Float(f) => f.to_string(),
-            Value::FloatArray(arr) => {
-                format!(
-                    "[{}]",
-                    arr.iter()
-                        .map(|f| f.to_string())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )
-            }
             Value::Bool(b) => b.to_string(),
-            Value::BoolArray(arr) => {
-                format!(
-                    "[{}]",
-                    arr.iter()
-                        .map(|b| b.to_string())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )
-            }
             Value::Null => "NULL".to_string(),
+            // Arrays formatted as [elem1, elem2, ...]
+            Value::StringArray(arr) => format!("[{}]", arr.join(", ")),
+            Value::IntArray(arr) => Self::format_array(arr),
+            Value::FloatArray(arr) => Self::format_array(arr),
+            Value::BoolArray(arr) => Self::format_array(arr),
         }
     }
 
-    /// Try to get the value as an i64
-    pub fn as_int(&self) -> Option<i64> {
-        match self {
-            Value::Int(i) => Some(*i),
-            _ => None,
-        }
+    /// Format an array of displayable items
+    fn format_array<T: std::fmt::Display>(arr: &[T]) -> String {
+        format!(
+            "[{}]",
+            arr.iter()
+                .map(|v| v.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
     }
 
-    /// Try to get the value as a bool
-    pub fn as_bool(&self) -> Option<bool> {
-        match self {
-            Value::Bool(b) => Some(*b),
-            _ => None,
-        }
-    }
+    // Scalar accessors
+    impl_value_scalar_accessor!(as_int, Int, i64);
+    impl_value_scalar_accessor!(as_bool, Bool, bool);
 
-    /// Try to get the value as a string array
-    pub fn as_string_array(&self) -> Option<&[String]> {
-        match self {
-            Value::StringArray(arr) => Some(arr),
-            _ => None,
-        }
-    }
-
-    /// Try to get the value as an int array
-    pub fn as_int_array(&self) -> Option<&[i64]> {
-        match self {
-            Value::IntArray(arr) => Some(arr),
-            _ => None,
-        }
-    }
-
-    /// Try to get the value as a float array
-    pub fn as_float_array(&self) -> Option<&[f64]> {
-        match self {
-            Value::FloatArray(arr) => Some(arr),
-            _ => None,
-        }
-    }
-
-    /// Try to get the value as a bool array
-    pub fn as_bool_array(&self) -> Option<&[bool]> {
-        match self {
-            Value::BoolArray(arr) => Some(arr),
-            _ => None,
-        }
-    }
+    // Array accessors
+    impl_value_array_accessor!(as_string_array, StringArray, String);
+    impl_value_array_accessor!(as_int_array, IntArray, i64);
+    impl_value_array_accessor!(as_float_array, FloatArray, f64);
+    impl_value_array_accessor!(as_bool_array, BoolArray, bool);
 }
 
 /// A relation between two tables
