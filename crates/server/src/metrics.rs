@@ -267,6 +267,35 @@ impl MetricsCollector {
             query_timings: std::mem::take(&mut *self.query_timings.lock().unwrap()),
         })
     }
+
+    /// Lightweight snapshot without per-query timings (for TableDone messages)
+    pub fn snapshot(&self) -> Option<ServerMetrics> {
+        if !self.enabled {
+            return None;
+        }
+
+        Some(ServerMetrics {
+            query_time_ms: self.query_time_ns.load(Ordering::Relaxed) / 1_000_000,
+            iterate_time_ms: self.iterate_time_ns.load(Ordering::Relaxed) / 1_000_000,
+            serialize_time_ms: self.serialize_time_ns.load(Ordering::Relaxed) / 1_000_000,
+            write_time_ms: self.write_time_ns.load(Ordering::Relaxed) / 1_000_000,
+            rows_sent: self.rows_sent.load(Ordering::Relaxed),
+            bytes_sent: self.bytes_sent.load(Ordering::Relaxed),
+            dedup_time_ms: self.dedup_time_ns.load(Ordering::Relaxed) / 1_000_000,
+            aggregate_wall_ms: self.aggregate_wall_ns.load(Ordering::Relaxed) / 1_000_000,
+            full_tables_wall_ms: self.full_tables_wall_ns.load(Ordering::Relaxed) / 1_000_000,
+            aggregate_serialize_ms: self.aggregate_serialize_ns.load(Ordering::Relaxed) / 1_000_000,
+            aggregate_write_ms: self.aggregate_write_ns.load(Ordering::Relaxed) / 1_000_000,
+            compress_time_ms: self.compress_time_ns.load(Ordering::Relaxed) / 1_000_000,
+            aggregate_compress_ms: self.aggregate_compress_ns.load(Ordering::Relaxed) / 1_000_000,
+            schema_cache_time_ms: self.schema_cache_time_ns.load(Ordering::Relaxed) / 1_000_000,
+            message_count: self.message_count.load(Ordering::Relaxed),
+            total_compressed_bytes: self.total_compressed_bytes.load(Ordering::Relaxed),
+            aggregate_interlevel_dedup_ms: self.interlevel_dedup_time_ns.load(Ordering::Relaxed)
+                / 1_000_000,
+            query_timings: Vec::new(),
+        })
+    }
 }
 
 /// RAII timer that records elapsed time when dropped

@@ -15,6 +15,8 @@ mod tsv;
 
 use std::collections::HashSet;
 use std::io::{self, BufReader, BufWriter};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use jibs_protocol::{
     framing::{read_message, write_message},
@@ -100,8 +102,8 @@ fn run() -> Result<()> {
     let stdin = io::stdin();
     let stdout = io::stdout();
 
-    let mut reader = BufReader::new(stdin.lock());
-    let mut writer = BufWriter::with_capacity(256 * 1024, stdout.lock());
+    let mut reader = BufReader::new(stdin);
+    let mut writer = BufWriter::with_capacity(1024 * 1024, stdout.lock());
 
     // Read first message - could be Credentials or Init (backward compatibility)
     let first_msg: ClientMessage = read_message(&mut reader)?;
@@ -205,11 +207,41 @@ fn run() -> Result<()> {
 
     match msg {
         ClientMessage::Start => {
+            // Spawn interrupt listener thread — reads from stdin for Interrupt/Shutdown
+            let interrupt = Arc::new(AtomicBool::new(false));
+            let interrupt_clone = Arc::clone(&interrupt);
+            let listener_handle = std::thread::spawn(move || {
+                loop {
+                    match read_message::<_, ClientMessage>(&mut reader) {
+                        Ok(ClientMessage::Interrupt) | Ok(ClientMessage::Shutdown) => {
+                            interrupt_clone.store(true, Ordering::SeqCst);
+                            break;
+                        }
+                        Ok(_) => continue,
+                        Err(_) => {
+                            // Connection lost — treat as interrupt
+                            interrupt_clone.store(true, Ordering::SeqCst);
+                            break;
+                        }
+                    }
+                }
+            });
+
             let mut traverser = DependencyTraverser::new(&mut conn, &plan, collect_metrics)?;
 
-            let table_dispositions = match traverser.stream_all_tables(compression, &mut writer, parallel, &mysql_url) {
+            let table_dispositions = match traverser.stream_all_tables(compression, &mut writer, parallel, &mysql_url, &interrupt) {
                 Ok(dispositions) => dispositions,
                 Err(e) => {
+                    // On interrupt, still send Done with partial metrics
+                    if interrupt.load(Ordering::SeqCst) {
+                        let metrics = traverser.get_metrics();
+                        let _ = write_message(&mut writer, &ServerMessage::Done {
+                            table_dispositions: Vec::new(),
+                            metrics,
+                        });
+                        let _ = listener_handle.join();
+                        return Ok(());
+                    }
                     let error_msg = ServerMessage::Error {
                         message: e.to_string(),
                         recoverable: e.is_recoverable(),
@@ -224,6 +256,9 @@ fn run() -> Result<()> {
 
             // Send completion message
             write_message(&mut writer, &ServerMessage::Done { table_dispositions, metrics })?;
+
+            // Wait for listener thread (will get Shutdown from client)
+            let _ = listener_handle.join();
         }
         ClientMessage::Shutdown => {
             return Ok(());
@@ -232,19 +267,6 @@ fn run() -> Result<()> {
             return Err(ServerError::Protocol(
                 "Expected Start or Shutdown".to_string(),
             ));
-        }
-    }
-
-    // Wait for shutdown (client may send Acks during streaming)
-    loop {
-        match read_message(&mut reader)? {
-            ClientMessage::Shutdown => break,
-            ClientMessage::Ack => continue,
-            _ => {
-                return Err(ServerError::Protocol(
-                    "Expected Ack or Shutdown".to_string(),
-                ));
-            }
         }
     }
 

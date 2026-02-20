@@ -789,6 +789,19 @@ impl ProcessWriter {
             operation: "write to process stdin".to_string(),
             message: e.to_string(),
         })?;
+        self.writer.flush().await.map_err(|e| ClientError::Ssh {
+            operation: "flush process stdin".to_string(),
+            message: e.to_string(),
+        })?;
+        Ok(())
+    }
+
+    /// Shut down the write half, sending EOF to the remote process stdin
+    pub async fn shutdown(&mut self) -> Result<()> {
+        self.writer.shutdown().await.map_err(|e| ClientError::Ssh {
+            operation: "shutdown process stdin".to_string(),
+            message: e.to_string(),
+        })?;
         Ok(())
     }
 }

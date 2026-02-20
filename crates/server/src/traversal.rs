@@ -747,6 +747,7 @@ fn run_aggregate_bfs(
         tx.send(ServerMessage::TableDone {
             table: table.clone(),
             row_count: *row_count,
+            metrics: None,
         })
         .map_err(|_| ServerError::Protocol("Channel closed".to_string()))?;
     }
@@ -829,6 +830,7 @@ impl<'a> DependencyTraverser<'a> {
         writer: &mut W,
         parallel: u32,
         mysql_url: &str,
+        interrupt: &std::sync::atomic::AtomicBool,
     ) -> Result<Vec<(String, TableDisposition)>> {
         let overall_start = Instant::now();
 
@@ -874,6 +876,7 @@ impl<'a> DependencyTraverser<'a> {
                     &ServerMessage::TableDone {
                         table: table.clone(),
                         row_count: 0,
+                        metrics: None,
                     },
                 )?;
                 self.metrics.add_write_time(write_start.elapsed());
@@ -978,22 +981,44 @@ impl<'a> DependencyTraverser<'a> {
         drop(tx);
 
         // 8. Main thread becomes writer loop
+        let mut interrupted = false;
         let mut streamed_tables: HashSet<String> = HashSet::new();
-        for msg in rx {
-            if let ServerMessage::TableDone {
-                ref table,
-                row_count,
-            } = msg
-            {
+        loop {
+            // Check for client interrupt between messages
+            if interrupt.load(std::sync::atomic::Ordering::Relaxed) {
+                interrupted = true;
+                break;
+            }
+            // Use recv_timeout so we can periodically re-check the interrupt flag
+            // even when worker threads are busy (e.g. running long MySQL queries)
+            let msg = match rx.recv_timeout(std::time::Duration::from_millis(100)) {
+                Ok(msg) => msg,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            };
+            // For TableDone messages, attach a metrics snapshot so the client
+            // has server metrics even if the import is interrupted
+            let msg = if let ServerMessage::TableDone { table, row_count, .. } = msg {
                 if row_count > 0 {
                     streamed_tables.insert(table.clone());
                 }
-            }
+                ServerMessage::TableDone {
+                    table,
+                    row_count,
+                    metrics: self.metrics.snapshot(),
+                }
+            } else {
+                msg
+            };
             let write_start = Instant::now();
             write_message_noflush(writer, &msg)?;
             self.metrics.add_write_time(write_start.elapsed());
         }
         writer.flush()?;
+
+        if interrupted {
+            return Err(ServerError::Protocol("Interrupted by client".to_string()));
+        }
 
         // 9. Join all threads and propagate first error
         let mut first_error: Option<ServerError> = None;
@@ -1308,6 +1333,7 @@ fn stream_full_table_to_channel(
     tx.send(ServerMessage::TableDone {
         table: table.to_string(),
         row_count: total_rows,
+        metrics: None,
     })
     .map_err(|_| crate::error::ServerError::Protocol("Channel closed".to_string()))?;
 
