@@ -122,38 +122,38 @@ impl ClientMetrics {
 
     /// Display metrics summary
     pub fn display(&self, server_metrics: Option<&ServerMetrics>) {
-        println!();
-        println!("=== Performance Metrics ===");
-        println!();
+        eprintln!();
+        eprintln!("=== Performance Metrics ===");
+        eprintln!();
 
         // Server metrics
         if let Some(sm) = server_metrics {
             let server_total_ms = sm.query_time_ms + sm.iterate_time_ms + sm.serialize_time_ms
                 + sm.compress_time_ms + sm.write_time_ms;
-            println!("Server (remote):");
-            println!(
+            eprintln!("Server (remote):");
+            eprintln!(
                 "  Query execution:     {:>8} ({:>3}%)",
                 format_duration_ms(sm.query_time_ms),
                 percent(sm.query_time_ms, server_total_ms)
             );
-            println!(
+            eprintln!(
                 "  Row iteration:       {:>8} ({:>3}%)",
                 format_duration_ms(sm.iterate_time_ms),
                 percent(sm.iterate_time_ms, server_total_ms)
             );
-            println!(
+            eprintln!(
                 "  TSV serialization:   {:>8} ({:>3}%)",
                 format_duration_ms(sm.serialize_time_ms),
                 percent(sm.serialize_time_ms, server_total_ms)
             );
-            println!(
+            eprintln!(
                 "  Compression:         {:>8} ({:>3}%)",
                 format_duration_ms(sm.compress_time_ms),
                 percent(sm.compress_time_ms, server_total_ms)
             );
             let write_pct = percent(sm.write_time_ms, server_total_ms);
             let backpressure_note = if write_pct > 30 { " <- backpressure" } else { "" };
-            println!(
+            eprintln!(
                 "  Stdout write:        {:>8} ({:>3}%){}",
                 format_duration_ms(sm.write_time_ms),
                 write_pct,
@@ -161,19 +161,19 @@ impl ClientMetrics {
             );
             if sm.aggregate_wall_ms > 0 || sm.full_tables_wall_ms > 0 {
                 let total_wall = sm.aggregate_wall_ms + sm.full_tables_wall_ms;
-                println!();
-                println!(
+                eprintln!();
+                eprintln!(
                     "  Phase 1 (aggregates): {:>7} ({:>3}%)",
                     format_duration_ms(sm.aggregate_wall_ms),
                     percent(sm.aggregate_wall_ms, total_wall)
                 );
-                println!(
+                eprintln!(
                     "  Phase 2 (full tables): {:>6} ({:>3}%)",
                     format_duration_ms(sm.full_tables_wall_ms),
                     percent(sm.full_tables_wall_ms, total_wall)
                 );
             }
-            println!();
+            eprintln!();
 
             // Aggregate BFS breakdown
             if !sm.query_timings.is_empty() {
@@ -182,30 +182,30 @@ impl ClientMetrics {
                 let total_rows: u64 = sm.query_timings.iter().map(|t| t.rows).sum();
                 let mysql_total = total_query_ms + total_iterate_ms;
 
-                println!(
+                eprintln!(
                     "Aggregate BFS: {} queries, {} rows fetched",
                     sm.query_timings.len(),
                     format_rows(total_rows),
                 );
-                println!(
+                eprintln!(
                     "  MySQL (query+iterate): {:>6}",
                     format_duration_ms(mysql_total),
                 );
-                println!(
+                eprintln!(
                     "  Dedup + FK extract:    {:>6}",
                     format_duration_ms(sm.dedup_time_ms),
                 );
                 if sm.aggregate_interlevel_dedup_ms > 0 {
-                    println!(
+                    eprintln!(
                         "  Inter-level dedup:     {:>6}",
                         format_duration_ms(sm.aggregate_interlevel_dedup_ms),
                     );
                 }
-                println!(
+                eprintln!(
                     "  TSV serialization:     {:>6}",
                     format_duration_ms(sm.aggregate_serialize_ms),
                 );
-                println!(
+                eprintln!(
                     "  Compression:           {:>6}",
                     format_duration_ms(sm.aggregate_compress_ms),
                 );
@@ -215,14 +215,14 @@ impl ClientMetrics {
                     0
                 };
                 let agg_write_note = if agg_write_pct > 30 { " <- backpressure" } else { "" };
-                println!(
+                eprintln!(
                     "  Stdout write:          {:>6} ({:>3}%){}",
                     format_duration_ms(sm.aggregate_write_ms),
                     agg_write_pct,
                     agg_write_note,
                 );
                 if sm.schema_cache_time_ms > 0 {
-                    println!(
+                    eprintln!(
                         "  Schema pre-cache:      {:>6}",
                         format_duration_ms(sm.schema_cache_time_ms),
                     );
@@ -231,12 +231,12 @@ impl ClientMetrics {
                     + sm.aggregate_serialize_ms
                     + sm.aggregate_write_ms + sm.aggregate_compress_ms + sm.schema_cache_time_ms;
                 if sm.aggregate_wall_ms > accounted {
-                    println!(
+                    eprintln!(
                         "  Overhead:              {:>6}",
                         format_duration_ms(sm.aggregate_wall_ms - accounted),
                     );
                 }
-                println!();
+                eprintln!();
 
                 // Per-table aggregate totals
                 display_per_table_totals(&sm.query_timings);
@@ -249,18 +249,18 @@ impl ClientMetrics {
                     total_b.cmp(&total_a)
                 });
 
-                println!("Slowest aggregate queries:");
+                eprintln!("Slowest aggregate queries:");
                 for t in timings.iter().take(20) {
                     let total_ms = t.query_ms + t.iterate_ms;
                     if t.column.is_empty() {
-                        println!(
+                        eprintln!(
                             "  {:>8}  {} (root query, {} rows)",
                             format_duration_ms(total_ms),
                             t.table,
                             format_rows(t.rows),
                         );
                     } else {
-                        println!(
+                        eprintln!(
                             "  {:>8}  {} WHERE {} IN ({}) -> {} rows",
                             format_duration_ms(total_ms),
                             t.table,
@@ -271,31 +271,31 @@ impl ClientMetrics {
                     }
                 }
                 if timings.len() > 20 {
-                    println!("  ... and {} more queries", timings.len() - 20);
+                    eprintln!("  ... and {} more queries", timings.len() - 20);
                 }
-                println!();
+                eprintln!();
             }
         }
 
         // Client metrics — use wall time as denominator for meaningful percentages
         let wall_ms = self.wall_time.as_millis() as u64;
 
-        println!("Client (local):");
+        eprintln!("Client (local):");
         let recv_pct = percent(self.recv_time.as_millis() as u64, wall_ms);
         let recv_note = if recv_pct > 70 { " <- waiting for server" } else { "" };
-        println!(
+        eprintln!(
             "  Message receive:     {:>8} ({:>3}%){}",
             format_duration(self.recv_time),
             recv_pct,
             recv_note
         );
-        println!(
+        eprintln!(
             "  DDL (CREATE TABLE):  {:>8} ({:>3}%)",
             format_duration(self.ddl_time),
             percent(self.ddl_time.as_millis() as u64, wall_ms)
         );
         if self.wait_loads_time.as_millis() > 0 {
-            println!(
+            eprintln!(
                 "  Wait for loads:      {:>8} ({:>3}%)",
                 format_duration(self.wait_loads_time),
                 percent(self.wait_loads_time.as_millis() as u64, wall_ms)
@@ -304,14 +304,14 @@ impl ClientMetrics {
 
         // Sequential mode timings
         if self.decompress_time.as_millis() > 0 || self.load_time.as_millis() > 0 {
-            println!(
+            eprintln!(
                 "  Decompression:       {:>8} ({:>3}%)",
                 format_duration(self.decompress_time),
                 percent(self.decompress_time.as_millis() as u64, wall_ms)
             );
             let load_pct = percent(self.load_time.as_millis() as u64, wall_ms);
             let load_note = if load_pct > 40 { " <- bottleneck" } else { "" };
-            println!(
+            eprintln!(
                 "  LOAD DATA:           {:>8} ({:>3}%){}",
                 format_duration(self.load_time),
                 load_pct,
@@ -323,12 +323,12 @@ impl ClientMetrics {
         if self.parallel_decompress_time.as_millis() > 0
             || self.parallel_load_time.as_millis() > 0
         {
-            println!("  Parallel workers (cumulative):");
-            println!(
+            eprintln!("  Parallel workers (cumulative):");
+            eprintln!(
                 "    Decompress:        {:>8}",
                 format_duration(self.parallel_decompress_time)
             );
-            println!(
+            eprintln!(
                 "    LOAD DATA:         {:>8}",
                 format_duration(self.parallel_load_time)
             );
@@ -345,31 +345,34 @@ impl ClientMetrics {
             } else {
                 "balanced"
             };
-            println!(
+            eprintln!(
                 "  Read-ahead buffer:   avg {:.1}/32 ({})",
                 avg_depth, bound_note
             );
         }
-        println!();
+        eprintln!();
 
         // Transfer stats
         let wall_secs = self.wall_time.as_secs_f64();
-        let compressed_mb = self.compressed_bytes as f64 / (1024.0 * 1024.0);
-        let uncompressed_mb = self.uncompressed_bytes as f64 / (1024.0 * 1024.0);
+        let wire_mb = self.compressed_bytes as f64 / (1024.0 * 1024.0);
         let throughput = if wall_secs > 0.0 {
-            compressed_mb / wall_secs
+            wire_mb / wall_secs
         } else {
             0.0
         };
-        let ratio = if self.compressed_bytes > 0 {
-            self.uncompressed_bytes as f64 / self.compressed_bytes as f64
+        let compressed = self.compressed_bytes != self.uncompressed_bytes
+            && self.compressed_bytes > 0
+            && self.uncompressed_bytes > 0;
+        if compressed {
+            let uncompressed_mb = self.uncompressed_bytes as f64 / (1024.0 * 1024.0);
+            let ratio = self.uncompressed_bytes as f64 / self.compressed_bytes as f64;
+            eprintln!(
+                "Transfer: {:.1} MB wire / {:.1} MB uncompressed ({:.1}x ratio) at {:.1} MB/s",
+                wire_mb, uncompressed_mb, ratio, throughput
+            );
         } else {
-            1.0
-        };
-        println!(
-            "Transfer: {:.1} MB compressed / {:.1} MB uncompressed ({:.1}x ratio) at {:.1} MB/s",
-            compressed_mb, uncompressed_mb, ratio, throughput
-        );
+            eprintln!("Transfer: {:.1} MB at {:.1} MB/s", wire_mb, throughput);
+        }
 
         // Message stats (from server metrics if available)
         if let Some(sm) = server_metrics {
@@ -379,16 +382,24 @@ impl ClientMetrics {
                 } else {
                     0.0
                 };
-                println!(
-                    "Messages: {} (avg {:.1} KB compressed)",
-                    format_rows(sm.message_count),
-                    avg_kb
-                );
+                if compressed {
+                    eprintln!(
+                        "Messages: {} (avg {:.1} KB compressed)",
+                        format_rows(sm.message_count),
+                        avg_kb
+                    );
+                } else {
+                    eprintln!(
+                        "Messages: {} (avg {:.1} KB)",
+                        format_rows(sm.message_count),
+                        avg_kb
+                    );
+                }
             }
         }
 
-        println!("Rows: {}", format_rows(self.rows_loaded));
-        println!("Wall time: {}", format_duration(self.wall_time));
+        eprintln!("Rows: {}", format_rows(self.rows_loaded));
+        eprintln!("Wall time: {}", format_duration(self.wall_time));
     }
 }
 
@@ -424,10 +435,10 @@ fn display_per_table_totals(query_timings: &[jibs_protocol::QueryTiming]) {
         total_b.cmp(&total_a)
     });
 
-    println!("Per-table aggregate totals:");
+    eprintln!("Per-table aggregate totals:");
     for (table, total) in sorted.iter().take(20) {
         let mysql_ms = total.query_ms + total.iterate_ms;
-        println!(
+        eprintln!(
             "  {:>8}  {:<50} {:>3} queries, {} rows",
             format_duration_ms(mysql_ms),
             table,
@@ -436,9 +447,9 @@ fn display_per_table_totals(query_timings: &[jibs_protocol::QueryTiming]) {
         );
     }
     if sorted.len() > 20 {
-        println!("  ... and {} more tables", sorted.len() - 20);
+        eprintln!("  ... and {} more tables", sorted.len() - 20);
     }
-    println!();
+    eprintln!();
 }
 
 /// Format milliseconds as duration string
