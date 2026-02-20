@@ -7,6 +7,10 @@
 // ─── Variables ───
 var admin_password_hash: string = "$2y$10$placeholder"
 var customer_password_hash: string = "$2y$10$placeholder"
+var customer_limit: int = 10
+var order_limit: int = 10
+var product_limit: int = 10
+var base_url: string
 
 // ─── Faker pools for anonymization ───
 
@@ -193,15 +197,19 @@ relation sales_invoice_grid.store_id -> store.store_id
 relation sales_order_grid.store_id -> store.store_id
 relation sales_sequence_meta.store_id -> store.store_id
 relation sales_shipment_grid.store_id -> store.store_id
-relation url_rewrite.store_id -> store.store_id
 relation customer_entity.group_id -> store_group.group_id
 relation customer_grid_flat.group_id -> store_group.group_id
 relation design_config_grid_flat.store_group_id -> store_group.group_id
 relation design_config_grid_flat.store_website_id -> store_website.website_id
 
+relation review.entity_pk_value -> catalog_product_entity.entity_id
+relation review_detail.review_id -> review.review_id
+relation review_store.review_id -> review.review_id
+
 relation customer_group.tax_class_id -> tax_class.class_id
 relation customer_grid_flat.entity_id -> customer_entity.entity_id
 ignore_relation sales_order_tax_item.associated_item_id -> sales_order_item.item_id
+ignore_relation url_rewrite.store_id -> store.store_id
 
 // ─── Ignored tables (not imported at all) ───
 // Session, cache, changelog, and cron tables that are rebuilt automatically.
@@ -231,6 +239,65 @@ exclude_data password_reset_request_event
 exclude_data sendfriend_log
 exclude_data search_query
 
+// ─── Rebuild/temp tables ───
+exclude_data /^catalogrule_product/
+exclude_data /^catalogsearch_fulltext/
+exclude_data /_flat$/
+exclude_data /_log$/
+exclude_data /_errors?$/
+exclude_data /^tmp_/
+exclude_data /_temp/
+
+// ─── Magento system tables (safe to be empty for dev) ───
+exclude_data admin_user_session
+exclude_data adminnotification_inbox
+exclude_data /^adobe_stock_/
+exclude_data adobe_user_profile
+exclude_data catalog_compare_list
+exclude_data catalogsearch_recommendations
+exclude_data import_history
+exclude_data /^magento_acknowledged_bulk/
+exclude_data /^magento_bulk/
+exclude_data /^magento_operation/
+exclude_data persistent_session
+exclude_data search_synonyms
+
+// ─── Newsletter (specific tables, not /^newsletter_/ which would catch newsletter_template) ───
+exclude_data newsletter_subscriber
+exclude_data newsletter_queue
+exclude_data newsletter_queue_link
+exclude_data newsletter_queue_store_link
+exclude_data newsletter_problem
+
+// ─── Extension tables (common in Dutch Magento shops) ───
+exclude_data /^aw_arep/
+exclude_data /^aw_fue2/
+exclude_data /^aw_onsale_rule_product/
+exclude_data /^mst_cache_warmer_page/
+exclude_data /^amasty_geoip_block/
+exclude_data /^amasty_geoip_location/
+exclude_data /^amasty_blog_views/
+exclude_data /^amasty_xsearch_users_search/
+exclude_data /^amasty_conditions_quote/
+exclude_data /^channable_/
+exclude_data /^dealer4dealer_/
+exclude_data /^elasticsuite_tracker_/
+exclude_data /^fme_/
+exclude_data /^kl_/
+exclude_data /^mageplaza_smtp_abandonedcart/
+exclude_data /^mailchimp_/
+exclude_data /^mm_webforms_result/
+exclude_data /^mollie_/
+exclude_data /^vendic_/
+exclude_data /^xtento_orderexport_profile_history/
+exclude_data /^mc_api_queue/
+
+// ─── Full imports for reference tables ───
+full review_entity, review_status
+full catalog_product_link_attribute, catalog_product_link_type
+full sales_order_status, sales_order_status_state
+full sales_sequence_meta, sales_sequence_profile
+
 // ─── Anonymization rules ───
 // Strips PII from customer, order, and admin tables.
 
@@ -239,25 +306,12 @@ anonymize admin_adobe_ims_webapi {
     access_token_hash -> null
 }
 
-anonymize admin_passwords {
-    password_hash -> null
-}
-
-anonymize admin_user {
-    email -> fake_emails
-    firstname -> fake_names
-    lastname -> fake_names
-    password -> null
-    rp_token -> null
-}
-
 anonymize admin_user_session {
     ip -> null
 }
 
 anonymize adobe_user_profile {
     access_token -> null
-    email -> fake_emails
 }
 
 anonymize customer_address_entity {
@@ -362,4 +416,21 @@ anonymize sales_order_grid {
 
 anonymize sales_shipment_grid {
     customer_email -> fake_emails
+}
+
+set core_config_data {
+    match path = "web/secure/base_url", scope = "default", scope_id = 0
+    value = $base_url
+}
+
+set core_config_data {
+    match path = "web/unsecure/base_url", scope = "default", scope_id = 0
+    value = $base_url
+}
+
+after {
+    """
+    DELETE FROM core_config_data WHERE path = 'web/secure/base_url' AND scope <> 'default';
+    DELETE FROM core_config_data WHERE path = 'web/unsecure/base_url' AND scope <> 'default';
+    """
 }
