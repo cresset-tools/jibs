@@ -99,8 +99,8 @@ pub enum ClientMessage {
     },
     /// Start streaming data
     Start,
-    /// Acknowledge receipt of chunk (for flow control)
-    Ack,
+    /// Request graceful interruption — server should stop streaming and send Done with partial metrics
+    Interrupt,
     /// Graceful shutdown
     Shutdown,
 }
@@ -126,7 +126,13 @@ pub enum ServerMessage {
         tsv_data: Vec<u8>,
     },
     /// Table fully transferred
-    TableDone { table: String, row_count: u64 },
+    TableDone {
+        table: String,
+        row_count: u64,
+        /// Partial server metrics snapshot (without per-query timings).
+        /// Updated after each table so the client has metrics even on interruption.
+        metrics: Option<ServerMetrics>,
+    },
     /// All data transferred
     Done {
         /// What the server decided for each table

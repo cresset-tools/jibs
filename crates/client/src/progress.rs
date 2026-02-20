@@ -319,7 +319,7 @@ impl ImportProgress {
             return;
         }
 
-        let now = Instant::now();
+        let now: Instant = Instant::now();
         self.throughput_samples
             .push_back((now, self.stats.bytes_total));
 

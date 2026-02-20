@@ -723,44 +723,38 @@ pub async fn run_import(config: ImportConfig) -> Result<()> {
         parallel: config.parallel as u32,
         collect_metrics: config.collect_metrics,
     };
-    let result = run_protocol(server, &mut local_conn, loader_pool, plan, protocol_config).await;
+    let outcome = run_protocol(server, &mut local_conn, loader_pool, plan, protocol_config).await;
+
+    // Shutdown loader pool if used
+    if let Some(pool) = outcome.loader_pool {
+        debug!("Shutting down loader pool");
+        pool.shutdown();
+    }
+
+    // Display metrics if enabled (on both success and interruption)
+    if config.collect_metrics {
+        outcome.client_metrics.display(outcome.stats.server_metrics.as_ref());
+    }
+
+    // Display report if enabled and we have table data
+    if config.show_report && !outcome.stats.table_durations.is_empty() {
+        display_report(&outcome.stats.table_durations);
+    }
 
     // Re-enable checks
-    local_conn.query_drop("SET FOREIGN_KEY_CHECKS = 1")?;
-    local_conn.query_drop("SET UNIQUE_CHECKS = 1")?;
+    let _ = local_conn.query_drop("SET FOREIGN_KEY_CHECKS = 1");
+    let _ = local_conn.query_drop("SET UNIQUE_CHECKS = 1");
 
     // Handle result
-    match result {
-        Ok((stats, client_metrics, pool)) => {
-            // Shutdown loader pool if used
-            if let Some(pool) = pool {
-                debug!("Shutting down loader pool");
-                pool.shutdown();
-            }
+    match outcome.result {
+        Ok(()) => {
             info!(
                 "Import complete: {} tables, {} rows",
-                stats.tables_imported, stats.rows_imported
+                outcome.stats.tables_imported, outcome.stats.rows_imported
             );
-
-            // Display metrics if enabled
-            if config.collect_metrics {
-                client_metrics.display(stats.server_metrics.as_ref());
-            }
-
-            // Display report if enabled
-            if config.show_report {
-                display_report(&stats.table_durations);
-            }
-
             Ok(())
         }
-        Err((e, pool)) => {
-            // Shutdown loader pool if used
-            if let Some(pool) = pool {
-                pool.shutdown();
-            }
-            Err(e)
-        }
+        Err(e) => Err(e),
     }
 }
 
@@ -895,6 +889,14 @@ impl Checkpoint {
     }
 }
 
+/// Outcome of the protocol run - always carries metrics even on error/interruption
+struct ProtocolOutcome {
+    result: Result<()>,
+    stats: ImportStats,
+    client_metrics: ClientMetrics,
+    loader_pool: Option<LoaderPool>,
+}
+
 /// Run the import protocol with the remote server
 async fn run_protocol(
     server: RemoteProcess,
@@ -902,22 +904,7 @@ async fn run_protocol(
     loader_pool: Option<LoaderPool>,
     plan: ExecutionPlan,
     config: ProtocolConfig,
-) -> std::result::Result<(ImportStats, ClientMetrics, Option<LoaderPool>), (anyhow::Error, Option<LoaderPool>)> {
-    // Wrap the inner logic to handle errors while preserving the loader pool
-    match run_protocol_inner(server, local_conn, &loader_pool, plan, &config).await {
-        Ok((stats, client_metrics)) => Ok((stats, client_metrics, loader_pool)),
-        Err(e) => Err((e, loader_pool)),
-    }
-}
-
-/// Inner protocol implementation
-async fn run_protocol_inner(
-    mut server: RemoteProcess,
-    local_conn: &mut Conn,
-    loader_pool: &Option<LoaderPool>,
-    plan: ExecutionPlan,
-    config: &ProtocolConfig,
-) -> Result<(ImportStats, ClientMetrics)> {
+) -> ProtocolOutcome {
     let mut stats = ImportStats {
         tables_imported: 0,
         tables_imported_names: Vec::new(),
@@ -930,6 +917,32 @@ async fn run_protocol_inner(
     if config.collect_metrics {
         client_metrics.start();
     }
+
+    let result = run_protocol_inner(server, local_conn, &loader_pool, plan, &config, &mut stats, &mut client_metrics).await;
+
+    // Always stop metrics timing
+    if config.collect_metrics {
+        client_metrics.stop();
+    }
+
+    ProtocolOutcome {
+        result,
+        stats,
+        client_metrics,
+        loader_pool,
+    }
+}
+
+/// Inner protocol implementation
+async fn run_protocol_inner(
+    mut server: RemoteProcess,
+    local_conn: &mut Conn,
+    loader_pool: &Option<LoaderPool>,
+    plan: ExecutionPlan,
+    config: &ProtocolConfig,
+    stats: &mut ImportStats,
+    client_metrics: &mut ClientMetrics,
+) -> Result<()> {
 
     // Set up checkpointing
     Checkpoint::create(local_conn)?;
@@ -1038,13 +1051,33 @@ async fn run_protocol_inner(
         }
     });
 
+    // Pin ctrl_c future for use in select!
+    let mut ctrl_c = std::pin::pin!(tokio::signal::ctrl_c());
+
     loop {
         // Receive from the read-ahead buffer (not directly from SSH)
         let recv_start = Instant::now();
-        let msg = match msg_rx.recv().await {
-            Some(Ok(msg)) => msg,
-            Some(Err(e)) => return Err(e),
-            None => return Err(anyhow::anyhow!("Server connection closed unexpectedly")),
+        let msg = tokio::select! {
+            msg = msg_rx.recv() => match msg {
+                Some(Ok(msg)) => msg,
+                Some(Err(e)) => return Err(e),
+                None => return Err(anyhow::anyhow!("Server connection closed unexpectedly")),
+            },
+            _ = &mut ctrl_c => {
+
+                // Transfer parallel worker timing collected so far
+                if config.collect_metrics {
+                    client_metrics.add_parallel_decompress_time(Duration::from_nanos(
+                        load_accum.decompress_ns,
+                    ));
+                    client_metrics.add_parallel_load_time(Duration::from_nanos(load_accum.load_ns));
+                    client_metrics.add_rows_loaded(stats.rows_imported);
+                }
+                // Capture partial table durations
+                stats.table_durations = progress.table_durations().to_vec();
+                progress.finish();
+                return Err(anyhow::anyhow!("Interrupted"));
+            }
         };
         if config.collect_metrics {
             client_metrics.add_recv_time(recv_start.elapsed());
@@ -1110,8 +1143,6 @@ async fn run_protocol_inner(
                 // Skip data for already-completed tables
                 if skipped_tables.contains(&table) {
                     debug!("Skipping data chunk for {} (already completed)", table);
-                    // Still need to send ack
-                    send_message_writer(&mut writer, &ClientMessage::Ack).await?;
                     continue;
                 }
 
@@ -1133,6 +1164,8 @@ async fn run_protocol_inner(
                     .get(&table)
                     .cloned()
                     .ok_or_else(|| anyhow::anyhow!("No schema for table {}", table))?;
+
+                let chunk_bytes = tsv_data.len();
 
                 // Load data into MySQL - use pool if available
                 if let Some(pool) = loader_pool {
@@ -1161,7 +1194,7 @@ async fn run_protocol_inner(
                             &mut deferred_table_dones,
                             local_conn,
                             &mut progress,
-                            &mut stats,
+                            stats,
                             &mut table_schemas,
                             config.fail_after_tables,
                         )?;
@@ -1198,13 +1231,15 @@ async fn run_protocol_inner(
                 }
 
                 // Update progress (use compressed size for byte tracking)
-                progress.update_table(&table, row_count, 0);
-
-                // Send ack
-                send_message_writer(&mut writer, &ClientMessage::Ack).await?;
+                progress.update_table(&table, row_count, chunk_bytes);
             }
 
-            ServerMessage::TableDone { table, row_count } => {
+            ServerMessage::TableDone { table, row_count, metrics: table_done_metrics } => {
+                // Store latest server metrics snapshot for use on interruption
+                if table_done_metrics.is_some() {
+                    stats.server_metrics = table_done_metrics;
+                }
+
                 // Skip marking complete for already-completed tables
                 if skipped_tables.contains(&table) {
                     debug!("Table {} was already complete", table);
@@ -1237,7 +1272,7 @@ async fn run_protocol_inner(
                     &mut deferred_table_dones,
                     local_conn,
                     &mut progress,
-                    &mut stats,
+                    stats,
                     &mut table_schemas,
                     config.fail_after_tables,
                 )?;
@@ -1272,7 +1307,7 @@ async fn run_protocol_inner(
                         &mut deferred_table_dones,
                         local_conn,
                         &mut progress,
-                        &mut stats,
+                        stats,
                         &mut table_schemas,
                     )?;
                     if config.collect_metrics {
@@ -1366,12 +1401,7 @@ async fn run_protocol_inner(
     // Send shutdown
     send_message_writer(&mut writer, &ClientMessage::Shutdown).await?;
 
-    // Stop client metrics timing
-    if config.collect_metrics {
-        client_metrics.stop();
-    }
-
-    Ok((stats, client_metrics))
+    Ok(())
 }
 
 /// Send a message to the server
