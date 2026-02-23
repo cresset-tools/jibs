@@ -122,7 +122,7 @@ pub enum ServerMessage {
     /// Data chunk with rows in TSV format
     Data {
         table_id: u16,
-        row_count: u32,
+        row_count: u16,
         tsv_data: Vec<u8>,
     },
     /// Table fully transferred

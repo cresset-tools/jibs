@@ -1246,7 +1246,7 @@ async fn run_protocol_inner(
                 }
 
                 // Update progress (use compressed size for byte tracking)
-                progress.update_table(table, row_count, chunk_bytes);
+                progress.update_table(table, row_count.into(), chunk_bytes);
             }
 
             ServerMessage::TableDone { table_id, row_count, metrics: table_done_metrics } => {
@@ -1483,12 +1483,12 @@ async fn recv_message(
         .map_err(|e| anyhow::anyhow!("Failed to read message body: {}", e))?;
 
     if is_raw_chunk {
-        let (table_id, row_count, tsv_data) = jibs_protocol::decode_data_chunk(buffer)
+        let chunk = jibs_protocol::decode_data_chunk(buffer)
             .map_err(|e| anyhow::anyhow!("Failed to decode data chunk: {}", e))?;
         Ok(ServerMessage::Data {
-            table_id,
-            row_count,
-            tsv_data,
+            table_id: chunk.table_id,
+            row_count: chunk.row_count,
+            tsv_data: chunk.tsv_data,
         })
     } else {
         decode_server_message(&buffer)
@@ -1518,12 +1518,12 @@ async fn recv_message_from_reader(
         .map_err(|e| anyhow::anyhow!("Failed to read message body: {}", e))?;
 
     if is_raw_chunk {
-        let (table_id, row_count, tsv_data) = jibs_protocol::decode_data_chunk(buffer)
+        let chunk = jibs_protocol::decode_data_chunk(buffer)
             .map_err(|e| anyhow::anyhow!("Failed to decode data chunk: {}", e))?;
         Ok(ServerMessage::Data {
-            table_id,
-            row_count,
-            tsv_data,
+            table_id: chunk.table_id,
+            row_count: chunk.row_count,
+            tsv_data: chunk.tsv_data,
         })
     } else {
         decode_server_message(&buffer)

@@ -4,7 +4,7 @@ use mysql::Row;
 
 use crate::error::Result;
 use crate::mysql::{escape_tsv_bytes, write_tsv_value};
-use jibs_protocol::{AnonymizeRule, AnonymizeTarget};
+use jibs_protocol::{AnonymizeRule, AnonymizeTarget, CompressionMode, RAW_CHUNK_FLAG, RAW_CHUNK_HEADER_LEN};
 
 /// Pre-computed anonymization action for a column
 enum AnonAction {
@@ -80,8 +80,11 @@ impl TsvWriter {
 
         let num_columns = columns.len();
 
+        let mut buffer = Vec::with_capacity(64 * 1024); // 64KB buffer
+        buffer.resize(RAW_CHUNK_HEADER_LEN, 0); // preallocate frame header
+
         Self {
-            buffer: Vec::with_capacity(64 * 1024), // 64KB buffer
+            buffer,
             num_columns,
             anon_by_column,
             faker_pools,
@@ -124,18 +127,80 @@ impl TsvWriter {
         Ok(())
     }
 
-    /// Get the current buffer contents and clear it
-    pub fn take_buffer(&mut self) -> Vec<u8> {
-        std::mem::take(&mut self.buffer)
+    /// Finalize the buffer as a wire-ready data chunk frame.
+    ///
+    /// Fills in the preallocated header (`u32 flagged_len || u16 table_id || u16 row_count`),
+    /// optionally compresses the TSV payload, and returns the complete frame.
+    ///
+    /// For uncompressed data this is zero-copy — the header is written in-place.
+    /// For zstd the TSV portion is compressed into a new buffer.
+    pub fn take_encoded_chunk(
+        &mut self,
+        table_id: u16,
+        row_count: u16,
+        compression: CompressionMode,
+    ) -> Vec<u8> {
+        let tsv_start = RAW_CHUNK_HEADER_LEN;
+        let tsv_len = self.buffer.len() - tsv_start;
+
+        let frame = match compression {
+            CompressionMode::None | CompressionMode::Auto => {
+                // Fill in the preallocated header in-place — zero copy
+                let payload_len = 2 + 2 + tsv_len;
+                let flagged_len = (payload_len as u32) | RAW_CHUNK_FLAG;
+                self.buffer[0..4].copy_from_slice(&flagged_len.to_le_bytes());
+                self.buffer[4..6].copy_from_slice(&table_id.to_le_bytes());
+                self.buffer[6..8].copy_from_slice(&row_count.to_le_bytes());
+
+                std::mem::replace(&mut self.buffer, Vec::with_capacity(64 * 1024))
+            }
+            CompressionMode::Zstd => {
+                let tsv_data = &self.buffer[tsv_start..];
+                let compressed = match zstd::encode_all(tsv_data, 3) {
+                    Ok(c) => c,
+                    Err(_) => {
+                        // Fallback: send uncompressed
+                        let payload_len = 2 + 2 + tsv_len;
+                        let flagged_len = (payload_len as u32) | RAW_CHUNK_FLAG;
+                        self.buffer[0..4].copy_from_slice(&flagged_len.to_le_bytes());
+                        self.buffer[4..6].copy_from_slice(&table_id.to_le_bytes());
+                        self.buffer[6..8].copy_from_slice(&row_count.to_le_bytes());
+                        let frame =
+                            std::mem::replace(&mut self.buffer, Vec::with_capacity(64 * 1024));
+                        self.buffer.resize(RAW_CHUNK_HEADER_LEN, 0);
+                        return frame;
+                    }
+                };
+
+                // Build: header + u32 original_len + compressed data
+                let compressed_payload_len = 4 + compressed.len();
+                let payload_len = 2 + 2 + compressed_payload_len;
+                let flagged_len = (payload_len as u32) | RAW_CHUNK_FLAG;
+
+                let mut frame = Vec::with_capacity(4 + payload_len);
+                frame.extend_from_slice(&flagged_len.to_le_bytes());
+                frame.extend_from_slice(&table_id.to_le_bytes());
+                frame.extend_from_slice(&row_count.to_le_bytes());
+                frame.extend_from_slice(&(tsv_len as u32).to_le_bytes());
+                frame.extend(compressed);
+
+                // Reuse the existing allocation
+                self.buffer.clear();
+                frame
+            }
+        };
+
+        self.buffer.resize(RAW_CHUNK_HEADER_LEN, 0);
+        frame
     }
 
-    /// Get the current buffer size
+    /// Get the current TSV data size (excluding the preallocated frame header).
     pub fn buffer_size(&self) -> usize {
-        self.buffer.len()
+        self.buffer.len() - RAW_CHUNK_HEADER_LEN
     }
 
-    /// Check if buffer is empty
+    /// Check if no TSV data has been written (header-only).
     pub fn is_empty(&self) -> bool {
-        self.buffer.is_empty()
+        self.buffer.len() <= RAW_CHUNK_HEADER_LEN
     }
 }

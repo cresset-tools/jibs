@@ -7,8 +7,8 @@ pub mod framing;
 pub mod messages;
 pub mod plan;
 pub use framing::{
-    decode_data_chunk, encode_data_chunk, read_message, write_message, MessageWriter,
-    RAW_CHUNK_FLAG,
+    decode_data_chunk, read_message, write_message, DataChunk, MessageWriter, RAW_CHUNK_FLAG,
+    RAW_CHUNK_HEADER_LEN,
 };
 pub use messages::{ClientMessage, QueryTiming, ServerMessage, ServerMetrics, TableDisposition};
 pub use plan::{
