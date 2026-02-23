@@ -21,7 +21,7 @@ use crate::tsv::TsvWriter;
 /// Maximum rows per chunk
 const CHUNK_ROW_LIMIT: usize = 10_000;
 /// Maximum bytes per chunk
-const CHUNK_BYTE_LIMIT: usize = 512 * 1024; // 512kb
+const CHUNK_BYTE_LIMIT: usize = 1024 * 1024; // 1MiB
 /// Maximum number of values in a single IN clause to stay under MySQL's max_allowed_packet
 const MAX_IN_VALUES: usize = 10_000;
 
@@ -32,17 +32,27 @@ struct TableTask {
     anonymization: Vec<AnonymizeRule>,
 }
 
+/// Messages sent through the internal channel between worker/BFS threads
+/// and the main writer thread.
+enum ChannelMessage {
+    /// Pre-encoded raw data chunk frame (length prefix + header + tsv_data).
+    /// Written directly via [`MessageWriter::write_preencoded`].
+    EncodedChunk(Vec<u8>),
+    /// Control messages (Schema, TableDone, Error).
+    Control(ServerMessage),
+}
+
 // ============================================================================
 // Streaming helpers
 // ============================================================================
 
-/// Send a TSV buffer as a Data message through a channel if non-empty.
+/// Encode and send a TSV chunk as a pre-encoded data frame through a channel.
 fn send_chunk(
     table: &str,
     tsv_writer: &mut TsvWriter,
     chunk_row_count: u32,
     compression: CompressionMode,
-    tx: &mpsc::SyncSender<ServerMessage>,
+    tx: &mpsc::SyncSender<ChannelMessage>,
     metrics: &MetricsCollector,
 ) -> Result<()> {
     if tsv_writer.is_empty() {
@@ -60,13 +70,9 @@ fn send_chunk(
     metrics.add_compress_time(compress_start.elapsed());
 
     let compressed_len = compressed.len() as u64;
-    let msg = ServerMessage::Data {
-        table: table.to_string(),
-        row_count: chunk_row_count,
-        tsv_data: compressed,
-    };
+    let encoded = jibs_protocol::encode_data_chunk(table, chunk_row_count, compressed);
 
-    tx.send(msg)
+    tx.send(ChannelMessage::EncodedChunk(encoded))
         .map_err(|_| ServerError::Protocol("Channel closed".to_string()))?;
     metrics.add_message(compressed_len);
 
@@ -244,7 +250,7 @@ fn run_aggregate_bfs(
     all_table_names_vec: Vec<String>,
     potential_aggregate_tables: HashSet<String>,
     compression: CompressionMode,
-    tx: mpsc::SyncSender<ServerMessage>,
+    tx: mpsc::SyncSender<ChannelMessage>,
     metrics: Arc<MetricsCollector>,
 ) -> Result<HashSet<String>> {
     let mut conn = MySqlConnection::connect(mysql_url)?;
@@ -378,10 +384,10 @@ fn run_aggregate_bfs(
 
                 // Send schema on first row
                 if schemas_sent.insert(root_table.clone()) {
-                    tx.send(ServerMessage::Schema {
+                    tx.send(ChannelMessage::Control(ServerMessage::Schema {
                         table: root_table.clone(),
                         columns: columns.clone(),
-                    })
+                    }))
                     .map_err(|_| ServerError::Protocol("Channel closed".to_string()))?;
                 }
 
@@ -648,10 +654,10 @@ fn run_aggregate_bfs(
 
                             // Send schema on first new row for this table
                             if schemas_sent.insert(table.clone()) {
-                                tx.send(ServerMessage::Schema {
+                                tx.send(ChannelMessage::Control(ServerMessage::Schema {
                                     table: table.clone(),
                                     columns: columns.clone(),
-                                })
+                                }))
                                 .map_err(|_| {
                                     ServerError::Protocol("Channel closed".to_string())
                                 })?;
@@ -744,11 +750,11 @@ fn run_aggregate_bfs(
 
     // Send TableDone for all aggregate tables that had rows
     for (table, row_count) in &table_row_counts {
-        tx.send(ServerMessage::TableDone {
+        tx.send(ChannelMessage::Control(ServerMessage::TableDone {
             table: table.clone(),
             row_count: *row_count,
             metrics: None,
-        })
+        }))
         .map_err(|_| ServerError::Protocol("Channel closed".to_string()))?;
     }
 
@@ -849,7 +855,7 @@ impl<'a> DependencyTraverser<'a> {
 
         // 3. Create shared channel
         let num_workers = (parallel as usize).max(1);
-        let (tx, rx) = mpsc::sync_channel::<ServerMessage>(num_workers * 4);
+        let (tx, rx) = mpsc::sync_channel::<ChannelMessage>(num_workers * 4);
 
         // Classify tables into excluded, definite-full, and potential-aggregate.
         // Write excluded tables directly to the writer (not through channel)
@@ -935,10 +941,10 @@ impl<'a> DependencyTraverser<'a> {
                         &metrics,
                     );
                     if let Err(e) = result {
-                        let _ = tx.send(ServerMessage::Error {
+                        let _ = tx.send(ChannelMessage::Control(ServerMessage::Error {
                             message: e.to_string(),
                             recoverable: e.is_recoverable(),
-                        });
+                        }));
                         return Err(e);
                     }
                 }
@@ -994,22 +1000,30 @@ impl<'a> DependencyTraverser<'a> {
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             };
-            // For TableDone messages, attach a metrics snapshot so the client
-            // has server metrics even if the import is interrupted
-            let msg = if let ServerMessage::TableDone { table, row_count, .. } = msg {
-                if row_count > 0 {
-                    streamed_tables.insert(table.clone());
-                }
-                ServerMessage::TableDone {
-                    table,
-                    row_count,
-                    metrics: self.metrics.snapshot(),
-                }
-            } else {
-                msg
-            };
             let write_start = Instant::now();
-            writer.write_message_noflush(&msg)?;
+            match msg {
+                ChannelMessage::EncodedChunk(bytes) => {
+                    writer.write_preencoded(&bytes)?;
+                }
+                ChannelMessage::Control(ctrl) => {
+                    // For TableDone messages, attach a metrics snapshot so the
+                    // client has server metrics even if the import is interrupted
+                    let ctrl =
+                        if let ServerMessage::TableDone { table, row_count, .. } = ctrl {
+                            if row_count > 0 {
+                                streamed_tables.insert(table.clone());
+                            }
+                            ServerMessage::TableDone {
+                                table,
+                                row_count,
+                                metrics: self.metrics.snapshot(),
+                            }
+                        } else {
+                            ctrl
+                        };
+                    writer.write_message_noflush(&ctrl)?;
+                }
+            }
             self.metrics.add_write_time(write_start.elapsed());
         }
         writer.flush()?;
@@ -1238,7 +1252,7 @@ fn stream_full_table_to_channel(
     anonymization: Vec<AnonymizeRule>,
     compression: CompressionMode,
     fakers: &HashMap<String, Vec<String>>,
-    tx: &mpsc::SyncSender<ServerMessage>,
+    tx: &mpsc::SyncSender<ChannelMessage>,
     metrics: &Arc<MetricsCollector>,
 ) -> Result<()> {
     let column_names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
@@ -1247,10 +1261,10 @@ fn stream_full_table_to_channel(
     let mut chunk_row_count: u32 = 0;
 
     // Always send schema so the table is created locally even if empty
-    tx.send(ServerMessage::Schema {
+    tx.send(ChannelMessage::Control(ServerMessage::Schema {
         table: table.to_string(),
         columns: columns.to_vec(),
-    })
+    }))
     .map_err(|_| crate::error::ServerError::Protocol("Channel closed".to_string()))?;
 
     let query = format!("SELECT * FROM `{}`", table);
@@ -1282,57 +1296,36 @@ fn stream_full_table_to_channel(
         if chunk_row_count >= CHUNK_ROW_LIMIT as u32
             || tsv_writer.buffer_size() >= CHUNK_BYTE_LIMIT
         {
-            // Flush chunk through channel
-            let tsv_data = tsv_writer.take_buffer();
-            let bytes = tsv_data.len() as u64;
-
-            metrics.add_bytes_sent(bytes);
-            metrics.add_rows_sent(chunk_row_count as u64);
-
-            let compress_start = Instant::now();
-            let compressed = maybe_compress(tsv_data, compression);
-            metrics.add_compress_time(compress_start.elapsed());
-            let compressed_len = compressed.len() as u64;
-            let msg = ServerMessage::Data {
-                table: table.to_string(),
-                row_count: chunk_row_count,
-                tsv_data: compressed,
-            };
-            tx.send(msg)
-                .map_err(|_| crate::error::ServerError::Protocol("Channel closed".to_string()))?;
-            metrics.add_message(compressed_len);
+            send_chunk(
+                table,
+                &mut tsv_writer,
+                chunk_row_count,
+                compression,
+                tx,
+                metrics,
+            )?;
             chunk_row_count = 0;
         }
     }
 
     // Flush remaining data
     if chunk_row_count > 0 {
-        let tsv_data = tsv_writer.take_buffer();
-        let bytes = tsv_data.len() as u64;
-
-        metrics.add_bytes_sent(bytes);
-        metrics.add_rows_sent(chunk_row_count as u64);
-
-        let compress_start = Instant::now();
-        let compressed = maybe_compress(tsv_data, compression);
-        metrics.add_compress_time(compress_start.elapsed());
-        let compressed_len = compressed.len() as u64;
-        let msg = ServerMessage::Data {
-            table: table.to_string(),
-            row_count: chunk_row_count,
-            tsv_data: compressed,
-        };
-        tx.send(msg)
-            .map_err(|_| crate::error::ServerError::Protocol("Channel closed".to_string()))?;
-        metrics.add_message(compressed_len);
+        send_chunk(
+            table,
+            &mut tsv_writer,
+            chunk_row_count,
+            compression,
+            tx,
+            metrics,
+        )?;
     }
 
     // Send TableDone (always, even for empty tables so the client marks them complete)
-    tx.send(ServerMessage::TableDone {
+    tx.send(ChannelMessage::Control(ServerMessage::TableDone {
         table: table.to_string(),
         row_count: total_rows,
         metrics: None,
-    })
+    }))
     .map_err(|_| crate::error::ServerError::Protocol("Channel closed".to_string()))?;
 
     Ok(())
