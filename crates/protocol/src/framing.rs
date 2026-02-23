@@ -3,7 +3,7 @@
 //! Two frame types distinguished by the high bit of the u32 length prefix:
 //!
 //! - **Bincode message** (high bit clear): `u32 length || bincode payload`
-//! - **Raw data chunk** (high bit set): `u32 length|0x80000000 || u16 table_name_len || table_name || u32 row_count || tsv_data`
+//! - **Raw data chunk** (high bit set): `u32 length|0x80000000 || u16 table_id || u32 row_count || tsv_data`
 //!
 //! The high bit halves the maximum frame size to ~2 GiB, which is never reached in practice.
 
@@ -258,27 +258,26 @@ impl<W: Write> MessageWriter<W> {
 
 /// Encode a raw data chunk into a complete frame ready for wire transmission.
 ///
-/// Builds: `u32 length|RAW_CHUNK_FLAG || u16 table_name_len || table_name || u32 row_count || tsv_data`
+/// Builds: `u32 length|RAW_CHUNK_FLAG || u16 table_id || u32 row_count || tsv_data`
 ///
 /// The returned `Vec<u8>` can be written directly via [`MessageWriter::write_preencoded`].
-pub fn encode_data_chunk(table: &str, row_count: u32, tsv_data: Vec<u8>) -> Vec<u8> {
-    let payload_len = 2 + table.len() + 4 + tsv_data.len();
+pub fn encode_data_chunk(table_id: u16, row_count: u32, tsv_data: Vec<u8>) -> Vec<u8> {
+    let payload_len = 2 + 4 + tsv_data.len();
     let flagged_len = (payload_len as u32) | RAW_CHUNK_FLAG;
 
     let mut frame = Vec::with_capacity(4 + payload_len);
     frame.extend_from_slice(&flagged_len.to_le_bytes());
-    frame.extend_from_slice(&(table.len() as u16).to_le_bytes());
-    frame.extend_from_slice(table.as_bytes());
+    frame.extend_from_slice(&table_id.to_le_bytes());
     frame.extend_from_slice(&row_count.to_le_bytes());
     frame.extend_from_slice(&tsv_data);
     frame
 }
 
-/// Decode a raw data chunk buffer into its components: (table, row_count, tsv_data).
+/// Decode a raw data chunk buffer into its components: (table_id, row_count, tsv_data).
 ///
-/// Takes ownership of the buffer. The small header is parsed and the remaining
+/// Takes ownership of the buffer. The 6-byte header is parsed and the remaining
 /// bytes become the `tsv_data` Vec (reusing the original allocation via `drain`).
-pub fn decode_data_chunk(mut buf: Vec<u8>) -> io::Result<(String, u32, Vec<u8>)> {
+pub fn decode_data_chunk(mut buf: Vec<u8>) -> io::Result<(u16, u32, Vec<u8>)> {
     if buf.len() < 6 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -286,28 +285,16 @@ pub fn decode_data_chunk(mut buf: Vec<u8>) -> io::Result<(String, u32, Vec<u8>)>
         ));
     }
 
-    let table_len = u16::from_le_bytes([buf[0], buf[1]]) as usize;
-    let header_end = 2 + table_len + 4;
-    if buf.len() < header_end {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Data chunk header truncated",
-        ));
-    }
-
-    let table = String::from_utf8(buf[2..2 + table_len].to_vec())
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-
-    let rc_start = 2 + table_len;
+    let table_id = u16::from_le_bytes([buf[0], buf[1]]);
     let row_count = u32::from_le_bytes(
-        buf[rc_start..rc_start + 4]
+        buf[2..6]
             .try_into()
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad row_count"))?,
     );
 
     // Remove header, leaving just tsv_data — reuses the allocation
-    buf.drain(..header_end);
-    Ok((table, row_count, buf))
+    buf.drain(..6);
+    Ok((table_id, row_count, buf))
 }
 
 /// Temporary `Write` adapter that appends into a borrowed `Vec<u8>`.
@@ -417,11 +404,11 @@ mod tests {
 
     #[test]
     fn test_encode_decode_data_chunk_roundtrip() {
-        let table = "users";
+        let table_id = 7u16;
         let row_count = 42u32;
         let tsv_data = b"id\tname\n1\tAlice\n2\tBob\n";
 
-        let frame = encode_data_chunk(table, row_count, tsv_data.to_vec());
+        let frame = encode_data_chunk(table_id, row_count, tsv_data.to_vec());
 
         // Verify the frame has RAW_CHUNK_FLAG set
         let raw_len = u32::from_le_bytes(frame[0..4].try_into().unwrap());
@@ -431,8 +418,8 @@ mod tests {
 
         // Decode the payload
         let buf = frame[4..].to_vec();
-        let (dec_table, dec_row_count, dec_tsv) = decode_data_chunk(buf).unwrap();
-        assert_eq!(dec_table, table);
+        let (dec_table_id, dec_row_count, dec_tsv) = decode_data_chunk(buf).unwrap();
+        assert_eq!(dec_table_id, table_id);
         assert_eq!(dec_row_count, row_count);
         assert_eq!(dec_tsv, tsv_data);
     }
@@ -440,7 +427,7 @@ mod tests {
     #[test]
     fn test_write_preencoded_small_buffered() {
         // Small pre-encoded data stays in the buffer until flushed
-        let frame = encode_data_chunk("t", 1, b"hello\n".to_vec());
+        let frame = encode_data_chunk(0, 1, b"hello\n".to_vec());
 
         let mut output = Vec::new();
         {
@@ -457,7 +444,7 @@ mod tests {
     fn test_write_preencoded_large_write_through() {
         // Large pre-encoded data goes directly to the writer
         let big_data = vec![0x42u8; 2048];
-        let frame = encode_data_chunk("big_table", 99, big_data);
+        let frame = encode_data_chunk(42, 99, big_data);
 
         let mut output = Vec::new();
         {
@@ -473,7 +460,7 @@ mod tests {
     fn test_write_preencoded_interleaved_with_bincode() {
         let msg = TestMessage { value: "control".to_string(), count: 7 };
         let tsv = b"col1\tcol2\nval1\tval2\n";
-        let chunk_frame = encode_data_chunk("orders", 2, tsv.to_vec());
+        let chunk_frame = encode_data_chunk(5, 2, tsv.to_vec());
 
         let mut output = Vec::new();
         {
@@ -503,8 +490,8 @@ mod tests {
         let len = (raw_len & !RAW_CHUNK_FLAG) as usize;
         let mut buf = vec![0u8; len];
         cursor.read_exact(&mut buf).unwrap();
-        let (table, row_count, data) = decode_data_chunk(buf).unwrap();
-        assert_eq!(table, "orders");
+        let (table_id, row_count, data) = decode_data_chunk(buf).unwrap();
+        assert_eq!(table_id, 5);
         assert_eq!(row_count, 2);
         assert_eq!(data, tsv);
     }

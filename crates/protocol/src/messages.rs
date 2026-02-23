@@ -116,18 +116,18 @@ pub enum ServerMessage {
     },
     /// Schema for a table (sent before first data chunk)
     Schema {
-        table: String,
+        table_id: u16,
         columns: Vec<ColumnDef>,
     },
     /// Data chunk with rows in TSV format
     Data {
-        table: String,
+        table_id: u16,
         row_count: u32,
         tsv_data: Vec<u8>,
     },
     /// Table fully transferred
     TableDone {
-        table: String,
+        table_id: u16,
         row_count: u64,
         /// Partial server metrics snapshot (without per-query timings).
         /// Updated after each table so the client has metrics even on interruption.
@@ -135,8 +135,8 @@ pub enum ServerMessage {
     },
     /// All data transferred
     Done {
-        /// What the server decided for each table
-        table_dispositions: Vec<(String, TableDisposition)>,
+        /// What the server decided for each table (by interned table_id)
+        table_dispositions: Vec<(u16, TableDisposition)>,
         /// Performance metrics (only populated if --metrics flag was used)
         metrics: Option<ServerMetrics>,
     },

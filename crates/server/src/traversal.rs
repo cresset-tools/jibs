@@ -28,6 +28,7 @@ const MAX_IN_VALUES: usize = 10_000;
 /// A table task for parallel streaming
 struct TableTask {
     table: String,
+    table_id: u16,
     columns: Vec<ColumnDef>,
     anonymization: Vec<AnonymizeRule>,
 }
@@ -48,7 +49,7 @@ enum ChannelMessage {
 
 /// Encode and send a TSV chunk as a pre-encoded data frame through a channel.
 fn send_chunk(
-    table: &str,
+    table_id: u16,
     tsv_writer: &mut TsvWriter,
     chunk_row_count: u32,
     compression: CompressionMode,
@@ -70,7 +71,7 @@ fn send_chunk(
     metrics.add_compress_time(compress_start.elapsed());
 
     let compressed_len = compressed.len() as u64;
-    let encoded = jibs_protocol::encode_data_chunk(table, chunk_row_count, compressed);
+    let encoded = jibs_protocol::encode_data_chunk(table_id, chunk_row_count, compressed);
 
     tx.send(ChannelMessage::EncodedChunk(encoded))
         .map_err(|_| ServerError::Protocol("Channel closed".to_string()))?;
@@ -252,6 +253,7 @@ fn run_aggregate_bfs(
     compression: CompressionMode,
     tx: mpsc::SyncSender<ChannelMessage>,
     metrics: Arc<MetricsCollector>,
+    table_ids: Arc<HashMap<String, u16>>,
 ) -> Result<HashSet<String>> {
     let mut conn = MySqlConnection::connect(mysql_url)?;
 
@@ -385,7 +387,7 @@ fn run_aggregate_bfs(
                 // Send schema on first row
                 if schemas_sent.insert(root_table.clone()) {
                     tx.send(ChannelMessage::Control(ServerMessage::Schema {
-                        table: root_table.clone(),
+                        table_id: table_ids[root_table],
                         columns: columns.clone(),
                     }))
                     .map_err(|_| ServerError::Protocol("Channel closed".to_string()))?;
@@ -438,7 +440,7 @@ fn run_aggregate_bfs(
                     || tsv_writer.buffer_size() >= CHUNK_BYTE_LIMIT
                 {
                     send_chunk(
-                        root_table,
+                        table_ids[root_table],
                         &mut tsv_writer,
                         chunk_row_count,
                         compression,
@@ -463,7 +465,7 @@ fn run_aggregate_bfs(
         // Flush remaining root table data
         if chunk_row_count > 0 {
             send_chunk(
-                root_table,
+                table_ids[root_table],
                 &mut tsv_writer,
                 chunk_row_count,
                 compression,
@@ -655,7 +657,7 @@ fn run_aggregate_bfs(
                             // Send schema on first new row for this table
                             if schemas_sent.insert(table.clone()) {
                                 tx.send(ChannelMessage::Control(ServerMessage::Schema {
-                                    table: table.clone(),
+                                    table_id: table_ids[&table],
                                     columns: columns.clone(),
                                 }))
                                 .map_err(|_| {
@@ -674,7 +676,7 @@ fn run_aggregate_bfs(
                                 || tsv_writer.buffer_size() >= CHUNK_BYTE_LIMIT
                             {
                                 send_chunk(
-                                    &table,
+                                    table_ids[&table],
                                     &mut tsv_writer,
                                     chunk_row_count,
                                     compression,
@@ -698,7 +700,7 @@ fn run_aggregate_bfs(
 
                 if chunk_row_count > 0 {
                     send_chunk(
-                        &table,
+                        table_ids[&table],
                         &mut tsv_writer,
                         chunk_row_count,
                         compression,
@@ -751,7 +753,7 @@ fn run_aggregate_bfs(
     // Send TableDone for all aggregate tables that had rows
     for (table, row_count) in &table_row_counts {
         tx.send(ChannelMessage::Control(ServerMessage::TableDone {
-            table: table.clone(),
+            table_id: table_ids[table],
             row_count: *row_count,
             metrics: None,
         }))
@@ -778,6 +780,7 @@ fn run_aggregate_bfs(
             stream_full_table_to_channel(
                 &mut conn,
                 table,
+                table_ids[table],
                 &columns,
                 anonymization,
                 compression,
@@ -801,6 +804,8 @@ pub struct DependencyTraverser<'a> {
     plan: &'a ExecutionPlan,
     /// Metrics collector for timing
     metrics: Arc<MetricsCollector>,
+    /// Table name → interned u16 ID mapping
+    table_ids: Arc<HashMap<String, u16>>,
 }
 
 impl<'a> DependencyTraverser<'a> {
@@ -809,6 +814,7 @@ impl<'a> DependencyTraverser<'a> {
         conn: &'a mut MySqlConnection,
         plan: &'a ExecutionPlan,
         collect_metrics: bool,
+        table_ids: Arc<HashMap<String, u16>>,
     ) -> Result<Self> {
         let metrics = if collect_metrics {
             Arc::new(MetricsCollector::enabled())
@@ -820,6 +826,7 @@ impl<'a> DependencyTraverser<'a> {
             conn,
             plan,
             metrics,
+            table_ids,
         })
     }
 
@@ -837,7 +844,7 @@ impl<'a> DependencyTraverser<'a> {
         parallel: u32,
         mysql_url: &str,
         interrupt: &std::sync::atomic::AtomicBool,
-    ) -> Result<Vec<(String, TableDisposition)>> {
+    ) -> Result<Vec<(u16, TableDisposition)>> {
         let overall_start = Instant::now();
 
         // 1. Pre-cache schemas on self.conn, build table list
@@ -868,17 +875,18 @@ impl<'a> DependencyTraverser<'a> {
                 continue;
             }
             if self.plan.excluded_tables.contains(table) {
+                let tid = self.table_ids[table];
                 let columns = self.conn.get_column_defs(table)?;
                 let write_start = Instant::now();
                 writer.write_message_noflush(
                     &ServerMessage::Schema {
-                        table: table.clone(),
+                        table_id: tid,
                         columns,
                     },
                 )?;
                 writer.write_message_noflush(
                     &ServerMessage::TableDone {
-                        table: table.clone(),
+                        table_id: tid,
                         row_count: 0,
                         metrics: None,
                     },
@@ -902,6 +910,7 @@ impl<'a> DependencyTraverser<'a> {
                 .unwrap_or_default();
             full_table_tasks.push(TableTask {
                 table: table.clone(),
+                table_id: self.table_ids[table],
                 columns,
                 anonymization,
             });
@@ -933,6 +942,7 @@ impl<'a> DependencyTraverser<'a> {
                     let result = stream_full_table_to_channel(
                         &mut conn,
                         &task.table,
+                        task.table_id,
                         &task.columns,
                         task.anonymization,
                         compression,
@@ -962,6 +972,7 @@ impl<'a> DependencyTraverser<'a> {
             let pot_agg = potential_aggregate.clone();
             let mysql_url = mysql_url.to_string();
             let metrics = Arc::clone(&self.metrics);
+            let table_ids = Arc::clone(&self.table_ids);
 
             Some(std::thread::spawn(move || -> Result<HashSet<String>> {
                 run_aggregate_bfs(
@@ -972,6 +983,7 @@ impl<'a> DependencyTraverser<'a> {
                     compression,
                     bfs_tx,
                     metrics,
+                    table_ids,
                 )
             }))
         } else {
@@ -986,7 +998,7 @@ impl<'a> DependencyTraverser<'a> {
 
         // 8. Main thread becomes writer loop
         let mut interrupted = false;
-        let mut streamed_tables: HashSet<String> = HashSet::new();
+        let mut streamed_tables: HashSet<u16> = HashSet::new();
         loop {
             // Check for client interrupt between messages
             if interrupt.load(std::sync::atomic::Ordering::Relaxed) {
@@ -1009,12 +1021,12 @@ impl<'a> DependencyTraverser<'a> {
                     // For TableDone messages, attach a metrics snapshot so the
                     // client has server metrics even if the import is interrupted
                     let ctrl =
-                        if let ServerMessage::TableDone { table, row_count, .. } = ctrl {
+                        if let ServerMessage::TableDone { table_id, row_count, .. } = ctrl {
                             if row_count > 0 {
-                                streamed_tables.insert(table.clone());
+                                streamed_tables.insert(table_id);
                             }
                             ServerMessage::TableDone {
-                                table,
+                                table_id,
                                 row_count,
                                 metrics: self.metrics.snapshot(),
                             }
@@ -1080,19 +1092,20 @@ impl<'a> DependencyTraverser<'a> {
         }
 
         // 10. Assemble dispositions
-        let mut dispositions: Vec<(String, TableDisposition)> = Vec::new();
+        let mut dispositions: Vec<(u16, TableDisposition)> = Vec::new();
         for table in &all_table_names_vec {
             if self.plan.ignored_tables.contains(table) {
                 continue;
             }
+            let tid = self.table_ids[table];
             if excluded_set.contains(table) {
-                dispositions.push((table.clone(), TableDisposition::Excluded));
+                dispositions.push((tid, TableDisposition::Excluded));
             } else if actual_aggregate_tables.contains(table) {
-                dispositions.push((table.clone(), TableDisposition::Aggregate));
-            } else if streamed_tables.contains(table) {
-                dispositions.push((table.clone(), TableDisposition::Full));
+                dispositions.push((tid, TableDisposition::Aggregate));
+            } else if streamed_tables.contains(&tid) {
+                dispositions.push((tid, TableDisposition::Full));
             } else {
-                dispositions.push((table.clone(), TableDisposition::Empty));
+                dispositions.push((tid, TableDisposition::Empty));
             }
         }
 
@@ -1248,6 +1261,7 @@ fn maybe_compress(data: Vec<u8>, mode: CompressionMode) -> Vec<u8> {
 fn stream_full_table_to_channel(
     conn: &mut MySqlConnection,
     table: &str,
+    table_id: u16,
     columns: &[ColumnDef],
     anonymization: Vec<AnonymizeRule>,
     compression: CompressionMode,
@@ -1262,7 +1276,7 @@ fn stream_full_table_to_channel(
 
     // Always send schema so the table is created locally even if empty
     tx.send(ChannelMessage::Control(ServerMessage::Schema {
-        table: table.to_string(),
+        table_id,
         columns: columns.to_vec(),
     }))
     .map_err(|_| crate::error::ServerError::Protocol("Channel closed".to_string()))?;
@@ -1297,7 +1311,7 @@ fn stream_full_table_to_channel(
             || tsv_writer.buffer_size() >= CHUNK_BYTE_LIMIT
         {
             send_chunk(
-                table,
+                table_id,
                 &mut tsv_writer,
                 chunk_row_count,
                 compression,
@@ -1311,7 +1325,7 @@ fn stream_full_table_to_channel(
     // Flush remaining data
     if chunk_row_count > 0 {
         send_chunk(
-            table,
+            table_id,
             &mut tsv_writer,
             chunk_row_count,
             compression,
@@ -1322,7 +1336,7 @@ fn stream_full_table_to_channel(
 
     // Send TableDone (always, even for empty tables so the client marks them complete)
     tx.send(ChannelMessage::Control(ServerMessage::TableDone {
-        table: table.to_string(),
+        table_id,
         row_count: total_rows,
         metrics: None,
     }))

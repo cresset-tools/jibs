@@ -983,6 +983,12 @@ async fn run_protocol_inner(
         }
     };
 
+    // Build table_id → name reverse lookup
+    let id_to_name: std::collections::HashMap<u16, String> = tables
+        .iter()
+        .map(|t| (t.table_id, t.name.clone()))
+        .collect();
+
     // Create table info map for estimated rows lookup
     let table_info: std::collections::HashMap<String, u64> = tables
         .iter()
@@ -1090,17 +1096,20 @@ async fn run_protocol_inner(
         }
 
         match msg {
-            ServerMessage::Schema { table, columns } => {
+            ServerMessage::Schema { table_id, columns } => {
+                let table = id_to_name.get(&table_id)
+                    .ok_or_else(|| anyhow::anyhow!("Unknown table_id {} in Schema", table_id))?;
+
                 // Check if this table was already completed in a previous run
-                if completed_tables.contains(&table) {
-                    progress.skip_table(&table);
+                if completed_tables.contains(table) {
+                    progress.skip_table(table);
                     skipped_tables.insert(table.clone());
                     continue;
                 }
 
                 // Get estimated rows for progress tracking
-                let estimated_rows = table_info.get(&table).copied().unwrap_or(0);
-                progress.start_table(&table, estimated_rows);
+                let estimated_rows = table_info.get(table).copied().unwrap_or(0);
+                progress.start_table(table, estimated_rows);
 
                 // Store schema for this table
                 table_schemas.insert(table.clone(), Arc::new(columns.clone()));
@@ -1109,17 +1118,17 @@ async fn run_protocol_inner(
                 let table_preserves: Vec<&PreserveRule> = plan
                     .preserves
                     .iter()
-                    .filter(|p| p.table == table)
+                    .filter(|p| p.table == *table)
                     .collect();
 
                 if !table_preserves.is_empty() {
-                    if backup_preserved_rows(local_conn, &table, &table_preserves)? {
+                    if backup_preserved_rows(local_conn, table, &table_preserves)? {
                         tables_with_preserves.push(table.clone());
                     }
                 }
 
                 // Get anonymization rules for this table
-                let anon_rules = plan.anonymization.get(&table).cloned();
+                let anon_rules = plan.anonymization.get(table).cloned();
 
                 // Dispatch CREATE TABLE to loader pool (parallel) or run synchronously
                 if let Some(pool) = loader_pool {
@@ -1128,10 +1137,10 @@ async fn run_protocol_inner(
                         columns,
                         anon_rules,
                     )?;
-                    pending_ddls.insert(table, ddl_rx);
+                    pending_ddls.insert(table.clone(), ddl_rx);
                 } else {
                     let ddl_start = Instant::now();
-                    create_table(local_conn, &table, &columns, anon_rules.as_ref())?;
+                    create_table(local_conn, table, &columns, anon_rules.as_ref())?;
                     if config.collect_metrics {
                         client_metrics.add_ddl_time(ddl_start.elapsed());
                     }
@@ -1139,12 +1148,15 @@ async fn run_protocol_inner(
             }
 
             ServerMessage::Data {
-                table,
+                table_id,
                 row_count,
                 tsv_data,
             } => {
+                let table = id_to_name.get(&table_id)
+                    .ok_or_else(|| anyhow::anyhow!("Unknown table_id {} in Data", table_id))?;
+
                 // Skip data for already-completed tables
-                if skipped_tables.contains(&table) {
+                if skipped_tables.contains(table) {
                     debug!("Skipping data chunk for {} (already completed)", table);
                     continue;
                 }
@@ -1164,7 +1176,7 @@ async fn run_protocol_inner(
 
                 // Get schema for this table
                 let schema = table_schemas
-                    .get(&table)
+                    .get(table)
                     .cloned()
                     .ok_or_else(|| anyhow::anyhow!("No schema for table {}", table))?;
 
@@ -1173,7 +1185,7 @@ async fn run_protocol_inner(
                 // Load data into MySQL - use pool if available
                 if let Some(pool) = loader_pool {
                     // Ensure CREATE TABLE has completed before loading data
-                    if let Some(ddl_rx) = pending_ddls.remove(&table) {
+                    if let Some(ddl_rx) = pending_ddls.remove(table) {
                         let ddl_result = ddl_rx
                             .recv()
                             .map_err(|_| anyhow::anyhow!("DDL worker died for {}", table))?
@@ -1225,7 +1237,7 @@ async fn run_protocol_inner(
                     }
 
                     let load_start = Instant::now();
-                    let loaded = load_tsv_data(local_conn, &table, &schema, &decompressed)?;
+                    let loaded = load_tsv_data(local_conn, table, &schema, &decompressed)?;
                     if config.collect_metrics {
                         client_metrics.add_load_time(load_start.elapsed());
                         client_metrics.add_rows_loaded(loaded);
@@ -1234,24 +1246,27 @@ async fn run_protocol_inner(
                 }
 
                 // Update progress (use compressed size for byte tracking)
-                progress.update_table(&table, row_count, chunk_bytes);
+                progress.update_table(table, row_count, chunk_bytes);
             }
 
-            ServerMessage::TableDone { table, row_count, metrics: table_done_metrics } => {
+            ServerMessage::TableDone { table_id, row_count, metrics: table_done_metrics } => {
+                let table = id_to_name.get(&table_id)
+                    .ok_or_else(|| anyhow::anyhow!("Unknown table_id {} in TableDone", table_id))?;
+
                 // Store latest server metrics snapshot for use on interruption
                 if table_done_metrics.is_some() {
                     stats.server_metrics = table_done_metrics;
                 }
 
                 // Skip marking complete for already-completed tables
-                if skipped_tables.contains(&table) {
+                if skipped_tables.contains(table) {
                     debug!("Table {} was already complete", table);
                     continue;
                 }
 
                 // Ensure DDL completed for this table (handles 0-row tables
                 // where no Data message triggered the DDL wait)
-                if let Some(ddl_rx) = pending_ddls.remove(&table) {
+                if let Some(ddl_rx) = pending_ddls.remove(table) {
                     let ddl_result = ddl_rx
                         .recv()
                         .map_err(|_| anyhow::anyhow!("DDL worker died for {}", table))?
@@ -1339,7 +1354,8 @@ async fn run_protocol_inner(
                 // Log table report: show all server tables with their import disposition
                 {
                     use jibs_protocol::TableDisposition;
-                    let lines: Vec<String> = table_dispositions.iter().map(|(name, disp)| {
+                    let lines: Vec<String> = table_dispositions.iter().map(|(tid, disp)| {
+                        let name = id_to_name.get(tid).map(|s| s.as_str()).unwrap_or("?");
                         let label = match disp {
                             TableDisposition::Aggregate => "aggregate",
                             TableDisposition::Full => "full",
@@ -1467,10 +1483,10 @@ async fn recv_message(
         .map_err(|e| anyhow::anyhow!("Failed to read message body: {}", e))?;
 
     if is_raw_chunk {
-        let (table, row_count, tsv_data) = jibs_protocol::decode_data_chunk(buffer)
+        let (table_id, row_count, tsv_data) = jibs_protocol::decode_data_chunk(buffer)
             .map_err(|e| anyhow::anyhow!("Failed to decode data chunk: {}", e))?;
         Ok(ServerMessage::Data {
-            table,
+            table_id,
             row_count,
             tsv_data,
         })
@@ -1502,10 +1518,10 @@ async fn recv_message_from_reader(
         .map_err(|e| anyhow::anyhow!("Failed to read message body: {}", e))?;
 
     if is_raw_chunk {
-        let (table, row_count, tsv_data) = jibs_protocol::decode_data_chunk(buffer)
+        let (table_id, row_count, tsv_data) = jibs_protocol::decode_data_chunk(buffer)
             .map_err(|e| anyhow::anyhow!("Failed to decode data chunk: {}", e))?;
         Ok(ServerMessage::Data {
-            table,
+            table_id,
             row_count,
             tsv_data,
         })

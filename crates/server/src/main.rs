@@ -13,7 +13,7 @@ mod mysql;
 mod traversal;
 mod tsv;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, BufReader};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -139,8 +139,13 @@ fn run() -> Result<()> {
     // Connect to MySQL using credentials received via protocol
     let mut conn = MySqlConnection::connect(&mysql_url)?;
 
-    // Discover tables and build table info
+    // Discover tables and build table info (assigns u16 table IDs)
     let tables = conn.discover_tables(&mut plan)?;
+
+    // Build table name → u16 ID mapping for the wire protocol
+    let table_name_to_id: Arc<HashMap<String, u16>> = Arc::new(
+        tables.iter().map(|t| (t.name.clone(), t.table_id)).collect(),
+    );
 
     // Discover and merge database FK relations
     let explicit_count = plan.relations.len();
@@ -227,7 +232,7 @@ fn run() -> Result<()> {
                 }
             });
 
-            let mut traverser = DependencyTraverser::new(&mut conn, &plan, collect_metrics)?;
+            let mut traverser = DependencyTraverser::new(&mut conn, &plan, collect_metrics, Arc::clone(&table_name_to_id))?;
 
             let table_dispositions = match traverser.stream_all_tables(compression, &mut writer, parallel, &mysql_url, &interrupt) {
                 Ok(dispositions) => dispositions,
