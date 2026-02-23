@@ -70,6 +70,7 @@ impl MySqlConnection {
             }
         }
 
+        let mut next_id: u16 = 0;
         for table_name in &table_names {
             // Skip ignored tables
             if plan.ignored_tables.contains(table_name) {
@@ -90,9 +91,11 @@ impl MySqlConnection {
 
             tables.push(TableInfo {
                 name: table_name.clone(),
+                table_id: next_id,
                 estimated_rows,
                 primary_key,
             });
+            next_id += 1;
         }
 
         Ok(tables)

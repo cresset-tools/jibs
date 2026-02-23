@@ -273,6 +273,8 @@ pub struct Assignment {
 pub struct TableInfo {
     /// Table name
     pub name: String,
+    /// Interned table ID (u16) — used in all subsequent protocol messages
+    pub table_id: u16,
     /// Estimated row count
     pub estimated_rows: u64,
     /// Primary key columns
