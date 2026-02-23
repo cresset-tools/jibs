@@ -153,7 +153,7 @@ pub struct MessageWriter<W> {
     capacity: usize,
 }
 
-impl<W: Write> MessageWriter<W> {
+impl<W> MessageWriter<W> {
     pub fn with_capacity(capacity: usize, inner: W) -> Self {
         Self {
             inner,
@@ -162,6 +162,32 @@ impl<W: Write> MessageWriter<W> {
         }
     }
 
+    /// Encode a length-prefixed bincode message into the internal buffer,
+    /// returning the encoded bytes. Clears the buffer first.
+    ///
+    /// Use this for async callers that need to send the bytes themselves.
+    pub fn encode_message<T: Encode>(&mut self, message: &T) -> io::Result<&[u8]> {
+        self.buf.clear();
+        self.encode_into_buf(message)?;
+        Ok(&self.buf)
+    }
+
+    fn encode_into_buf<T: Encode>(&mut self, message: &T) -> io::Result<()> {
+        let len_pos = self.buf.len();
+        self.buf.extend_from_slice(&[0u8; 4]);
+
+        let mut encoder = BufEncoder { buf: &mut self.buf };
+        bincode::encode_into_std_write(message, &mut encoder, bincode_config())
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+        let msg_len = (self.buf.len() - len_pos - 4) as u32;
+        self.buf[len_pos..len_pos + 4].copy_from_slice(&msg_len.to_le_bytes());
+
+        Ok(())
+    }
+}
+
+impl<W: Write> MessageWriter<W> {
     /// Write a length-prefixed bincode message, then flush.
     pub fn write_message<T: Encode>(&mut self, message: &T) -> io::Result<()> {
         self.write_message_noflush(message)?;
@@ -174,20 +200,8 @@ impl<W: Write> MessageWriter<W> {
     /// messages before a single flush. Still flushes to the inner writer if
     /// the buffer exceeds capacity, to bound memory usage.
     pub fn write_message_noflush<T: Encode>(&mut self, message: &T) -> io::Result<()> {
-        // Reserve space for the length prefix
-        let len_pos = self.buf.len();
-        self.buf.extend_from_slice(&[0u8; 4]);
+        self.encode_into_buf(message)?;
 
-        // Encode directly into our buffer via a temporary Write adapter
-        let mut encoder = BufEncoder { buf: &mut self.buf };
-        bincode::encode_into_std_write(message, &mut encoder, bincode_config())
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-
-        // Patch the length prefix
-        let msg_len = (self.buf.len() - len_pos - 4) as u32;
-        self.buf[len_pos..len_pos + 4].copy_from_slice(&msg_len.to_le_bytes());
-
-        // Flush to inner writer if buffer has grown past capacity
         if self.buf.len() >= self.capacity {
             self.flush_buf()?;
         }
