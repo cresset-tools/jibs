@@ -6,7 +6,7 @@
 pub mod framing;
 pub mod messages;
 pub mod plan;
-pub use framing::{read_message, write_message};
+pub use framing::{read_message, write_message, MessageWriter};
 pub use messages::{ClientMessage, QueryTiming, ServerMessage, ServerMetrics, TableDisposition};
 pub use plan::{
     AnonymizeRule, AnonymizeTarget, Assignment, ColumnDef, ColumnFlags, CompressionMode,

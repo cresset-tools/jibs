@@ -141,6 +141,94 @@ pub fn read_data_message_header<R: Read>(reader: &mut R) -> io::Result<(DataMess
     Ok((msg_type, len - 1))
 }
 
+/// A buffered writer optimized for length-prefixed message framing.
+///
+/// Encodes bincode messages directly into a reusable internal buffer via a
+/// temporary [`BufEncoder`] that implements `io::Write`. The buffer may grow for
+/// large messages but never shrinks, so repeated messages of similar size
+/// allocate nothing.
+pub struct MessageWriter<W> {
+    inner: W,
+    buf: Vec<u8>,
+    capacity: usize,
+}
+
+impl<W: Write> MessageWriter<W> {
+    pub fn with_capacity(capacity: usize, inner: W) -> Self {
+        Self {
+            inner,
+            buf: Vec::with_capacity(capacity),
+            capacity,
+        }
+    }
+
+    /// Write a length-prefixed bincode message, then flush.
+    pub fn write_message<T: Encode>(&mut self, message: &T) -> io::Result<()> {
+        self.write_message_noflush(message)?;
+        self.flush()
+    }
+
+    /// Write a length-prefixed bincode message without flushing.
+    ///
+    /// Use this in hot paths where you want the buffer to coalesce multiple
+    /// messages before a single flush. Still flushes to the inner writer if
+    /// the buffer exceeds capacity, to bound memory usage.
+    pub fn write_message_noflush<T: Encode>(&mut self, message: &T) -> io::Result<()> {
+        // Reserve space for the length prefix
+        let len_pos = self.buf.len();
+        self.buf.extend_from_slice(&[0u8; 4]);
+
+        // Encode directly into our buffer via a temporary Write adapter
+        let mut encoder = BufEncoder { buf: &mut self.buf };
+        bincode::encode_into_std_write(message, &mut encoder, bincode_config())
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+        // Patch the length prefix
+        let msg_len = (self.buf.len() - len_pos - 4) as u32;
+        self.buf[len_pos..len_pos + 4].copy_from_slice(&msg_len.to_le_bytes());
+
+        // Flush to inner writer if buffer has grown past capacity
+        if self.buf.len() >= self.capacity {
+            self.flush_buf()?;
+        }
+
+        Ok(())
+    }
+
+    /// Flush the internal buffer to the inner writer.
+    pub fn flush(&mut self) -> io::Result<()> {
+        self.flush_buf()?;
+        self.inner.flush()
+    }
+
+    fn flush_buf(&mut self) -> io::Result<()> {
+        if !self.buf.is_empty() {
+            self.inner.write_all(&self.buf)?;
+            self.buf.clear();
+        }
+        Ok(())
+    }
+}
+
+/// Temporary `Write` adapter that appends into a borrowed `Vec<u8>`.
+///
+/// Created by [`MessageWriter`] during message encoding so that
+/// `bincode::encode_into_std_write` can write directly into the buffer.
+struct BufEncoder<'a> {
+    buf: &'a mut Vec<u8>,
+}
+
+impl Write for BufEncoder<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.buf.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,5 +272,64 @@ mod tests {
         let mut read_payload = vec![0u8; len];
         cursor.read_exact(&mut read_payload).unwrap();
         assert_eq!(read_payload, payload);
+    }
+
+    #[test]
+    fn test_message_writer_roundtrip() {
+        let msg = TestMessage {
+            value: "hello".to_string(),
+            count: 42,
+        };
+
+        let mut output = Vec::new();
+        let mut writer = MessageWriter::with_capacity(4096, &mut output);
+        writer.write_message(&msg).unwrap();
+
+        let mut cursor = Cursor::new(output);
+        let decoded: TestMessage = read_message(&mut cursor).unwrap();
+        assert_eq!(msg, decoded);
+    }
+
+    #[test]
+    fn test_message_writer_noflush_batches() {
+        let msg1 = TestMessage { value: "first".to_string(), count: 1 };
+        let msg2 = TestMessage { value: "second".to_string(), count: 2 };
+
+        let mut output = Vec::new();
+        {
+            let mut writer = MessageWriter::with_capacity(4096, &mut output);
+            writer.write_message_noflush(&msg1).unwrap();
+            writer.write_message_noflush(&msg2).unwrap();
+
+            // Not flushed yet — data is in the internal buffer
+            assert!(!writer.buf.is_empty());
+
+            writer.flush().unwrap();
+        }
+
+        // Now read both messages
+        let mut cursor = Cursor::new(output);
+        let decoded1: TestMessage = read_message(&mut cursor).unwrap();
+        let decoded2: TestMessage = read_message(&mut cursor).unwrap();
+        assert_eq!(msg1, decoded1);
+        assert_eq!(msg2, decoded2);
+    }
+
+    #[test]
+    fn test_message_writer_compatible_with_free_fn() {
+        // Verify MessageWriter produces identical bytes as the free function
+        let msg = TestMessage {
+            value: "compatibility".to_string(),
+            count: 99,
+        };
+
+        let mut free_fn_output = Vec::new();
+        write_message(&mut free_fn_output, &msg).unwrap();
+
+        let mut writer_output = Vec::new();
+        let mut writer = MessageWriter::with_capacity(4096, &mut writer_output);
+        writer.write_message(&msg).unwrap();
+
+        assert_eq!(free_fn_output, writer_output);
     }
 }
