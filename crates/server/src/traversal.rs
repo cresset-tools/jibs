@@ -5,7 +5,7 @@ use std::io::Write;
 use std::sync::{mpsc, Arc};
 use std::time::Instant;
 
-use jibs_protocol::framing::write_message_noflush;
+use jibs_protocol::MessageWriter;
 use mysql::{Row, Value as MySqlValue};
 
 use jibs_protocol::{
@@ -827,7 +827,7 @@ impl<'a> DependencyTraverser<'a> {
     pub fn stream_all_tables<W: Write>(
         &mut self,
         compression: CompressionMode,
-        writer: &mut W,
+        writer: &mut MessageWriter<W>,
         parallel: u32,
         mysql_url: &str,
         interrupt: &std::sync::atomic::AtomicBool,
@@ -864,15 +864,13 @@ impl<'a> DependencyTraverser<'a> {
             if self.plan.excluded_tables.contains(table) {
                 let columns = self.conn.get_column_defs(table)?;
                 let write_start = Instant::now();
-                write_message_noflush(
-                    writer,
+                writer.write_message_noflush(
                     &ServerMessage::Schema {
                         table: table.clone(),
                         columns,
                     },
                 )?;
-                write_message_noflush(
-                    writer,
+                writer.write_message_noflush(
                     &ServerMessage::TableDone {
                         table: table.clone(),
                         row_count: 0,
@@ -1011,7 +1009,7 @@ impl<'a> DependencyTraverser<'a> {
                 msg
             };
             let write_start = Instant::now();
-            write_message_noflush(writer, &msg)?;
+            writer.write_message_noflush(&msg)?;
             self.metrics.add_write_time(write_start.elapsed());
         }
         writer.flush()?;

@@ -14,13 +14,13 @@ mod traversal;
 mod tsv;
 
 use std::collections::HashSet;
-use std::io::{self, BufReader, BufWriter};
+use std::io::{self, BufReader};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use jibs_protocol::{
-    framing::{read_message, write_message},
-    ClientMessage, CompressionMode, ServerMessage,
+    framing::read_message,
+    ClientMessage, CompressionMode, MessageWriter, ServerMessage,
 };
 
 use crate::error::{Result, ServerError};
@@ -103,7 +103,7 @@ fn run() -> Result<()> {
     let stdout = io::stdout();
 
     let mut reader = BufReader::new(stdin);
-    let mut writer = BufWriter::with_capacity(1024 * 1024, stdout.lock());
+    let mut writer = MessageWriter::with_capacity(1024 * 1024, stdout.lock());
 
     // Read first message - could be Credentials or Init (backward compatibility)
     let first_msg: ClientMessage = read_message(&mut reader)?;
@@ -200,7 +200,7 @@ fn run() -> Result<()> {
         tables: tables.clone(),
         compression,
     };
-    write_message(&mut writer, &ready_msg)?;
+    writer.write_message(&ready_msg)?;
 
     // Wait for client to start
     let msg: ClientMessage = read_message(&mut reader)?;
@@ -235,7 +235,7 @@ fn run() -> Result<()> {
                     // On interrupt, still send Done with partial metrics
                     if interrupt.load(Ordering::SeqCst) {
                         let metrics = traverser.get_metrics();
-                        let _ = write_message(&mut writer, &ServerMessage::Done {
+                        let _ = writer.write_message(&ServerMessage::Done {
                             table_dispositions: Vec::new(),
                             metrics,
                         });
@@ -246,7 +246,7 @@ fn run() -> Result<()> {
                         message: e.to_string(),
                         recoverable: e.is_recoverable(),
                     };
-                    write_message(&mut writer, &error_msg)?;
+                    writer.write_message(&error_msg)?;
                     return Err(e);
                 }
             };
@@ -255,7 +255,7 @@ fn run() -> Result<()> {
             let metrics = traverser.get_metrics();
 
             // Send completion message
-            write_message(&mut writer, &ServerMessage::Done { table_dispositions, metrics })?;
+            writer.write_message(&ServerMessage::Done { table_dispositions, metrics })?;
 
             // Wait for listener thread (will get Shutdown from client)
             let _ = listener_handle.join();
