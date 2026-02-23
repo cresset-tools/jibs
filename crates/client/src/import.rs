@@ -1454,7 +1454,9 @@ async fn recv_message(
         .read_exact(&mut len_bytes)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to read message length: {}", e))?;
-    let len = u32::from_le_bytes(len_bytes) as usize;
+    let raw_len = u32::from_le_bytes(len_bytes);
+    let is_raw_chunk = raw_len & jibs_protocol::RAW_CHUNK_FLAG != 0;
+    let len = (raw_len & !jibs_protocol::RAW_CHUNK_FLAG) as usize;
 
     validate_message_length(len, max_message_size)?;
 
@@ -1464,7 +1466,17 @@ async fn recv_message(
         .await
         .map_err(|e| anyhow::anyhow!("Failed to read message body: {}", e))?;
 
-    decode_server_message(&buffer)
+    if is_raw_chunk {
+        let (table, row_count, tsv_data) = jibs_protocol::decode_data_chunk(buffer)
+            .map_err(|e| anyhow::anyhow!("Failed to decode data chunk: {}", e))?;
+        Ok(ServerMessage::Data {
+            table,
+            row_count,
+            tsv_data,
+        })
+    } else {
+        decode_server_message(&buffer)
+    }
 }
 
 /// Receive a message from a ProcessReader (split read half)
@@ -1477,7 +1489,9 @@ async fn recv_message_from_reader(
         .read_exact(&mut len_bytes)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to read message length: {}", e))?;
-    let len = u32::from_le_bytes(len_bytes) as usize;
+    let raw_len = u32::from_le_bytes(len_bytes);
+    let is_raw_chunk = raw_len & jibs_protocol::RAW_CHUNK_FLAG != 0;
+    let len = (raw_len & !jibs_protocol::RAW_CHUNK_FLAG) as usize;
 
     validate_message_length(len, max_message_size)?;
 
@@ -1487,7 +1501,17 @@ async fn recv_message_from_reader(
         .await
         .map_err(|e| anyhow::anyhow!("Failed to read message body: {}", e))?;
 
-    decode_server_message(&buffer)
+    if is_raw_chunk {
+        let (table, row_count, tsv_data) = jibs_protocol::decode_data_chunk(buffer)
+            .map_err(|e| anyhow::anyhow!("Failed to decode data chunk: {}", e))?;
+        Ok(ServerMessage::Data {
+            table,
+            row_count,
+            tsv_data,
+        })
+    } else {
+        decode_server_message(&buffer)
+    }
 }
 
 /// Send a message using a ProcessWriter (split write half)

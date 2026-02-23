@@ -6,7 +6,10 @@
 pub mod framing;
 pub mod messages;
 pub mod plan;
-pub use framing::{read_message, write_message, MessageWriter};
+pub use framing::{
+    decode_data_chunk, encode_data_chunk, read_message, write_message, MessageWriter,
+    RAW_CHUNK_FLAG,
+};
 pub use messages::{ClientMessage, QueryTiming, ServerMessage, ServerMetrics, TableDisposition};
 pub use plan::{
     AnonymizeRule, AnonymizeTarget, Assignment, ColumnDef, ColumnFlags, CompressionMode,
