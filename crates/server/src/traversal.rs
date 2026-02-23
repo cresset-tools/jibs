@@ -10,7 +10,7 @@ use mysql::{Row, Value as MySqlValue};
 
 use jibs_protocol::{
     AnonymizeRule, ColumnDef, CompressionMode, ExecutionPlan, Relation, ResolvedAggregate,
-    ServerMessage, ServerMetrics, SortDirection, TableDisposition,
+    ServerMessage, ServerMetrics, SortDirection, TableDisposition, RAW_CHUNK_HEADER_LEN,
 };
 
 use crate::error::{Result, ServerError};
@@ -51,7 +51,7 @@ enum ChannelMessage {
 fn send_chunk(
     table_id: u16,
     tsv_writer: &mut TsvWriter,
-    chunk_row_count: u32,
+    chunk_row_count: u16,
     compression: CompressionMode,
     tx: &mpsc::SyncSender<ChannelMessage>,
     metrics: &MetricsCollector,
@@ -60,18 +60,16 @@ fn send_chunk(
         return Ok(());
     }
 
-    let tsv_data = tsv_writer.take_buffer();
-    let bytes = tsv_data.len() as u64;
-
+    let bytes = tsv_writer.buffer_size() as u64;
     metrics.add_bytes_sent(bytes);
     metrics.add_rows_sent(chunk_row_count as u64);
 
     let compress_start = Instant::now();
-    let compressed = maybe_compress(tsv_data, compression);
+    let encoded = tsv_writer.take_encoded_chunk(table_id, chunk_row_count, compression);
     metrics.add_compress_time(compress_start.elapsed());
 
-    let compressed_len = compressed.len() as u64;
-    let encoded = jibs_protocol::encode_data_chunk(table_id, chunk_row_count, compressed);
+    // Payload length is everything after the 4-byte frame length prefix
+    let compressed_len = (encoded.len() - RAW_CHUNK_HEADER_LEN) as u64;
 
     tx.send(ChannelMessage::EncodedChunk(encoded))
         .map_err(|_| ServerError::Protocol("Channel closed".to_string()))?;
@@ -350,7 +348,7 @@ fn run_aggregate_bfs(
         let column_names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
         let mut tsv_writer =
             TsvWriter::new(column_names, anonymization, plan.fakers.clone());
-        let mut chunk_row_count: u32 = 0;
+        let mut chunk_row_count: u16 = 0;
 
         // Accumulators for FK values
         let mut backward_fk_vecs: Vec<Vec<MySqlValue>> =
@@ -436,7 +434,7 @@ fn run_aggregate_bfs(
                 chunk_row_count += 1;
                 *table_row_counts.entry(root_table.clone()).or_default() += 1;
 
-                if chunk_row_count >= CHUNK_ROW_LIMIT as u32
+                if chunk_row_count >= CHUNK_ROW_LIMIT as u16
                     || tsv_writer.buffer_size() >= CHUNK_BYTE_LIMIT
                 {
                     send_chunk(
@@ -569,7 +567,7 @@ fn run_aggregate_bfs(
                     anonymization,
                     plan.fakers.clone(),
                 );
-                let mut chunk_row_count: u32 = 0;
+                let mut chunk_row_count: u16 = 0;
 
                 let mut fwd_fk_vecs: Vec<Vec<MySqlValue>> =
                     vec![Vec::new(); forward_relations.len()];
@@ -672,7 +670,7 @@ fn run_aggregate_bfs(
                             chunk_row_count += 1;
                             *row_count_entry += 1;
 
-                            if chunk_row_count >= CHUNK_ROW_LIMIT as u32
+                            if chunk_row_count >= CHUNK_ROW_LIMIT as u16
                                 || tsv_writer.buffer_size() >= CHUNK_BYTE_LIMIT
                             {
                                 send_chunk(
@@ -1238,24 +1236,6 @@ fn serialize_pk(pk: &[MySqlValue]) -> Vec<u8> {
     bytes
 }
 
-/// Optionally compress data based on compression mode
-fn maybe_compress(data: Vec<u8>, mode: CompressionMode) -> Vec<u8> {
-    match mode {
-        CompressionMode::None | CompressionMode::Auto => data,
-        CompressionMode::Zstd => {
-            match zstd::encode_all(data.as_slice(), 3) {
-                Ok(compressed) => {
-                    let mut result = Vec::with_capacity(4 + compressed.len());
-                    result.extend_from_slice(&(data.len() as u32).to_le_bytes());
-                    result.extend(compressed);
-                    result
-                }
-                Err(_) => data,
-            }
-        }
-    }
-}
-
 /// Stream a full table using its own MySQL connection, sending messages through a channel.
 /// Used by worker threads in parallel mode.
 fn stream_full_table_to_channel(
@@ -1272,7 +1252,7 @@ fn stream_full_table_to_channel(
     let column_names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
     let mut tsv_writer = TsvWriter::new(column_names, anonymization, fakers.clone());
     let mut total_rows: u64 = 0;
-    let mut chunk_row_count: u32 = 0;
+    let mut chunk_row_count: u16 = 0;
 
     // Always send schema so the table is created locally even if empty
     tx.send(ChannelMessage::Control(ServerMessage::Schema {
@@ -1307,7 +1287,7 @@ fn stream_full_table_to_channel(
         chunk_row_count += 1;
         total_rows += 1;
 
-        if chunk_row_count >= CHUNK_ROW_LIMIT as u32
+        if chunk_row_count >= CHUNK_ROW_LIMIT as u16
             || tsv_writer.buffer_size() >= CHUNK_BYTE_LIMIT
         {
             send_chunk(
