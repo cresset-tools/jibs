@@ -21,7 +21,7 @@ use crate::tsv::TsvWriter;
 /// Maximum rows per chunk
 const CHUNK_ROW_LIMIT: usize = 10_000;
 /// Maximum bytes per chunk
-const CHUNK_BYTE_LIMIT: usize = 10 * 1024 * 1024; // 10MB
+const CHUNK_BYTE_LIMIT: usize = 512 * 1024; // 512kb
 /// Maximum number of values in a single IN clause to stay under MySQL's max_allowed_packet
 const MAX_IN_VALUES: usize = 10_000;
 

@@ -11,8 +11,8 @@ use mysql::{Conn, LocalInfileHandler, Opts};
 use tracing::{debug, info, warn};
 
 use jibs_protocol::{
-    framing::write_message, ClientMessage, ColumnDef, CompressionMode, ExecutionPlan,
-    PreserveRule, ServerMessage, ServerMetrics, SetRule, Value,
+    ClientMessage, ColumnDef, CompressionMode, ExecutionPlan, MessageWriter, PreserveRule,
+    ServerMessage, ServerMetrics, SetRule, Value,
 };
 
 use crate::metrics::ClientMetrics;
@@ -706,10 +706,11 @@ pub async fn run_import(config: ImportConfig) -> Result<()> {
     let mut server = session.start_process(&server_path).await?;
 
     // Send credentials via protocol (not visible in process listing)
+    let mut encoder: MessageWriter<()> = MessageWriter::with_capacity(4096, ());
     let creds_msg = ClientMessage::Credentials {
         mysql_url: config.remote_mysql.clone(),
     };
-    send_message(&mut server, &creds_msg).await?;
+    send_message(&mut server, &mut encoder, &creds_msg).await?;
 
     // Run the import protocol (takes ownership of server for split)
     let protocol_config = ProtocolConfig {
@@ -723,7 +724,7 @@ pub async fn run_import(config: ImportConfig) -> Result<()> {
         parallel: config.parallel as u32,
         collect_metrics: config.collect_metrics,
     };
-    let outcome = run_protocol(server, &mut local_conn, loader_pool, plan, protocol_config).await;
+    let outcome = run_protocol(server, &mut local_conn, loader_pool, plan, protocol_config, encoder).await;
 
     // Shutdown loader pool if used
     if let Some(pool) = outcome.loader_pool {
@@ -904,6 +905,7 @@ async fn run_protocol(
     loader_pool: Option<LoaderPool>,
     plan: ExecutionPlan,
     config: ProtocolConfig,
+    encoder: MessageWriter<()>,
 ) -> ProtocolOutcome {
     let mut stats = ImportStats {
         tables_imported: 0,
@@ -918,7 +920,7 @@ async fn run_protocol(
         client_metrics.start();
     }
 
-    let result = run_protocol_inner(server, local_conn, &loader_pool, plan, &config, &mut stats, &mut client_metrics).await;
+    let result = run_protocol_inner(server, local_conn, &loader_pool, plan, &config, &mut stats, &mut client_metrics, encoder).await;
 
     // Always stop metrics timing
     if config.collect_metrics {
@@ -942,6 +944,7 @@ async fn run_protocol_inner(
     config: &ProtocolConfig,
     stats: &mut ImportStats,
     client_metrics: &mut ClientMetrics,
+    mut encoder: MessageWriter<()>,
 ) -> Result<()> {
 
     // Set up checkpointing
@@ -960,7 +963,7 @@ async fn run_protocol_inner(
         parallel: config.parallel,
         collect_metrics: config.collect_metrics,
     };
-    send_message(&mut server, &init_msg).await?;
+    send_message(&mut server, &mut encoder, &init_msg).await?;
 
     // Wait for Ready
     let ready_msg: ServerMessage = recv_message(&mut server, config.max_message_size).await?;
@@ -992,7 +995,7 @@ async fn run_protocol_inner(
 
     // Send Start message
     debug!("Starting data transfer");
-    send_message(&mut server, &ClientMessage::Start).await?;
+    send_message(&mut server, &mut encoder, &ClientMessage::Start).await?;
 
     // Track tables with preserved backups
     let mut tables_with_preserves: Vec<String> = Vec::new();
@@ -1399,18 +1402,22 @@ async fn run_protocol_inner(
     Checkpoint::cleanup(local_conn)?;
 
     // Send shutdown
-    send_message_writer(&mut writer, &ClientMessage::Shutdown).await?;
+    send_message_writer(&mut writer, &mut encoder, &ClientMessage::Shutdown).await?;
 
     Ok(())
 }
 
 /// Send a message to the server
-async fn send_message(server: &mut RemoteProcess, msg: &ClientMessage) -> Result<()> {
-    let mut buffer = Vec::new();
-    write_message(&mut buffer, msg)
+async fn send_message(
+    server: &mut RemoteProcess,
+    encoder: &mut MessageWriter<()>,
+    msg: &ClientMessage,
+) -> Result<()> {
+    let bytes = encoder
+        .encode_message(msg)
         .map_err(|e| anyhow::anyhow!("Failed to serialize message: {}", e))?;
     server
-        .write(&buffer)
+        .write(bytes)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to send message: {}", e))?;
     Ok(())
@@ -1484,12 +1491,16 @@ async fn recv_message_from_reader(
 }
 
 /// Send a message using a ProcessWriter (split write half)
-async fn send_message_writer(writer: &mut ProcessWriter, msg: &ClientMessage) -> Result<()> {
-    let mut buffer = Vec::new();
-    write_message(&mut buffer, msg)
+async fn send_message_writer(
+    writer: &mut ProcessWriter,
+    encoder: &mut MessageWriter<()>,
+    msg: &ClientMessage,
+) -> Result<()> {
+    let bytes = encoder
+        .encode_message(msg)
         .map_err(|e| anyhow::anyhow!("Failed to serialize message: {}", e))?;
     writer
-        .write(&buffer)
+        .write(bytes)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to send message: {}", e))?;
     Ok(())
