@@ -205,11 +205,12 @@ impl MetricsCollector {
         }
     }
 
-    /// Set wall-clock time for full table streaming (Phase 2)
+    /// Set wall-clock time for full table streaming (Phase 2).
+    /// Uses fetch_max so concurrent workers report correctly (longest wins).
     pub fn set_full_tables_wall_time(&self, duration: Duration) {
         if self.enabled {
             self.full_tables_wall_ns
-                .store(duration.as_nanos() as u64, Ordering::Relaxed);
+                .fetch_max(duration.as_nanos() as u64, Ordering::Relaxed);
         }
     }
 

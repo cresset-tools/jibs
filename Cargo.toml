@@ -39,6 +39,7 @@ rand = "0.8"
 
 # Shared
 hex = "0.4"
+crossbeam-channel = "0.5"
 indicatif = "0.17"
 
 # Use vendored mysql implementation

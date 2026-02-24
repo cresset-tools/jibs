@@ -61,12 +61,16 @@ impl MySqlConnection {
         // Expand regex patterns into the exact table name sets
         let ignored_regexes = compile_patterns(&plan.ignored_patterns)?;
         let excluded_regexes = compile_patterns(&plan.excluded_patterns)?;
+        let full_regexes = compile_patterns(&plan.full_patterns)?;
         for table_name in &table_names {
             if ignored_regexes.iter().any(|re| re.is_match(table_name)) {
                 plan.ignored_tables.insert(table_name.clone());
             }
             if excluded_regexes.iter().any(|re| re.is_match(table_name)) {
                 plan.excluded_tables.insert(table_name.clone());
+            }
+            if full_regexes.iter().any(|re| re.is_match(table_name)) {
+                plan.full_tables.insert(table_name.clone());
             }
         }
 
