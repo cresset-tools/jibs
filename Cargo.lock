@@ -1017,6 +1017,7 @@ dependencies = [
  "anyhow",
  "bincode",
  "clap",
+ "crossbeam-channel",
  "directories",
  "hex",
  "indicatif",

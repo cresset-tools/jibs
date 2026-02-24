@@ -287,7 +287,7 @@ where
         .map(StatementKind::Ignore)
 }
 
-/// Parse: full table1, table2, ...
+/// Parse: full table1, table2, /pattern/, ...
 fn full_parser<'tokens, 'src: 'tokens, I>(
 ) -> impl Parser<'tokens, I, StatementKind<'src>, extra::Err<Rich<'tokens, Token<'src>, Span>>> + Clone
 where
@@ -295,7 +295,7 @@ where
 {
     just(Token::Full)
         .ignore_then(
-            ident()
+            table_pattern()
                 .separated_by(just(Token::Comma))
                 .at_least(1)
                 .collect::<Vec<_>>()
@@ -855,10 +855,40 @@ mod tests {
         let program = parse("full store, catalog_category_entity");
         assert_eq!(program.statements.len(), 1);
         match &program.statements[0].0.kind {
-            StatementKind::Full(tables) => {
-                assert_eq!(tables.len(), 2);
-                assert_eq!(tables[0].0, "store");
-                assert_eq!(tables[1].0, "catalog_category_entity");
+            StatementKind::Full(patterns) => {
+                assert_eq!(patterns.len(), 2);
+                match &patterns[0] {
+                    TablePattern::Exact((name, _)) => assert_eq!(*name, "store"),
+                    _ => panic!("Expected Exact pattern"),
+                }
+                match &patterns[1] {
+                    TablePattern::Exact((name, _)) => assert_eq!(*name, "catalog_category_entity"),
+                    _ => panic!("Expected Exact pattern"),
+                }
+            }
+            _ => panic!("Expected Full"),
+        }
+    }
+
+    #[test]
+    fn test_full_with_regex() {
+        let program = parse("full store, /^eav_/, catalog_category_entity");
+        assert_eq!(program.statements.len(), 1);
+        match &program.statements[0].0.kind {
+            StatementKind::Full(patterns) => {
+                assert_eq!(patterns.len(), 3);
+                match &patterns[0] {
+                    TablePattern::Exact((name, _)) => assert_eq!(*name, "store"),
+                    _ => panic!("Expected Exact pattern"),
+                }
+                match &patterns[1] {
+                    TablePattern::Regex((pattern, _)) => assert_eq!(*pattern, "^eav_"),
+                    _ => panic!("Expected Regex pattern"),
+                }
+                match &patterns[2] {
+                    TablePattern::Exact((name, _)) => assert_eq!(*name, "catalog_category_entity"),
+                    _ => panic!("Expected Exact pattern"),
+                }
             }
             _ => panic!("Expected Full"),
         }

@@ -51,6 +51,8 @@ pub struct ExecutionPlan {
     pub sets: Vec<SetRule>,
     /// Tables to import in full (skip BFS filtering)
     pub full_tables: HashSet<String>,
+    /// Regex patterns for tables to import in full (expanded server-side)
+    pub full_patterns: Vec<String>,
     /// After blocks (raw SQL to run post-import)
     ///
     /// Statements are executed in order. When imports are used, the order is
@@ -80,6 +82,7 @@ impl ExecutionPlan {
             anonymization: HashMap::new(),
             fakers: HashMap::new(),
             full_tables: HashSet::new(),
+            full_patterns: Vec::new(),
             preserves: Vec::new(),
             sets: Vec::new(),
             after_statements: Vec::new(),

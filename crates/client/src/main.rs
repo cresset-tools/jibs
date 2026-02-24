@@ -69,9 +69,13 @@ struct ConnectionArgs {
     #[arg(long = "var-file")]
     var_file: Option<PathBuf>,
 
-    /// Number of parallel SSH sessions
+    /// Number of parallel server-side workers
     #[arg(long, default_value = "1")]
     parallel: usize,
+
+    /// Number of parallel local MySQL loader workers (defaults to --parallel if not set)
+    #[arg(long)]
+    client_parallel: Option<usize>,
 
     /// Disable compression (compression is enabled by default)
     #[arg(long)]
@@ -225,6 +229,7 @@ async fn run_import(args: ImportArgs) -> Result<()> {
         resume: args.resume,
         clean: args.clean,
         parallel: args.connection.parallel,
+        client_parallel: args.connection.client_parallel,
         compression,
         identity_file: args.connection.identity,
         ssh_port: args.connection.port,
@@ -264,6 +269,7 @@ async fn run_get(args: GetArgs) -> Result<()> {
         resume: false,
         clean: false,
         parallel: args.connection.parallel,
+        client_parallel: args.connection.client_parallel,
         compression,
         identity_file: args.connection.identity,
         ssh_port: args.connection.port,

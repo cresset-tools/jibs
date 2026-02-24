@@ -315,9 +315,16 @@ impl Resolver {
                 }
                 Ok(())
             }
-            StatementKind::Full(tables) => {
-                for (table, _span) in tables {
-                    self.plan.full_tables.insert(table.to_string());
+            StatementKind::Full(patterns) => {
+                for pattern in patterns {
+                    match pattern {
+                        TablePattern::Exact((table, _span)) => {
+                            self.plan.full_tables.insert(table.to_string());
+                        }
+                        TablePattern::Regex((pattern, _span)) => {
+                            self.plan.full_patterns.push(pattern.to_string());
+                        }
+                    }
                 }
                 Ok(())
             }

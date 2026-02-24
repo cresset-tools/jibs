@@ -37,7 +37,7 @@ enum LoadWork {
         table: String,
         columns: Vec<ColumnDef>,
         anon_rules: Option<Vec<jibs_protocol::AnonymizeRule>>,
-        result_tx: std::sync::mpsc::Sender<Result<DdlResult>>,
+        result_tx: crossbeam_channel::Sender<Result<DdlResult>>,
     },
     /// Decompress + LOAD DATA for a chunk of rows
     LoadData {
@@ -45,7 +45,7 @@ enum LoadWork {
         columns: Arc<Vec<ColumnDef>>,
         data: Vec<u8>,
         compression: CompressionMode,
-        result_tx: std::sync::mpsc::Sender<Result<LoadResult>>,
+        result_tx: crossbeam_channel::Sender<Result<LoadResult>>,
     },
 }
 
@@ -57,7 +57,7 @@ enum WorkerInitResult {
 
 /// Pool of loader workers for parallel data loading
 struct LoaderPool {
-    work_tx: std::sync::mpsc::Sender<LoadWork>,
+    work_tx: crossbeam_channel::Sender<LoadWork>,
     worker_handles: Vec<std::thread::JoinHandle<()>>,
 }
 
@@ -65,18 +65,16 @@ impl LoaderPool {
     /// Create a new loader pool with N workers
     /// Returns an error if any worker fails to initialize
     fn new(mysql_url: &str, num_workers: usize) -> Result<Self> {
-        // Use std sync channel for thread workers
-        let (work_tx, work_rx) = std::sync::mpsc::channel::<LoadWork>();
-        let work_rx = Arc::new(std::sync::Mutex::new(work_rx));
+        let (work_tx, work_rx) = crossbeam_channel::unbounded::<LoadWork>();
 
         // Channel for workers to report initialization status
-        let (init_tx, init_rx) = std::sync::mpsc::channel::<(usize, WorkerInitResult)>();
+        let (init_tx, init_rx) = crossbeam_channel::unbounded::<(usize, WorkerInitResult)>();
 
         let mut worker_handles = Vec::with_capacity(num_workers);
 
         for worker_id in 0..num_workers {
             let url = mysql_url.to_string();
-            let rx = Arc::clone(&work_rx);
+            let rx = work_rx.clone();
             let init_reporter = init_tx.clone();
 
             let handle = std::thread::spawn(move || {
@@ -123,10 +121,7 @@ impl LoaderPool {
 
                 // Process work items
                 loop {
-                    let work = {
-                        let rx_guard = rx.lock().unwrap();
-                        rx_guard.recv()
-                    };
+                    let work = rx.recv();
 
                     let work = match work {
                         Ok(w) => w,
@@ -172,7 +167,7 @@ impl LoaderPool {
                                     &mut conn,
                                     &table,
                                     &columns,
-                                    &decompressed,
+                                    decompressed,
                                 )?;
                                 let load_ns = load_start.elapsed().as_nanos() as u64;
 
@@ -211,7 +206,7 @@ impl LoaderPool {
                 Ok((worker_id, WorkerInitResult::Failed(msg))) => {
                     failed_workers.push((worker_id, msg));
                 }
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                     // Worker didn't respond in time - likely stuck connecting
                     return Err(anyhow::anyhow!(
                         "Loader pool initialization timed out after {}s ({}/{} workers ready). \
@@ -222,7 +217,7 @@ impl LoaderPool {
                         mysql_url
                     ));
                 }
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
                     // Channel closed unexpectedly
                     return Err(anyhow::anyhow!(
                         "Loader pool initialization failed: channel closed ({}/{} workers ready)",
@@ -261,8 +256,8 @@ impl LoaderPool {
         table: String,
         columns: Vec<ColumnDef>,
         anon_rules: Option<Vec<jibs_protocol::AnonymizeRule>>,
-    ) -> Result<std::sync::mpsc::Receiver<Result<DdlResult>>> {
-        let (result_tx, result_rx) = std::sync::mpsc::channel();
+    ) -> Result<crossbeam_channel::Receiver<Result<DdlResult>>> {
+        let (result_tx, result_rx) = crossbeam_channel::unbounded();
 
         self.work_tx
             .send(LoadWork::CreateTable {
@@ -284,8 +279,8 @@ impl LoaderPool {
         columns: Arc<Vec<ColumnDef>>,
         data: Vec<u8>,
         compression: CompressionMode,
-    ) -> Result<std::sync::mpsc::Receiver<Result<LoadResult>>> {
-        let (result_tx, result_rx) = std::sync::mpsc::channel();
+    ) -> Result<crossbeam_channel::Receiver<Result<LoadResult>>> {
+        let (result_tx, result_rx) = crossbeam_channel::unbounded();
 
         self.work_tx
             .send(LoadWork::LoadData {
@@ -317,7 +312,7 @@ fn load_tsv_data_with_conn(
     conn: &mut Conn,
     table: &str,
     columns: &[ColumnDef],
-    tsv_data: &[u8],
+    tsv_data: Vec<u8>,
 ) -> Result<u64> {
     use std::io::Write;
 
@@ -326,7 +321,7 @@ fn load_tsv_data_with_conn(
     }
 
     // Set up the local infile handler
-    let data = tsv_data.to_vec();
+    let data = tsv_data;
 
     let handler = LocalInfileHandler::new(move |_file_name, local_infile| {
         local_infile.write_all(&data)?;
@@ -397,7 +392,7 @@ impl LoadAccum {
     }
 }
 
-type PendingLoad = (String, std::sync::mpsc::Receiver<Result<LoadResult>>);
+type PendingLoad = (String, crossbeam_channel::Receiver<Result<LoadResult>>);
 
 /// Info needed to finalize a table after all its loads complete
 struct DeferredTableDone {
@@ -424,8 +419,8 @@ fn drain_completed_loads(
                 load_accum.add(&result);
             }
             Ok(Err(e)) => return Err(anyhow::anyhow!("Loader error for {}: {}", table, e)),
-            Err(std::sync::mpsc::TryRecvError::Empty) => still_pending.push((table, rx)),
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+            Err(crossbeam_channel::TryRecvError::Empty) => still_pending.push((table, rx)),
+            Err(crossbeam_channel::TryRecvError::Disconnected) => {
                 return Err(anyhow::anyhow!("Loader worker died for {}", table))
             }
         }
@@ -488,7 +483,7 @@ fn finalize_completed_tables(
 /// Wait for a specific load to complete (blocking)
 fn wait_for_load(
     table: &str,
-    rx: &std::sync::mpsc::Receiver<Result<LoadResult>>,
+    rx: &crossbeam_channel::Receiver<Result<LoadResult>>,
 ) -> Result<LoadResult> {
     match rx.recv() {
         Ok(Ok(result)) => Ok(result),
@@ -538,6 +533,8 @@ pub struct ImportConfig {
     pub resume: bool,
     pub clean: bool,
     pub parallel: usize,
+    /// Number of client-side loader pool workers (None = use `parallel` value)
+    pub client_parallel: Option<usize>,
     pub compression: CompressionMode,
     pub identity_file: Option<PathBuf>,
     pub ssh_port: u16,
@@ -693,10 +690,17 @@ pub async fn run_import(config: ImportConfig) -> Result<()> {
     // Allow inserting 0 into auto-increment columns (e.g. store_website.website_id = 0)
     local_conn.query_drop("SET SQL_MODE = 'NO_AUTO_VALUE_ON_ZERO'")?;
 
-    // Create loader pool for parallel loading (if parallel > 1)
-    let loader_pool = if config.parallel > 1 {
-        info!("Creating loader pool with {} workers", config.parallel);
-        Some(LoaderPool::new(&config.local_mysql, config.parallel)?)
+    // Drop all FK constraints in the local database to prevent MySQL ERROR 1822.
+    // When tables are recreated in parallel (with only a PK, no secondary indexes),
+    // MySQL re-validates orphaned FK constraints from existing tables and fails if
+    // the required index is missing on the newly created referenced table.
+    drop_all_foreign_keys(&mut local_conn)?;
+
+    // Create loader pool for parallel loading
+    let client_workers = config.client_parallel.unwrap_or(config.parallel);
+    let loader_pool = if client_workers > 1 {
+        info!("Creating loader pool with {} workers", client_workers);
+        Some(LoaderPool::new(&config.local_mysql, client_workers)?)
     } else {
         None
     };
@@ -1018,7 +1022,7 @@ async fn run_protocol_inner(
 
     // Track pending DDL (CREATE TABLE) operations dispatched to the loader pool.
     // When a Data message arrives, we wait for DDL completion before submitting load.
-    let mut pending_ddls: HashMap<String, std::sync::mpsc::Receiver<Result<DdlResult>>> =
+    let mut pending_ddls: HashMap<String, crossbeam_channel::Receiver<Result<DdlResult>>> =
         HashMap::new();
 
     // Tables where TableDone has been received but not all loads have completed yet.
@@ -1233,7 +1237,6 @@ async fn run_protocol_inner(
                     let decompressed = maybe_decompress(tsv_data, negotiated_compression)?;
                     if config.collect_metrics {
                         client_metrics.add_decompress_time(decompress_start.elapsed());
-                        client_metrics.add_uncompressed_bytes(decompressed.len() as u64);
                     }
 
                     let load_start = Instant::now();
@@ -1612,6 +1615,38 @@ async fn deploy_server(session: &SshSession) -> Result<String> {
             available
         ))
     }
+}
+
+/// Drop all foreign key constraints in the local database.
+///
+/// This prevents MySQL ERROR 1822 when tables are recreated in parallel.
+/// When we DROP + CREATE a table that was previously referenced by FK constraints
+/// from other tables, MySQL re-validates those orphaned FK constraints against the
+/// new table. Since we only create a PRIMARY KEY (no secondary indexes), the
+/// required index for the FK is missing, causing the error.
+fn drop_all_foreign_keys(conn: &mut Conn) -> Result<()> {
+    let rows: Vec<(String, String)> = conn.query(
+        "SELECT TABLE_NAME, CONSTRAINT_NAME \
+         FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS \
+         WHERE CONSTRAINT_TYPE = 'FOREIGN KEY' AND TABLE_SCHEMA = DATABASE()",
+    )?;
+
+    if rows.is_empty() {
+        return Ok(());
+    }
+
+    for (table, constraint) in &rows {
+        conn.query_drop(format!(
+            "ALTER TABLE `{}` DROP FOREIGN KEY `{}`",
+            table, constraint
+        ))?;
+    }
+
+    info!(
+        "Dropped {} foreign key constraints from local database",
+        rows.len()
+    );
+    Ok(())
 }
 
 /// Create a table in local MySQL based on schema

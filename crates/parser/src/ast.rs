@@ -45,8 +45,8 @@ pub enum StatementKind<'src> {
     /// ignore table or /pattern/
     Ignore(TablePattern<'src>),
 
-    /// full table1, table2, ...
-    Full(Vec<Spanned<&'src str>>),
+    /// full table1, table2, /pattern/, ...
+    Full(Vec<TablePattern<'src>>),
 
     /// aggregate name { ... }
     Aggregate(AggregateBlock<'src>),

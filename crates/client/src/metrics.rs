@@ -159,7 +159,7 @@ impl ClientMetrics {
                 write_pct,
                 backpressure_note
             );
-            if sm.aggregate_wall_ms > 0 || sm.full_tables_wall_ms > 0 {
+            if sm.aggregate_wall_ms > 0 && sm.full_tables_wall_ms > 0 {
                 let total_wall = sm.aggregate_wall_ms + sm.full_tables_wall_ms;
                 eprintln!();
                 eprintln!(
@@ -171,6 +171,18 @@ impl ClientMetrics {
                     "  Phase 2 (full tables): {:>6} ({:>3}%)",
                     format_duration_ms(sm.full_tables_wall_ms),
                     percent(sm.full_tables_wall_ms, total_wall)
+                );
+            } else if sm.aggregate_wall_ms > 0 {
+                eprintln!();
+                eprintln!(
+                    "  Aggregates wall time:  {:>6}",
+                    format_duration_ms(sm.aggregate_wall_ms)
+                );
+            } else if sm.full_tables_wall_ms > 0 {
+                eprintln!();
+                eprintln!(
+                    "  Full tables wall time: {:>6}",
+                    format_duration_ms(sm.full_tables_wall_ms)
                 );
             }
             eprintln!();
