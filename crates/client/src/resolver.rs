@@ -369,6 +369,9 @@ impl Resolver {
                 let val = self.evaluate_expr(&operand.0)?;
                 self.eval_unary_op(*op, &val)
             }
+            Expr::Unique => Err(ClientError::Parse(
+                "unique() can only be used inside faker string interpolation".to_string(),
+            )),
         }
     }
 
@@ -502,6 +505,10 @@ impl Resolver {
         for part in &lit.parts {
             match part {
                 StringPart::Text(text) => result.push_str(text),
+                StringPart::Interpolation((Expr::Unique, _span)) => {
+                    // Pass through as sentinel for server-side replacement
+                    result.push_str("{unique()}");
+                }
                 StringPart::Interpolation((expr, _span)) => {
                     let value = self.evaluate_expr(expr)?;
                     result.push_str(&value.as_string());

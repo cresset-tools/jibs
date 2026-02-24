@@ -193,8 +193,9 @@ fn get_host_key_verification(args: &ConnectionArgs) -> ssh::HostKeyVerification 
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize logging
+    // Initialize logging (routes through MultiProgress when progress bars are active)
     tracing_subscriber::fmt()
+        .with_writer(progress::ProgressWriter)
         .with_env_filter(EnvFilter::from_default_env().add_directive("jibs=info".parse()?))
         .init();
 

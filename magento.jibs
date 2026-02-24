@@ -15,26 +15,7 @@ var base_url: string
 // ─── Faker pools for anonymization ───
 
 faker fake_emails [
-    "user1@example.test",
-    "user2@example.test",
-    "user3@example.test",
-    "user4@example.test",
-    "user5@example.test",
-    "user6@example.test",
-    "user7@example.test",
-    "user8@example.test",
-    "user9@example.test",
-    "user10@example.test",
-    "user11@example.test",
-    "user12@example.test",
-    "user13@example.test",
-    "user14@example.test",
-    "user15@example.test",
-    "user16@example.test",
-    "user17@example.test",
-    "user18@example.test",
-    "user19@example.test",
-    "user20@example.test"
+    "user{unique()}@example.test"
 ]
 
 faker fake_names [
@@ -133,6 +114,7 @@ relation quote_address.customer_id -> customer_entity.entity_id
 relation rating_option_vote.customer_id -> customer_entity.entity_id
 relation reporting_orders.customer_id -> customer_entity.entity_id
 relation sales_order_address.customer_id -> customer_entity.entity_id
+relation sales_order_grid.entity_id -> sales_order.entity_id
 relation sales_order_grid.customer_id -> customer_entity.entity_id
 relation sales_shipment.customer_id -> customer_entity.entity_id
 relation catalogrule_group_website.customer_group_id -> customer_group.customer_group_id

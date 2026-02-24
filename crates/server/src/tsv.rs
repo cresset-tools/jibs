@@ -6,12 +6,17 @@ use crate::error::Result;
 use crate::mysql::{escape_tsv_bytes, write_tsv_value};
 use jibs_protocol::{AnonymizeRule, AnonymizeTarget, CompressionMode, RAW_CHUNK_FLAG, RAW_CHUNK_HEADER_LEN};
 
+/// Sentinel string emitted by the resolver for `{unique()}` interpolation.
+const UNIQUE_SENTINEL: &str = "{unique()}";
+
 /// Pre-computed anonymization action for a column
 enum AnonAction {
     /// Write \\N
     Null,
     /// Pick a random value from this faker pool (index into fakers vec)
     Faker(usize),
+    /// Pool contains {unique()} — replace with counter at write time
+    FakerUnique(usize),
 }
 
 /// TSV writer for streaming table data
@@ -24,8 +29,12 @@ pub struct TsvWriter {
     anon_by_column: Vec<Option<AnonAction>>,
     /// Faker pools stored as pre-escaped byte slices for zero-copy writes
     faker_pools: Vec<Vec<Vec<u8>>>,
+    /// Raw (unescaped) faker pools for unique mode — need raw strings to insert counter
+    faker_pools_raw: Vec<Vec<String>>,
     /// RNG for faker selection
     rng: rand::rngs::ThreadRng,
+    /// Counter for unique faker values (monotonically increasing per writer)
+    unique_counter: u64,
 }
 
 impl TsvWriter {
@@ -38,6 +47,37 @@ impl TsvWriter {
         // Pre-escape all faker pool values into byte buffers
         let mut faker_pool_names: Vec<String> = Vec::new();
         let mut faker_pools: Vec<Vec<Vec<u8>>> = Vec::new();
+        let mut faker_pools_raw: Vec<Vec<String>> = Vec::new();
+
+        // Helper: find or create a faker pool index
+        let get_or_create_pool = |faker_name: &str,
+                                       faker_pool_names: &mut Vec<String>,
+                                       faker_pools: &mut Vec<Vec<Vec<u8>>>,
+                                       faker_pools_raw: &mut Vec<Vec<String>>|
+         -> usize {
+            if let Some(idx) = faker_pool_names.iter().position(|n| n == faker_name) {
+                idx
+            } else {
+                let idx = faker_pool_names.len();
+                faker_pool_names.push(faker_name.to_string());
+                let raw_pool: Vec<String> = fakers
+                    .get(faker_name)
+                    .cloned()
+                    .unwrap_or_default();
+                // Pre-escape all values in the pool
+                let escaped_pool: Vec<Vec<u8>> = raw_pool
+                    .iter()
+                    .map(|s| {
+                        let mut buf = Vec::with_capacity(s.len());
+                        escape_tsv_bytes(&mut buf, s.as_bytes());
+                        buf
+                    })
+                    .collect();
+                faker_pools.push(escaped_pool);
+                faker_pools_raw.push(raw_pool);
+                idx
+            }
+        };
 
         // Build pre-computed anonymization lookup by column index
         let anon_by_column: Vec<Option<AnonAction>> = columns
@@ -49,30 +89,21 @@ impl TsvWriter {
                     .map(|rule| match &rule.target {
                         AnonymizeTarget::Null => AnonAction::Null,
                         AnonymizeTarget::Faker(faker_name) => {
-                            // Find or create the faker pool index
-                            let pool_idx =
-                                if let Some(idx) = faker_pool_names.iter().position(|n| n == faker_name) {
-                                    idx
-                                } else {
-                                    let idx = faker_pool_names.len();
-                                    faker_pool_names.push(faker_name.clone());
-                                    // Pre-escape all values in the pool
-                                    let escaped_pool: Vec<Vec<u8>> = fakers
-                                        .get(faker_name)
-                                        .map(|pool| {
-                                            pool.iter()
-                                                .map(|s| {
-                                                    let mut buf = Vec::with_capacity(s.len());
-                                                    escape_tsv_bytes(&mut buf, s.as_bytes());
-                                                    buf
-                                                })
-                                                .collect()
-                                        })
-                                        .unwrap_or_default();
-                                    faker_pools.push(escaped_pool);
-                                    idx
-                                };
-                            AnonAction::Faker(pool_idx)
+                            let pool_idx = get_or_create_pool(
+                                faker_name,
+                                &mut faker_pool_names,
+                                &mut faker_pools,
+                                &mut faker_pools_raw,
+                            );
+                            // Auto-detect: if any pool value contains {unique()}, use unique mode
+                            let has_unique = faker_pools_raw[pool_idx]
+                                .iter()
+                                .any(|v| v.contains(UNIQUE_SENTINEL));
+                            if has_unique {
+                                AnonAction::FakerUnique(pool_idx)
+                            } else {
+                                AnonAction::Faker(pool_idx)
+                            }
                         }
                     })
             })
@@ -88,7 +119,9 @@ impl TsvWriter {
             num_columns,
             anon_by_column,
             faker_pools,
+            faker_pools_raw,
             rng: rand::thread_rng(),
+            unique_counter: 0,
         }
     }
 
@@ -111,6 +144,18 @@ impl TsvWriter {
                         self.buffer.extend_from_slice(value);
                     } else {
                         self.buffer.extend_from_slice(b"\\N");
+                    }
+                }
+                Some(AnonAction::FakerUnique(pool_idx)) => {
+                    let pool = &self.faker_pools_raw[*pool_idx];
+                    if pool.is_empty() {
+                        self.buffer.extend_from_slice(b"\\N");
+                    } else {
+                        let base = &pool[self.unique_counter as usize % pool.len()];
+                        let counter_str = self.unique_counter.to_string();
+                        let unique_value = base.replace(UNIQUE_SENTINEL, &counter_str);
+                        escape_tsv_bytes(&mut self.buffer, unique_value.as_bytes());
+                        self.unique_counter += 1;
                     }
                 }
                 None => {
