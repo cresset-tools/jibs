@@ -406,7 +406,7 @@ fn drain_completed_loads(
     load_accum: &mut LoadAccum,
     deferred: &mut HashMap<String, DeferredTableDone>,
     local_conn: &mut Conn,
-    progress: &mut ImportProgress,
+    progress: &ImportProgress,
     stats: &mut ImportStats,
     table_schemas: &mut HashMap<String, Arc<Vec<ColumnDef>>>,
     fail_after_tables: Option<usize>,
@@ -447,7 +447,7 @@ fn finalize_completed_tables(
     pending_loads: &[PendingLoad],
     deferred: &mut HashMap<String, DeferredTableDone>,
     local_conn: &mut Conn,
-    progress: &mut ImportProgress,
+    progress: &ImportProgress,
     stats: &mut ImportStats,
     table_schemas: &mut HashMap<String, Arc<Vec<ColumnDef>>>,
 ) -> Result<()> {
@@ -499,7 +499,7 @@ fn wait_for_all_loads(
     load_accum: &mut LoadAccum,
     deferred: &mut HashMap<String, DeferredTableDone>,
     local_conn: &mut Conn,
-    progress: &mut ImportProgress,
+    progress: &ImportProgress,
     stats: &mut ImportStats,
     table_schemas: &mut HashMap<String, Arc<Vec<ColumnDef>>>,
 ) -> Result<()> {
@@ -1001,7 +1001,7 @@ async fn run_protocol_inner(
 
     // Initialize progress tracking
     let skipped_count = completed_tables.len();
-    let mut progress = ImportProgress::new(&tables, skipped_count);
+    let progress = ImportProgress::new(&tables, skipped_count);
 
     // Send Start message
     debug!("Starting data transfer");
@@ -1087,7 +1087,7 @@ async fn run_protocol_inner(
                     client_metrics.add_rows_loaded(stats.rows_imported);
                 }
                 // Capture partial table durations
-                stats.table_durations = progress.table_durations().to_vec();
+                stats.table_durations = progress.table_durations();
                 progress.finish();
                 return Err(anyhow::anyhow!("Interrupted"));
             }
@@ -1212,7 +1212,7 @@ async fn run_protocol_inner(
                             &mut load_accum,
                             &mut deferred_table_dones,
                             local_conn,
-                            &mut progress,
+                            &progress,
                             stats,
                             &mut table_schemas,
                             config.fail_after_tables,
@@ -1292,7 +1292,7 @@ async fn run_protocol_inner(
                     &mut load_accum,
                     &mut deferred_table_dones,
                     local_conn,
-                    &mut progress,
+                    &progress,
                     stats,
                     &mut table_schemas,
                     config.fail_after_tables,
@@ -1327,7 +1327,7 @@ async fn run_protocol_inner(
                         &mut load_accum,
                         &mut deferred_table_dones,
                         local_conn,
-                        &mut progress,
+                        &progress,
                         stats,
                         &mut table_schemas,
                     )?;
@@ -1350,7 +1350,7 @@ async fn run_protocol_inner(
                 stats.server_metrics = server_metrics;
 
                 // Capture per-table durations before finishing progress
-                stats.table_durations = progress.table_durations().to_vec();
+                stats.table_durations = progress.table_durations();
 
                 progress.finish();
 
@@ -1379,7 +1379,7 @@ async fn run_protocol_inner(
                 recoverable,
             } => {
                 if recoverable {
-                    progress.suspend(|| warn!("Recoverable server error: {}", message));
+                    warn!("Recoverable server error: {}", message);
                 } else {
                     return Err(anyhow::anyhow!("Server error: {}", message));
                 }

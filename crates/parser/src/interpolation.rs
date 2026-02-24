@@ -220,6 +220,11 @@ where
     recursive(|expr| {
         // Primary expressions
         let primary = choice((
+            // unique() function call
+            select! { InterpToken::Ident("unique") => () }
+                .ignore_then(just(InterpToken::LParen))
+                .ignore_then(just(InterpToken::RParen))
+                .to(Expr::Unique),
             // Variable reference $name
             just(InterpToken::Dollar)
                 .ignore_then(select! { InterpToken::Ident(s) => s })
@@ -417,6 +422,26 @@ mod tests {
         // "/"
         match &result.parts[4] {
             StringPart::Text(s) => assert_eq!(*s, "/"),
+            _ => panic!("Expected Text"),
+        }
+    }
+
+    #[test]
+    fn test_unique_function() {
+        let result = parse_interpolated_string("user{unique()}@example.test", 0);
+        assert_eq!(result.parts.len(), 3);
+        match &result.parts[0] {
+            StringPart::Text(s) => assert_eq!(*s, "user"),
+            _ => panic!("Expected Text"),
+        }
+        match &result.parts[1] {
+            StringPart::Interpolation((expr, _)) => {
+                assert!(matches!(expr, Expr::Unique));
+            }
+            _ => panic!("Expected Interpolation with Unique"),
+        }
+        match &result.parts[2] {
+            StringPart::Text(s) => assert_eq!(*s, "@example.test"),
             _ => panic!("Expected Text"),
         }
     }

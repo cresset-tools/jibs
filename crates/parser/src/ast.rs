@@ -272,6 +272,8 @@ pub enum Expr<'src> {
     Binary(Box<Spanned<Expr<'src>>>, BinaryOp, Box<Spanned<Expr<'src>>>),
     /// Unary operation
     Unary(UnaryOp, Box<Spanned<Expr<'src>>>),
+    /// unique() — generates a unique counter value (used in faker string interpolation)
+    Unique,
 }
 
 /// Binary operators
