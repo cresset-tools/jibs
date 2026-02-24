@@ -253,6 +253,7 @@ fn run_aggregate_bfs(
     metrics: Arc<MetricsCollector>,
     table_ids: Arc<HashMap<String, u16>>,
 ) -> Result<HashSet<String>> {
+    let phase_start = Instant::now();
     let mut conn = MySqlConnection::connect(mysql_url)?;
 
     // Build relation indices
@@ -276,7 +277,7 @@ fn run_aggregate_bfs(
     }
 
     // Track visited rows per table (only PKs, not full rows)
-    let mut visited: HashMap<String, HashSet<Vec<u8>>> = HashMap::new();
+    let mut visited: HashMap<String, HashSet<CompactKey>> = HashMap::new();
 
     // Tables actually touched by aggregates
     let mut aggregate_tables: HashSet<String> = HashSet::new();
@@ -393,9 +394,8 @@ fn run_aggregate_bfs(
 
                 // Dedup check + FK extraction
                 let dedup_start = Instant::now();
-                let pk = extract_pk_from_row(&row, &pk_columns);
-                let pk_bytes = serialize_pk(&pk);
-                let is_new = visited_set.insert(pk_bytes);
+                let pk_key = row_pk_key(&row, &pk_columns);
+                let is_new = visited_set.insert(pk_key);
 
                 // Always extract backward FK values from root table rows,
                 // even for already-visited rows.
@@ -621,9 +621,8 @@ fn run_aggregate_bfs(
 
                             // Dedup check + FK extraction
                             let dedup_start = Instant::now();
-                            let pk = extract_pk_from_row(&row, &pk_columns);
-                            let pk_bytes = serialize_pk(&pk);
-                            if !visited_set.insert(pk_bytes) {
+                            let pk_key = row_pk_key(&row, &pk_columns);
+                            if !visited_set.insert(pk_key) {
                                 metrics.add_dedup_time(dedup_start.elapsed());
                                 continue;
                             }
@@ -789,6 +788,7 @@ fn run_aggregate_bfs(
         }
     }
 
+    metrics.set_aggregate_wall_time(phase_start.elapsed());
     Ok(aggregate_tables)
 }
 
@@ -843,8 +843,6 @@ impl<'a> DependencyTraverser<'a> {
         mysql_url: &str,
         interrupt: &std::sync::atomic::AtomicBool,
     ) -> Result<Vec<(u16, TableDisposition)>> {
-        let overall_start = Instant::now();
-
         // 1. Pre-cache schemas on self.conn, build table list
         let schema_start = Instant::now();
         let all_table_names_vec = self.conn.get_all_table_names()?;
@@ -924,6 +922,7 @@ impl<'a> DependencyTraverser<'a> {
         }
 
         let mut handles: Vec<std::thread::JoinHandle<Result<()>>> = Vec::new();
+        let ft_phase_start = Instant::now();
 
         for tasks in worker_tasks {
             if tasks.is_empty() {
@@ -956,6 +955,7 @@ impl<'a> DependencyTraverser<'a> {
                         return Err(e);
                     }
                 }
+                metrics.set_full_tables_wall_time(ft_phase_start.elapsed());
                 Ok(())
             });
             handles.push(handle);
@@ -1107,11 +1107,6 @@ impl<'a> DependencyTraverser<'a> {
             }
         }
 
-        self.metrics
-            .set_aggregate_wall_time(overall_start.elapsed());
-        self.metrics
-            .set_full_tables_wall_time(overall_start.elapsed());
-
         dispositions.sort_by(|a, b| a.0.cmp(&b.0));
         Ok(dispositions)
     }
@@ -1153,15 +1148,60 @@ fn build_root_query(aggregate: &ResolvedAggregate) -> String {
 // Utility functions
 // ============================================================================
 
-/// Deduplicate MySQL values
+/// A compact, hashable key for deduplication.
+/// Stores integers inline (no heap allocation) — covers ~99% of FK/PK values.
+/// Falls back to serialized bytes only for composite keys or rare types.
+#[derive(Hash, Eq, PartialEq)]
+enum CompactKey {
+    Int(i64),
+    UInt(u64),
+    Bytes(Vec<u8>),
+}
+
+/// Convert a single MySqlValue to a compact dedup key.
+/// For integer values (the common case), this avoids heap allocation entirely.
+fn value_to_compact_key(value: &MySqlValue) -> CompactKey {
+    match value {
+        MySqlValue::Int(i) => CompactKey::Int(*i),
+        MySqlValue::UInt(u) if *u <= i64::MAX as u64 => CompactKey::Int(*u as i64),
+        MySqlValue::UInt(u) => CompactKey::UInt(*u),
+        MySqlValue::Bytes(b) => {
+            if let Ok(s) = std::str::from_utf8(b) {
+                if let Ok(i) = s.parse::<i64>() {
+                    return CompactKey::Int(i);
+                }
+                if let Ok(u) = s.parse::<u64>() {
+                    return CompactKey::UInt(u);
+                }
+            }
+            CompactKey::Bytes(b.clone())
+        }
+        MySqlValue::NULL => CompactKey::Bytes(vec![0]),
+        _ => CompactKey::Bytes(serialize_pk(&[value.clone()])),
+    }
+}
+
+/// Extract primary key from a row and return it as a CompactKey.
+/// Avoids intermediate Vec<MySqlValue> and Vec<u8> allocations for single-column integer PKs.
+fn row_pk_key(row: &Row, pk_columns: &[String]) -> CompactKey {
+    if pk_columns.len() == 1 {
+        let value = row
+            .get_opt::<MySqlValue, _>(pk_columns[0].as_str())
+            .and_then(|r| r.ok())
+            .unwrap_or(MySqlValue::NULL);
+        value_to_compact_key(&value)
+    } else {
+        let pk = extract_pk_from_row(row, pk_columns);
+        CompactKey::Bytes(serialize_pk(&pk))
+    }
+}
+
+/// Deduplicate MySQL values using compact keys (allocation-free for integers).
 fn dedupe_values(values: Vec<MySqlValue>) -> Vec<MySqlValue> {
-    let mut seen = HashSet::new();
+    let mut seen = HashSet::with_capacity(values.len());
     values
         .into_iter()
-        .filter(|v| {
-            let bytes = serialize_pk(&[v.clone()]);
-            seen.insert(bytes)
-        })
+        .filter(|v| seen.insert(value_to_compact_key(v)))
         .collect()
 }
 
