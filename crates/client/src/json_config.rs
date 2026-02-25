@@ -390,8 +390,9 @@ impl JsonResolver {
                 .collect();
 
             // Use the DSL resolver for .jibs files
-            let imported_plan = crate::resolver::resolve(&canonical_path, &program, &cli_vars)
+            let imported_config = crate::resolver::resolve(&canonical_path, &program, &cli_vars)
                 .map_err(|e| ClientError::Parse(format!("Resolution error in '{}': {}", import_path, e)))?;
+            let imported_plan = imported_config.plan;
 
             // Merge the imported plan into our plan
             self.merge_plan(imported_plan);

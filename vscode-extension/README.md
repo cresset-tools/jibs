@@ -59,8 +59,10 @@ aggregate orders {
     limit $order_limit
 }
 
-# Incremental imports
-include orders where "id = 123"
+# Get functions (parameterized queries for CLI)
+get orders_for_user(user_id: int) {
+    orders where "user_id = {$user_id}"
+}
 
 # Set values with interpolation
 set config {

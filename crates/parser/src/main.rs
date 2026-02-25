@@ -22,7 +22,7 @@ fn main() {
                     jibs_parser::ast::StatementKind::Ignore(_) => "ignore",
                     jibs_parser::ast::StatementKind::Full(_) => "full",
                     jibs_parser::ast::StatementKind::Aggregate(_) => "aggregate",
-                    jibs_parser::ast::StatementKind::Include(_) => "include",
+                    jibs_parser::ast::StatementKind::Get(_) => "get",
                     jibs_parser::ast::StatementKind::Preserve(_) => "preserve",
                     jibs_parser::ast::StatementKind::Set(_) => "set",
                     jibs_parser::ast::StatementKind::After(_) => "after",

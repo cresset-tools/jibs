@@ -400,6 +400,20 @@ anonymize sales_shipment_grid {
     customer_email -> fake_emails
 }
 
+aggregate products {
+    root catalog_product_entity
+    where "FALSE"
+    exclude /^sales_/, /^quote/, /^yotpo_/, /^customer_/, /^url_rewrite/
+}
+
+get product_by_sku (sku: string) {
+    products where "sku like '{$sku}'"
+}
+
+get product_by_urlkey (urlkey: string) {
+    products where "entity_id IN (SELECT entity_id FROM url_rewrite WHERE request_path = '{$urlkey}')"
+}
+
 set core_config_data {
     match path = "web/secure/base_url", scope = "default", scope_id = 0
     value = $base_url
