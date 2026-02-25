@@ -70,7 +70,7 @@ where
         ignore_parser(),
         full_parser(),
         aggregate_parser(),
-        include_parser(),
+        get_function_parser(),
         preserve_parser(),
         set_parser(),
         after_parser(),
@@ -378,23 +378,99 @@ where
         })
 }
 
-/// Parse: include aggregate where "condition"
-fn include_parser<'tokens, 'src: 'tokens, I>(
+/// Parse a parameter declaration: name: type [= default]
+fn param_decl<'tokens, 'src: 'tokens, I>(
+) -> impl Parser<'tokens, I, Spanned<VarDecl<'src>>, extra::Err<Rich<'tokens, Token<'src>, Span>>> + Clone
+where
+    I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
+{
+    ident()
+        .then_ignore(just(Token::Colon))
+        .then(var_type())
+        .then(
+            just(Token::Assign)
+                .ignore_then(literal())
+                .or_not()
+        )
+        .map_with(|((name, var_type), default), e| {
+            (VarDecl { name, var_type, default }, e.span())
+        })
+}
+
+/// Parse: get func_name(params...) { aggregate_name [where ...] [order by ...] [limit ...] [exclude ...] [root_only] }
+fn get_function_parser<'tokens, 'src: 'tokens, I>(
 ) -> impl Parser<'tokens, I, StatementKind<'src>, extra::Err<Rich<'tokens, Token<'src>, Span>>> + Clone
 where
     I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
 {
-    just(Token::Include)
+    let params = param_decl()
+        .separated_by(just(Token::Comma))
+        .allow_trailing()
+        .collect::<Vec<_>>()
+        .delimited_by(just(Token::LParen), just(Token::RParen));
+
+    let where_clause = just(Token::Where)
+        .ignore_then(string_literal());
+
+    let order_by_clause = just(Token::Order)
+        .ignore_then(just(Token::By))
         .ignore_then(ident())
         .then(
-            just(Token::Where)
-                .ignore_then(string_literal())
-                .or_not(),
+            just(Token::Asc).to(SortDirection::Asc)
+                .or(just(Token::Desc).to(SortDirection::Desc))
+                .or_not()
         )
-        .map(|(aggregate, where_clause)| {
-            StatementKind::Include(IncludeStmt {
+        .map(|(column, direction)| OrderByClause { column, direction });
+
+    let limit_clause = just(Token::Limit)
+        .ignore_then(
+            select! { Token::Int(n) => LimitValue::Literal(n) }
+                .or(
+                    just(Token::Dollar)
+                        .ignore_then(ident_raw())
+                        .map(LimitValue::Variable)
+                )
+        )
+        .map_with(|v, e| (v, e.span()));
+
+    let exclude_clause = just(Token::Exclude)
+        .ignore_then(
+            table_pattern()
+                .separated_by(just(Token::Comma))
+                .at_least(1)
+                .collect::<Vec<_>>()
+        );
+
+    let root_only_clause = just(Token::RootOnly).to(true);
+
+    let body = ident()  // aggregate reference
+        .then(where_clause.or_not())
+        .then(order_by_clause.or_not())
+        .then(limit_clause.or_not())
+        .then(exclude_clause.or_not())
+        .then(root_only_clause.or_not())
+        .delimited_by(just(Token::LBrace), just(Token::RBrace));
+
+    just(Token::Get)
+        .ignore_then(ident())
+        .then(params)
+        .then(body)
+        .map(|((name, params), clauses)| {
+            let (rest, root_only) = clauses;
+            let (rest, exclude_tables) = rest;
+            let (rest, limit) = rest;
+            let (rest, order_by) = rest;
+            let (aggregate, where_clause) = rest;
+
+            StatementKind::Get(GetFunctionDef {
+                name,
+                params,
                 aggregate,
                 where_clause,
+                order_by,
+                limit,
+                exclude_tables: exclude_tables.unwrap_or_default(),
+                root_only: root_only.unwrap_or(false),
             })
         })
 }
@@ -895,28 +971,93 @@ mod tests {
     }
 
     #[test]
-    fn test_include() {
-        let program = parse(r#"include orders where "id = 123""#);
+    fn test_get_function() {
+        let program = parse(r#"
+            get orders_for_user(user_id: int) {
+                orders where "user_id = {$user_id}"
+            }
+        "#);
         assert_eq!(program.statements.len(), 1);
         match &program.statements[0].0.kind {
-            StatementKind::Include(stmt) => {
-                assert_eq!(stmt.aggregate.0, "orders");
-                assert!(stmt.where_clause.is_some());
+            StatementKind::Get(func) => {
+                assert_eq!(func.name.0, "orders_for_user");
+                assert_eq!(func.params.len(), 1);
+                assert_eq!(func.params[0].0.name.0, "user_id");
+                assert_eq!(func.params[0].0.var_type.0, VarType::Int);
+                assert!(func.params[0].0.default.is_none());
+                assert_eq!(func.aggregate.0, "orders");
+                assert!(func.where_clause.is_some());
             }
-            _ => panic!("Expected Include"),
+            _ => panic!("Expected Get"),
         }
     }
 
     #[test]
-    fn test_include_without_where() {
-        let program = parse(r#"include orders"#);
+    fn test_get_function_with_defaults() {
+        let program = parse(r#"
+            get products(cat_id: int, max_rows: int = 50) {
+                product_aggregate where "category_id = {$cat_id}"
+                limit $max_rows
+            }
+        "#);
         assert_eq!(program.statements.len(), 1);
         match &program.statements[0].0.kind {
-            StatementKind::Include(stmt) => {
-                assert_eq!(stmt.aggregate.0, "orders");
-                assert!(stmt.where_clause.is_none());
+            StatementKind::Get(func) => {
+                assert_eq!(func.name.0, "products");
+                assert_eq!(func.params.len(), 2);
+                assert_eq!(func.params[0].0.name.0, "cat_id");
+                assert!(func.params[0].0.default.is_none());
+                assert_eq!(func.params[1].0.name.0, "max_rows");
+                assert!(func.params[1].0.default.is_some());
+                assert_eq!(func.aggregate.0, "product_aggregate");
+                assert!(func.where_clause.is_some());
+                assert!(func.limit.is_some());
             }
-            _ => panic!("Expected Include"),
+            _ => panic!("Expected Get"),
+        }
+    }
+
+    #[test]
+    fn test_get_function_no_where() {
+        let program = parse(r#"
+            get all_products(max_rows: int = 100) {
+                products
+                limit $max_rows
+            }
+        "#);
+        assert_eq!(program.statements.len(), 1);
+        match &program.statements[0].0.kind {
+            StatementKind::Get(func) => {
+                assert_eq!(func.name.0, "all_products");
+                assert_eq!(func.aggregate.0, "products");
+                assert!(func.where_clause.is_none());
+                assert!(func.limit.is_some());
+            }
+            _ => panic!("Expected Get"),
+        }
+    }
+
+    #[test]
+    fn test_get_function_full_overrides() {
+        let program = parse(r#"
+            get recent(cutoff: string) {
+                orders where "created_at > '{$cutoff}'"
+                order by created_at desc
+                limit 50
+                exclude /^temp_/
+            }
+        "#);
+        assert_eq!(program.statements.len(), 1);
+        match &program.statements[0].0.kind {
+            StatementKind::Get(func) => {
+                assert_eq!(func.name.0, "recent");
+                assert_eq!(func.params.len(), 1);
+                assert!(func.where_clause.is_some());
+                assert!(func.order_by.is_some());
+                assert!(func.limit.is_some());
+                assert_eq!(func.exclude_tables.len(), 1);
+            }
+            _ => panic!("Expected Get"),
         }
     }
 

@@ -17,7 +17,7 @@ use jibs_protocol::{
 
 use crate::metrics::ClientMetrics;
 use crate::progress::ImportProgress;
-use crate::resolver;
+use crate::resolver::{self, LimitOverride, ResolvedGetFunction};
 use crate::server_binary;
 use crate::ssh::{get_server_path, ProcessReader, ProcessWriter, RemoteProcess, SshConfig, SshSession};
 
@@ -522,6 +522,12 @@ fn wait_for_all_loads(
 }
 
 /// Configuration for an import operation
+/// A get function invocation from the CLI
+pub struct GetInvocation {
+    pub func_name: String,
+    pub args: HashMap<String, String>,
+}
+
 pub struct ImportConfig {
     /// Path to the .jibs configuration file (None = import all tables)
     pub config_path: Option<PathBuf>,
@@ -538,9 +544,8 @@ pub struct ImportConfig {
     pub compression: CompressionMode,
     pub identity_file: Option<PathBuf>,
     pub ssh_port: u16,
-    /// For `get` command: filter to specific aggregates with custom where clauses
-    /// Each pair is (aggregate_name, where_clause)
-    pub aggregate_overrides: Option<Vec<(String, String)>>,
+    /// For `get` command: function invocations with named arguments
+    pub get_invocations: Option<Vec<GetInvocation>>,
     /// SSH host key verification mode
     pub host_key_verification: crate::ssh::HostKeyVerification,
     /// Maximum message size in bytes (default: 100MB)
@@ -559,7 +564,7 @@ pub async fn run_import(config: ImportConfig) -> Result<()> {
     info!("Starting import from {}", config.remote_host);
 
     // Create execution plan - either from config file or empty (import all tables)
-    let mut plan = if let Some(config_path) = &config.config_path {
+    let (mut plan, get_functions) = if let Some(config_path) = &config.config_path {
         // Load additional variables from file if specified
         let mut vars = config.vars.clone();
         if let Some(var_file) = &config.var_file {
@@ -580,9 +585,10 @@ pub async fn run_import(config: ImportConfig) -> Result<()> {
             .unwrap_or("");
 
         if extension == "json" {
-            // Parse as JSON config
-            crate::json_config::parse_json_config(config_path, &vars)
-                .map_err(|e| anyhow::anyhow!("JSON config error: {}", e))?
+            // Parse as JSON config (no get functions in JSON configs)
+            let plan = crate::json_config::parse_json_config(config_path, &vars)
+                .map_err(|e| anyhow::anyhow!("JSON config error: {}", e))?;
+            (plan, Vec::new())
         } else {
             // Parse as .jibs DSL
             let source = std::fs::read_to_string(config_path)?;
@@ -598,18 +604,19 @@ pub async fn run_import(config: ImportConfig) -> Result<()> {
             })?;
 
             // Resolve the execution plan
-            resolver::resolve(config_path, &program, &vars)
-                .map_err(|e| anyhow::anyhow!("Resolution failed: {}", e))?
+            let resolved = resolver::resolve(config_path, &program, &vars)
+                .map_err(|e| anyhow::anyhow!("Resolution failed: {}", e))?;
+            (resolved.plan, resolved.get_functions)
         }
     } else {
         // No config file - import all tables
         info!("No config file specified, importing all tables");
-        ExecutionPlan::default()
+        (ExecutionPlan::default(), Vec::new())
     };
 
-    // Apply aggregate overrides if this is a `get` command
-    if let Some(overrides) = &config.aggregate_overrides {
-        plan = apply_aggregate_overrides(plan, overrides)?;
+    // Apply get function invocations if this is a `get` command
+    if let Some(invocations) = &config.get_invocations {
+        plan = apply_get_invocations(plan, &get_functions, invocations)?;
     }
 
     info!(
@@ -773,41 +780,147 @@ struct ImportStats {
     table_durations: Vec<(String, u64, Duration)>,
 }
 
-/// Apply aggregate overrides for the `get` command
+/// Apply get function invocations for the `get` command
 ///
-/// Filters the plan to only include the specified aggregates, and replaces
-/// their where clauses with the provided overrides.
-fn apply_aggregate_overrides(
+/// For each invocation, looks up the get function, resolves parameters,
+/// clones the base aggregate, and applies overrides.
+fn apply_get_invocations(
     mut plan: ExecutionPlan,
-    overrides: &[(String, String)],
+    get_functions: &[ResolvedGetFunction],
+    invocations: &[GetInvocation],
 ) -> Result<ExecutionPlan> {
     let mut new_aggregates = Vec::new();
 
-    for (agg_name, where_clause) in overrides {
-        // Find the aggregate by name
-        let original = plan
-            .aggregates
+    for (idx, invocation) in invocations.iter().enumerate() {
+        // Look up the get function by name
+        let func = get_functions
             .iter()
-            .find(|a| a.name == *agg_name)
+            .find(|f| f.name == invocation.func_name)
             .ok_or_else(|| {
                 anyhow::anyhow!(
-                    "Aggregate '{}' not found in config. Available aggregates: {}",
-                    agg_name,
-                    plan.aggregates
-                        .iter()
-                        .map(|a| a.name.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
+                    "Get function '{}' not found in config. Available get functions: {}",
+                    invocation.func_name,
+                    if get_functions.is_empty() {
+                        "(none)".to_string()
+                    } else {
+                        get_functions
+                            .iter()
+                            .map(|f| f.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    }
                 )
             })?;
 
-        // Clone and override the where clause
-        let mut modified = original.clone();
-        modified.where_clause = Some(where_clause.clone());
+        // Resolve parameters: merge CLI args with defaults
+        let mut resolved_params: HashMap<String, String> = HashMap::new();
+        for param in &func.params {
+            if let Some(cli_value) = invocation.args.get(&param.name) {
+                resolved_params.insert(param.name.clone(), cli_value.clone());
+            } else if let Some(default) = &param.default {
+                resolved_params.insert(param.name.clone(), default.as_string());
+            } else {
+                anyhow::bail!(
+                    "Get function '{}' requires parameter '--{}' (type: {:?})",
+                    invocation.func_name,
+                    param.name,
+                    param.param_type,
+                );
+            }
+        }
+
+        // Find the base aggregate
+        let base = plan
+            .aggregates
+            .iter()
+            .find(|a| a.name == func.aggregate_name)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Get function '{}' references aggregate '{}' which was not found",
+                    func.name,
+                    func.aggregate_name
+                )
+            })?;
+
+        // Clone and apply overrides
+        let mut modified = base.clone();
+        modified.name = format!("{}_{}", func.name, idx);
+
+        // Apply WHERE template with parameter substitution
+        if let Some(template) = &func.where_template {
+            let mut where_clause = template.clone();
+            for (param_name, value) in &resolved_params {
+                where_clause = where_clause.replace(
+                    &format!("{{{}}}", param_name),
+                    value,
+                );
+            }
+            modified.where_clause = Some(where_clause);
+        }
+
+        // Apply order_by override
+        if let Some(order_by) = &func.order_by {
+            modified.order_by = Some(order_by.clone());
+        }
+        if let Some(direction) = &func.order_direction {
+            modified.order_direction = Some(*direction);
+        }
+
+        // Apply limit override
+        if let Some(limit) = &func.limit {
+            match limit {
+                LimitOverride::Concrete(n) => {
+                    modified.limit = Some(*n);
+                }
+                LimitOverride::Param(param_name) => {
+                    let value_str = resolved_params.get(param_name).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "Limit references parameter '{}' which was not resolved",
+                            param_name
+                        )
+                    })?;
+                    let limit_val: i64 = value_str.parse().map_err(|_| {
+                        anyhow::anyhow!(
+                            "Parameter '{}' value '{}' is not a valid integer for limit",
+                            param_name,
+                            value_str
+                        )
+                    })?;
+                    modified.limit = Some(limit_val);
+                }
+            }
+        }
+
+        // Apply exclude overrides
+        if !func.exclude_tables.is_empty() {
+            modified.exclude_tables = func.exclude_tables.clone();
+        }
+        if !func.exclude_patterns.is_empty() {
+            modified.exclude_patterns = func.exclude_patterns.clone();
+        }
+
+        // Apply root_only override
+        if let Some(root_only) = func.root_only {
+            modified.root_only = root_only;
+        }
+
         new_aggregates.push(modified);
     }
 
+    // For `get`, strip the plan down to only what's needed:
+    // - The new aggregates from get functions
+    // - Relations (needed for BFS traversal)
+    // - Excluded/ignored tables and patterns (still relevant for BFS)
+    // - Full tables (kept as BFS dead-ends, but not imported)
+    // Everything else (preserves, sets, after_statements, fakers,
+    // anonymization) is not relevant for `get`.
     plan.aggregates = new_aggregates;
+    plan.aggregates_only = true;
+    plan.preserves.clear();
+    plan.sets.clear();
+    plan.after_statements.clear();
+    plan.anonymization.clear();
+    plan.fakers.clear();
     Ok(plan)
 }
 

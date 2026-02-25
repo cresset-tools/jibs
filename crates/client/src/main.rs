@@ -145,7 +145,7 @@ struct GetArgs {
     #[command(flatten)]
     connection: ConnectionArgs,
 
-    /// Aggregate/where pairs: aggregate1 'where clause1' aggregate2 'where clause2' ...
+    /// Get function invocations: func_name --param1 value1 [func_name2 --param2 value2 ...]
     #[arg(last = true, required = true)]
     queries: Vec<String>,
 }
@@ -234,7 +234,7 @@ async fn run_import(args: ImportArgs) -> Result<()> {
         compression,
         identity_file: args.connection.identity,
         ssh_port: args.connection.port,
-        aggregate_overrides: None,
+        get_invocations: None,
         host_key_verification,
         max_message_size: args.connection.max_message_size,
         collect_metrics: args.connection.metrics,
@@ -249,8 +249,8 @@ async fn run_import(args: ImportArgs) -> Result<()> {
 async fn run_get(args: GetArgs) -> Result<()> {
     use jibs_protocol::CompressionMode;
 
-    // Parse aggregate/where pairs from trailing args
-    let aggregate_overrides = parse_aggregate_queries(&args.queries)?;
+    // Parse get function invocations from trailing args
+    let get_invocations = parse_get_invocations(&args.queries)?;
 
     let compression = if args.connection.no_compress {
         CompressionMode::None
@@ -268,13 +268,13 @@ async fn run_get(args: GetArgs) -> Result<()> {
         vars: args.connection.vars.into_iter().collect(),
         var_file: args.connection.var_file,
         resume: false,
-        clean: false,
+        clean: true,
         parallel: args.connection.parallel,
         client_parallel: args.connection.client_parallel,
         compression,
         identity_file: args.connection.identity,
         ssh_port: args.connection.port,
-        aggregate_overrides: Some(aggregate_overrides),
+        get_invocations: Some(get_invocations),
         host_key_verification,
         max_message_size: args.connection.max_message_size,
         collect_metrics: args.connection.metrics,
@@ -286,32 +286,54 @@ async fn run_get(args: GetArgs) -> Result<()> {
     import::run_import(config).await
 }
 
-/// Parse aggregate/where pairs from command line args
-/// Expected format: ["aggregate1", "where clause1", "aggregate2", "where clause2", ...]
-fn parse_aggregate_queries(args: &[String]) -> Result<Vec<(String, String)>> {
-    if args.len() % 2 != 0 {
-        anyhow::bail!(
-            "Expected pairs of aggregate name and where clause, got {} arguments",
-            args.len()
-        );
+/// Parse get function invocations from command line args.
+///
+/// Format: func_name [--param1 value1 --param2 value2] [func_name2 ...]
+/// Function names don't start with "--", so they act as separators.
+fn parse_get_invocations(args: &[String]) -> Result<Vec<import::GetInvocation>> {
+    use std::collections::HashMap;
+
+    if args.is_empty() {
+        anyhow::bail!("Expected at least one get function name");
     }
 
-    let mut pairs = Vec::new();
-    for chunk in args.chunks(2) {
-        let aggregate = chunk[0].clone();
-        let where_clause = chunk[1].clone();
+    let mut invocations = Vec::new();
+    let mut i = 0;
 
-        // Strip leading "where " if present (user might write 'where x = 1' or just 'x = 1')
-        let where_clause = where_clause
-            .strip_prefix("where ")
-            .or_else(|| where_clause.strip_prefix("WHERE "))
-            .map(|s| s.to_string())
-            .unwrap_or(where_clause);
+    while i < args.len() {
+        // First token should be a function name (not starting with --)
+        let func_name = &args[i];
+        if func_name.starts_with("--") {
+            anyhow::bail!(
+                "Expected get function name, got flag '{}'. Function names must not start with '--'",
+                func_name
+            );
+        }
+        i += 1;
 
-        pairs.push((aggregate, where_clause));
+        // Collect --key value pairs until next function name or end
+        let mut params = HashMap::new();
+        while i < args.len() && args[i].starts_with("--") {
+            let key = args[i]
+                .strip_prefix("--")
+                .unwrap()
+                .to_string();
+            i += 1;
+            if i >= args.len() {
+                anyhow::bail!("Expected value for --{}", key);
+            }
+            let value = args[i].clone();
+            i += 1;
+            params.insert(key, value);
+        }
+
+        invocations.push(import::GetInvocation {
+            func_name: func_name.clone(),
+            args: params,
+        });
     }
 
-    Ok(pairs)
+    Ok(invocations)
 }
 
 fn run_check(args: CheckArgs) -> Result<()> {
@@ -371,10 +393,11 @@ fn run_plan(args: PlanArgs) -> Result<()> {
         .and_then(|e| e.to_str())
         .unwrap_or("");
 
-    let plan = if extension == "json" {
+    if extension == "json" {
         // Parse as JSON config
-        json_config::parse_json_config(&args.config, &vars)
-            .map_err(|e| anyhow::anyhow!("JSON config error: {}", e))?
+        let plan = json_config::parse_json_config(&args.config, &vars)
+            .map_err(|e| anyhow::anyhow!("JSON config error: {}", e))?;
+        println!("{}", serde_json::to_string_pretty(&plan)?);
     } else {
         // Parse as .jibs DSL
         let source = std::fs::read_to_string(&args.config)?;
@@ -391,11 +414,39 @@ fn run_plan(args: PlanArgs) -> Result<()> {
         })?;
 
         // Resolve the plan
-        resolver::resolve(&args.config, &program, &vars)?
-    };
+        let resolved = resolver::resolve(&args.config, &program, &vars)?;
 
-    // Print the plan as JSON
-    println!("{}", serde_json::to_string_pretty(&plan)?);
+        // Print the plan as JSON
+        println!("{}", serde_json::to_string_pretty(&resolved.plan)?);
+
+        // Print get functions if any
+        if !resolved.get_functions.is_empty() {
+            println!("\nGet functions:");
+            for func in &resolved.get_functions {
+                let params: Vec<String> = func
+                    .params
+                    .iter()
+                    .map(|p| {
+                        if let Some(default) = &p.default {
+                            format!("{}: {:?} = {}", p.name, p.param_type, default.as_string())
+                        } else {
+                            format!("{}: {:?}", p.name, p.param_type)
+                        }
+                    })
+                    .collect();
+                println!("  {}({}) -> {}", func.name, params.join(", "), func.aggregate_name);
+                if let Some(where_template) = &func.where_template {
+                    println!("    where \"{}\"", where_template);
+                }
+                if let Some(limit) = &func.limit {
+                    match limit {
+                        resolver::LimitOverride::Concrete(n) => println!("    limit {}", n),
+                        resolver::LimitOverride::Param(p) => println!("    limit ${}", p),
+                    }
+                }
+            }
+        }
+    };
 
     Ok(())
 }

@@ -65,6 +65,9 @@ pub struct ExecutionPlan {
     /// This means imports are "hoisted" - their after statements run before
     /// the importing file's after statements.
     pub after_statements: Vec<String>,
+    /// When true, only import aggregate-related tables (skip all full-table imports).
+    /// Used by the `get` command to fetch only specific aggregates.
+    pub aggregates_only: bool,
 }
 
 impl ExecutionPlan {
@@ -86,6 +89,7 @@ impl ExecutionPlan {
             preserves: Vec::new(),
             sets: Vec::new(),
             after_statements: Vec::new(),
+            aggregates_only: false,
         }
     }
 }

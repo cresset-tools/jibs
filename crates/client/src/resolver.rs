@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use jibs_parser::ast::{
-    AggregateBlock, AnonymizeBlock, Expr, FakerDecl, FakerSource, FakerValue, IncludeStmt,
+    AggregateBlock, AnonymizeBlock, Expr, FakerDecl, FakerSource, FakerValue, GetFunctionDef,
     LimitValue, Literal, PreserveStmt, Program, RelationDecl, SetBlock,
     SortDirection as AstSortDirection, Statement, StatementKind, StringLiteral, StringPart,
     TablePattern, VarDecl, VarType,
@@ -16,7 +16,45 @@ use jibs_protocol::{
 
 use crate::error::{ClientError, Result};
 
-/// Resolve a parsed program into an execution plan
+/// Result of resolving a DSL program
+pub struct ResolvedConfig {
+    pub plan: ExecutionPlan,
+    pub get_functions: Vec<ResolvedGetFunction>,
+}
+
+/// A resolved get function definition (ready for CLI invocation)
+#[derive(Debug, Clone)]
+pub struct ResolvedGetFunction {
+    pub name: String,
+    pub params: Vec<ResolvedParam>,
+    pub aggregate_name: String,
+    pub where_template: Option<String>,
+    pub order_by: Option<String>,
+    pub order_direction: Option<SortDirection>,
+    pub limit: Option<LimitOverride>,
+    pub exclude_tables: Vec<String>,
+    pub exclude_patterns: Vec<String>,
+    pub root_only: Option<bool>,
+}
+
+/// A resolved parameter for a get function
+#[derive(Debug, Clone)]
+pub struct ResolvedParam {
+    pub name: String,
+    pub param_type: VarType,
+    pub default: Option<Value>,
+}
+
+/// How the limit is determined in a get function
+#[derive(Debug, Clone)]
+pub enum LimitOverride {
+    /// A concrete limit value
+    Concrete(i64),
+    /// References a function parameter by name
+    Param(String),
+}
+
+/// Resolve a parsed program into an execution plan and get function definitions
 ///
 /// `base_path` is the path to the .jibs file being resolved, used for resolving
 /// relative import paths.
@@ -24,7 +62,7 @@ pub fn resolve(
     base_path: &Path,
     program: &Program<'_>,
     cli_vars: &HashMap<String, String>,
-) -> Result<ExecutionPlan> {
+) -> Result<ResolvedConfig> {
     let mut resolver = Resolver::new(base_path, cli_vars.clone());
     resolver.resolve_program(program)
 }
@@ -41,6 +79,8 @@ struct Resolver {
     pending_vars: HashMap<String, (VarType, Option<Value>)>,
     /// The execution plan being built
     plan: ExecutionPlan,
+    /// Resolved get function definitions
+    get_functions: Vec<ResolvedGetFunction>,
 }
 
 impl Resolver {
@@ -63,10 +103,11 @@ impl Resolver {
             variables,
             pending_vars: HashMap::new(),
             plan: ExecutionPlan::new(),
+            get_functions: Vec::new(),
         }
     }
 
-    fn resolve_program(&mut self, program: &Program<'_>) -> Result<ExecutionPlan> {
+    fn resolve_program(&mut self, program: &Program<'_>) -> Result<ResolvedConfig> {
         // First pass: process imports (they may define variables, fakers, etc.)
         for (stmt, _span) in &program.statements {
             if let StatementKind::Import((path, _path_span)) = &stmt.kind {
@@ -95,7 +136,10 @@ impl Resolver {
             self.process_statement(stmt)?;
         }
 
-        Ok(std::mem::take(&mut self.plan))
+        Ok(ResolvedConfig {
+            plan: std::mem::take(&mut self.plan),
+            get_functions: std::mem::take(&mut self.get_functions),
+        })
     }
 
     /// Process an import statement by loading and resolving the imported file.
@@ -329,7 +373,7 @@ impl Resolver {
                 Ok(())
             }
             StatementKind::Aggregate(agg_block) => self.process_aggregate(agg_block),
-            StatementKind::Include(include_stmt) => self.process_include(include_stmt),
+            StatementKind::Get(get_func) => self.process_get_function(get_func),
             StatementKind::Preserve(preserve_stmt) => self.process_preserve(preserve_stmt),
             StatementKind::Set(set_block) => self.process_set(set_block),
             StatementKind::After(after_block) => {
@@ -698,30 +742,146 @@ impl Resolver {
         Ok(())
     }
 
-    fn process_include(&mut self, include_stmt: &IncludeStmt<'_>) -> Result<()> {
-        let aggregate_name = include_stmt.aggregate.0.to_string();
+    fn process_get_function(&mut self, func: &GetFunctionDef<'_>) -> Result<()> {
+        let name = func.name.0.to_string();
+        let aggregate_name = func.aggregate.0.to_string();
 
-        if let Some(existing) = self.plan.aggregates.iter().find(|a| a.name == aggregate_name) {
-            let mut new_agg = existing.clone();
-            new_agg.name = format!("{}_include_{}", aggregate_name, self.plan.aggregates.len());
+        // Validate the referenced aggregate exists
+        if !self.plan.aggregates.iter().any(|a| a.name == aggregate_name) {
+            return Err(ClientError::Parse(format!(
+                "Get function '{}' references unknown aggregate '{}'. Available aggregates: {}",
+                name,
+                aggregate_name,
+                self.plan
+                    .aggregates
+                    .iter()
+                    .map(|a| a.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        }
 
-            match &include_stmt.where_clause {
-                Some(wc) => {
-                    // Override with the specified where clause
-                    new_agg.where_clause = Some(self.resolve_string_literal(&wc.0)?);
-                }
-                None => {
-                    // No where clause: import the full root table (+ relations)
-                    new_agg.where_clause = None;
-                    new_agg.order_by = None;
-                    new_agg.order_direction = None;
-                    new_agg.limit = None;
+        // Resolve parameters (names + defaults)
+        let param_names: Vec<&str> = func.params.iter().map(|(decl, _)| decl.name.0).collect();
+        let mut resolved_params = Vec::new();
+        for (decl, _span) in &func.params {
+            let param_name = decl.name.0.to_string();
+            let param_type = decl.var_type.0;
+            let default = if let Some((lit, _span)) = &decl.default {
+                Some(self.literal_to_value(lit, param_type)?)
+            } else {
+                None
+            };
+            resolved_params.push(ResolvedParam {
+                name: param_name,
+                param_type,
+                default,
+            });
+        }
+
+        // Resolve WHERE template (parameters left as {param_name} placeholders)
+        let where_template = if let Some((lit, _span)) = &func.where_clause {
+            Some(self.resolve_string_literal_with_params(lit, &param_names)?)
+        } else {
+            None
+        };
+
+        // Resolve order_by (concrete, no param references)
+        let order_by = func.order_by.as_ref().map(|o| o.column.0.to_string());
+        let order_direction = func.order_by.as_ref().and_then(|o| {
+            o.direction.map(|d| match d {
+                AstSortDirection::Asc => SortDirection::Asc,
+                AstSortDirection::Desc => SortDirection::Desc,
+            })
+        });
+
+        // Resolve limit (may reference a param)
+        let limit = if let Some((limit_val, _span)) = &func.limit {
+            match limit_val {
+                LimitValue::Literal(n) => Some(LimitOverride::Concrete(*n)),
+                LimitValue::Variable(var_name) => {
+                    if param_names.contains(var_name) {
+                        Some(LimitOverride::Param(var_name.to_string()))
+                    } else {
+                        // Resolve from global variables
+                        let value = self.variables.get(*var_name).ok_or_else(|| {
+                            ClientError::UndefinedVariable(var_name.to_string())
+                        })?;
+                        Some(LimitOverride::Concrete(value.as_int().ok_or_else(
+                            || {
+                                ClientError::TypeError(format!(
+                                    "Variable '{}' must be an integer for limit",
+                                    var_name
+                                ))
+                            },
+                        )?))
+                    }
                 }
             }
+        } else {
+            None
+        };
 
-            self.plan.aggregates.push(new_agg);
+        // Resolve excludes (concrete)
+        let mut exclude_tables = Vec::new();
+        let mut exclude_patterns = Vec::new();
+        for pattern in &func.exclude_tables {
+            match pattern {
+                TablePattern::Exact((name, _span)) => {
+                    exclude_tables.push(name.to_string());
+                }
+                TablePattern::Regex((pat, _span)) => {
+                    exclude_patterns.push(pat.to_string());
+                }
+            }
         }
+
+        let root_only = if func.root_only { Some(true) } else { None };
+
+        self.get_functions.push(ResolvedGetFunction {
+            name,
+            params: resolved_params,
+            aggregate_name,
+            where_template,
+            order_by,
+            order_direction,
+            limit,
+            exclude_tables,
+            exclude_patterns,
+            root_only,
+        });
+
         Ok(())
+    }
+
+    /// Resolve a string literal but leave function parameters as {param_name} placeholders
+    fn resolve_string_literal_with_params(
+        &self,
+        lit: &StringLiteral<'_>,
+        param_names: &[&str],
+    ) -> Result<String> {
+        let mut result = String::new();
+        for part in &lit.parts {
+            match part {
+                StringPart::Text(text) => result.push_str(text),
+                StringPart::Interpolation((Expr::Variable(name), _span))
+                    if param_names.contains(name) =>
+                {
+                    // Leave as placeholder for runtime substitution
+                    result.push('{');
+                    result.push_str(name);
+                    result.push('}');
+                }
+                StringPart::Interpolation((Expr::Unique, _span)) => {
+                    result.push_str("{unique()}");
+                }
+                StringPart::Interpolation((expr, _span)) => {
+                    let value = self.evaluate_expr(expr)?;
+                    result.push_str(&value.as_string());
+                }
+            }
+        }
+        Ok(result)
     }
 
     fn process_preserve(&mut self, preserve_stmt: &PreserveStmt<'_>) -> Result<()> {

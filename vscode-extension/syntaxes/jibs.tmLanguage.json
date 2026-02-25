@@ -174,8 +174,8 @@
           "match": "\\baggregate\\b"
         },
         {
-          "name": "keyword.control.include.jibs",
-          "match": "\\binclude\\b"
+          "name": "keyword.declaration.get.jibs",
+          "match": "\\bget\\b"
         },
         {
           "name": "keyword.control.preserve.jibs",

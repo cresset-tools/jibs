@@ -51,8 +51,8 @@ pub enum StatementKind<'src> {
     /// aggregate name { ... }
     Aggregate(AggregateBlock<'src>),
 
-    /// include aggregate where "condition"
-    Include(IncludeStmt<'src>),
+    /// get function definition
+    Get(GetFunctionDef<'src>),
 
     /// preserve table where "condition"
     Preserve(PreserveStmt<'src>),
@@ -209,11 +209,17 @@ pub enum LimitValue<'src> {
     Variable(&'src str),
 }
 
-/// Include statement
+/// Get function definition
 #[derive(Debug, Clone)]
-pub struct IncludeStmt<'src> {
+pub struct GetFunctionDef<'src> {
+    pub name: Spanned<&'src str>,
+    pub params: Vec<Spanned<VarDecl<'src>>>,
     pub aggregate: Spanned<&'src str>,
     pub where_clause: Option<Spanned<StringLiteral<'src>>>,
+    pub order_by: Option<OrderByClause<'src>>,
+    pub limit: Option<Spanned<LimitValue<'src>>>,
+    pub exclude_tables: Vec<TablePattern<'src>>,
+    pub root_only: bool,
 }
 
 /// Preserve statement

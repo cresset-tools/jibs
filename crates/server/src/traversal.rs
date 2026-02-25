@@ -761,11 +761,13 @@ fn run_aggregate_bfs(
     metrics.snapshot_aggregate_phase();
 
     // Stream false-positive tables (potential aggregate that BFS didn't touch)
+    // In aggregates_only mode, skip these — only BFS-touched tables matter
     for table in &all_table_names_vec {
         if potential_aggregate_tables.contains(table)
             && !aggregate_tables.contains(table)
             && !plan.excluded_tables.contains(table)
             && !plan.ignored_tables.contains(table)
+            && !plan.aggregates_only
         {
             let columns = conn.get_column_defs(table)?;
             let anonymization = plan
@@ -870,6 +872,9 @@ impl<'a> DependencyTraverser<'a> {
             if self.plan.ignored_tables.contains(table) {
                 continue;
             }
+            if self.plan.aggregates_only && !potential_aggregate.contains(table) {
+                continue;
+            }
             if self.plan.excluded_tables.contains(table) {
                 let tid = self.table_ids[table];
                 let columns = self.conn.get_column_defs(table)?;
@@ -893,6 +898,11 @@ impl<'a> DependencyTraverser<'a> {
             }
             if potential_aggregate.contains(table) {
                 // Handled by BFS thread (either as aggregate or false-positive)
+                continue;
+            }
+
+            // In aggregates_only mode (used by `get`), skip all full-table imports
+            if self.plan.aggregates_only {
                 continue;
             }
 
