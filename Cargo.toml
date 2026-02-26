@@ -7,7 +7,7 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-license = "MIT"
+license = "proprietary"
 repository = "https://github.com/jelle/jibs"
 description = "Jelle's Importer with Better Speed - A MySQL database import tool"
 
