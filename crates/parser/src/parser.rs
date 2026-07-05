@@ -59,21 +59,23 @@ fn statement_kind_parser<'tokens, 'src: 'tokens, I>(
 where
     I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
 {
+    // .boxed() erases the deeply nested combinator types per statement,
+    // keeping rustc's type checking of this crate tractable
     choice((
-        import_parser(),
-        var_parser(),
-        faker_parser(),
-        relation_parser(),
-        ignore_relation_parser(),
-        anonymize_parser(),
-        exclude_parser(),
-        ignore_parser(),
-        full_parser(),
-        aggregate_parser(),
-        get_function_parser(),
-        preserve_parser(),
-        set_parser(),
-        after_parser(),
+        import_parser().boxed(),
+        var_parser().boxed(),
+        faker_parser().boxed(),
+        relation_parser().boxed(),
+        ignore_relation_parser().boxed(),
+        anonymize_parser().boxed(),
+        exclude_parser().boxed(),
+        ignore_parser().boxed(),
+        full_parser().boxed(),
+        aggregate_parser().boxed(),
+        get_function_parser().boxed(),
+        preserve_parser().boxed(),
+        set_parser().boxed(),
+        after_parser().boxed(),
     ))
 }
 
@@ -560,17 +562,13 @@ where
             .ignore_then(ident_raw())
             .map(Value::Variable),
         // String with interpolation support
-        select! { Token::String(s) => s }
-            .map_with(|s, e| {
-                let span: Span = e.span();
-                let str_literal = parse_interpolated_string(s, span.start);
-                Value::Literal(Literal::String(str_literal))
-            }),
-        select! { Token::Int(n) => Value::Literal(Literal::Int(n)) },
-        select! { Token::Float(n) => Value::Literal(Literal::Float(n)) },
+        string_literal().map(|(lit, _)| Value::Literal(Literal::String(lit))),
+        signed_float().map(|n| Value::Literal(Literal::Float(n))),
+        signed_int().map(|n| Value::Literal(Literal::Int(n))),
         select! { Token::Bool(b) => Value::Literal(Literal::Bool(b)) },
     ))
     .map_with(|v, e| (v, e.span()))
+    .boxed()
 }
 
 /// Parse expression (for conditionals and interpolation)
@@ -591,10 +589,9 @@ where
                 Token::Int(n) => Expr::Literal(Literal::Int(n)),
                 Token::Float(n) => Expr::Literal(Literal::Float(n)),
                 Token::Bool(b) => Expr::Literal(Literal::Bool(b)),
-                Token::String(s) => Expr::Literal(Literal::String(StringLiteral {
-                    parts: vec![StringPart::Text(s)],
-                })),
             },
+            // String literal (with escape decoding and interpolation)
+            string_literal().map(|(lit, _)| Expr::Literal(Literal::String(lit))),
             // Parenthesized expression
             expr.clone()
                 .delimited_by(just(Token::LParen), just(Token::RParen))
@@ -657,6 +654,33 @@ where
             |a, b, e| (Expr::Binary(Box::new(a), BinaryOp::Or, Box::new(b)), e.span()),
         )
     })
+    .boxed()
+}
+
+/// Parse an integer literal with optional leading minus.
+/// The lexer never folds a sign into number tokens (that broke binary
+/// minus), so literal positions accept `Minus Int` for negative values.
+fn signed_int<'tokens, 'src: 'tokens, I>(
+) -> impl Parser<'tokens, I, i64, extra::Err<Rich<'tokens, Token<'src>, Span>>> + Clone
+where
+    I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
+{
+    just(Token::Minus)
+        .or_not()
+        .then(select! { Token::Int(n) => n })
+        .map(|(minus, n)| if minus.is_some() { -n } else { n })
+}
+
+/// Parse a float literal with optional leading minus
+fn signed_float<'tokens, 'src: 'tokens, I>(
+) -> impl Parser<'tokens, I, f64, extra::Err<Rich<'tokens, Token<'src>, Span>>> + Clone
+where
+    I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
+{
+    just(Token::Minus)
+        .or_not()
+        .then(select! { Token::Float(n) => n })
+        .map(|(minus, n)| if minus.is_some() { -n } else { n })
 }
 
 /// Parse an identifier
@@ -678,19 +702,28 @@ where
     select! { Token::Ident(s) => s }
 }
 
-/// Parse a string literal with interpolation support
+/// Parse a string literal with interpolation support.
+/// Malformed interpolations are reported as parse errors.
 fn string_literal<'tokens, 'src: 'tokens, I>(
 ) -> impl Parser<'tokens, I, Spanned<StringLiteral<'src>>, extra::Err<Rich<'tokens, Token<'src>, Span>>> + Clone
 where
     I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
 {
     select! { Token::String(s) => s }
-        .map_with(|s, e| {
+        .validate(|s, e, emitter| {
             let span: Span = e.span();
-            // Offset by 1 to account for opening quote
-            let str_literal = parse_interpolated_string(s, span.start);
-            (str_literal, span)
+            // Offset by 1 to account for the opening quote
+            match parse_interpolated_string(s, span.start + 1) {
+                Ok(str_literal) => (str_literal, span),
+                Err(errors) => {
+                    for err in errors {
+                        emitter.emit(Rich::custom(err.span, err.message));
+                    }
+                    (StringLiteral { parts: vec![] }, span)
+                }
+            }
         })
+        .boxed()
 }
 
 /// Parse a string literal (raw, with span on the raw string)
@@ -717,16 +750,16 @@ where
         .delimited_by(just(Token::LBracket), just(Token::RBracket))
         .map(Literal::StringArray);
 
-    // Int array literal: [1, 2, 3]
-    let int_array = select! { Token::Int(n) => n }
+    // Int array literal: [1, -2, 3]
+    let int_array = signed_int()
         .separated_by(just(Token::Comma))
         .allow_trailing()
         .collect()
         .delimited_by(just(Token::LBracket), just(Token::RBracket))
         .map(Literal::IntArray);
 
-    // Float array literal: [1.0, 2.5, 3.14]
-    let float_array = select! { Token::Float(n) => n }
+    // Float array literal: [1.0, -2.5, 3.14]
+    let float_array = signed_float()
         .separated_by(just(Token::Comma))
         .allow_trailing()
         .collect()
@@ -746,13 +779,16 @@ where
         int_array,
         float_array,
         bool_array,
-        select! { Token::String(s) => Literal::String(StringLiteral { parts: vec![StringPart::Text(s)] }) },
-        select! { Token::Int(n) => Literal::Int(n) },
-        select! { Token::Float(n) => Literal::Float(n) },
+        // Scalar strings interpolate like everywhere else (string arrays
+        // above already did; scalars previously kept braces as literal text)
+        string_literal().map(|(lit, _)| Literal::String(lit)),
+        signed_float().map(Literal::Float),
+        signed_int().map(Literal::Int),
         select! { Token::Bool(b) => Literal::Bool(b) },
         just(Token::Null).to(Literal::Null),
     ))
     .map_with(|l, e| (l, e.span()))
+    .boxed()
 }
 
 /// Parse a multiline string
@@ -810,6 +846,73 @@ mod tests {
             }
             _ => panic!("Expected Var"),
         }
+    }
+
+    #[test]
+    fn test_negative_number_defaults() {
+        // SPEC-promised and previously unparseable: negative floats, and
+        // negative ints now lex as Minus + Int
+        let program = parse("var tax: float = -0.5\nvar offset: int = -3");
+        match &program.statements[0].0.kind {
+            StatementKind::Var(decl) => {
+                assert_eq!(decl.default.as_ref().unwrap().0, Literal::Float(-0.5));
+            }
+            _ => panic!("Expected Var"),
+        }
+        match &program.statements[1].0.kind {
+            StatementKind::Var(decl) => {
+                assert_eq!(decl.default.as_ref().unwrap().0, Literal::Int(-3));
+            }
+            _ => panic!("Expected Var"),
+        }
+    }
+
+    #[test]
+    fn test_negative_array_elements() {
+        let program = parse("var a: int[] = [1, -2, 3]\nvar b: float[] = [-1.5, 2.5]");
+        match &program.statements[0].0.kind {
+            StatementKind::Var(decl) => {
+                assert_eq!(
+                    decl.default.as_ref().unwrap().0,
+                    Literal::IntArray(vec![1, -2, 3])
+                );
+            }
+            _ => panic!("Expected Var"),
+        }
+        match &program.statements[1].0.kind {
+            StatementKind::Var(decl) => {
+                assert_eq!(
+                    decl.default.as_ref().unwrap().0,
+                    Literal::FloatArray(vec![-1.5, 2.5])
+                );
+            }
+            _ => panic!("Expected Var"),
+        }
+    }
+
+    #[test]
+    fn test_bad_interpolation_is_parse_error() {
+        let input = r#"
+            aggregate orders {
+                root orders
+                where "user_id = ${user_id}"
+            }
+        "#;
+        let result = crate::parse(input);
+        let errors = result.expect_err("${var} typo must be a parse error");
+        assert!(
+            errors[0].message.contains("did you mean {$user_id}?"),
+            "expected hint, got: {}",
+            errors[0].message
+        );
+    }
+
+    #[test]
+    fn test_division_in_when_condition() {
+        // Previously the regex lexer rule swallowed everything after '/'
+        let program = parse("#[when($order_limit / 2 > 10)]\nexclude_data audit_log");
+        assert_eq!(program.statements.len(), 1);
+        assert!(program.statements[0].0.attribute.is_some());
     }
 
     #[test]
@@ -1186,11 +1289,11 @@ mod tests {
                     Value::Literal(Literal::String(s)) => {
                         // Should have: "https://" + {$domain} + ":" + {$port} + "/"
                         assert_eq!(s.parts.len(), 5);
-                        assert!(matches!(&s.parts[0], StringPart::Text("https://")));
+                        assert!(matches!(&s.parts[0], StringPart::Text(t) if t == "https://"));
                         assert!(matches!(&s.parts[1], StringPart::Interpolation(_)));
-                        assert!(matches!(&s.parts[2], StringPart::Text(":")));
+                        assert!(matches!(&s.parts[2], StringPart::Text(t) if t == ":"));
                         assert!(matches!(&s.parts[3], StringPart::Interpolation(_)));
-                        assert!(matches!(&s.parts[4], StringPart::Text("/")));
+                        assert!(matches!(&s.parts[4], StringPart::Text(t) if t == "/"));
                     }
                     _ => panic!("Expected String literal with interpolation"),
                 }

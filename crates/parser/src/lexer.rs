@@ -172,23 +172,23 @@ pub fn lexer<'src>(
         .then_ignore(just("\"\"\""))
         .map(Token::MultilineString);
 
-    // Regular string with escape sequences
-    let escape = just('\\').ignore_then(choice((
-        just('\\'),
-        just('"'),
-        just('n').to('\n'),
-        just('t').to('\t'),
-        just('{'),
-    )));
+    // Regular string. The token keeps the RAW inner slice; escape sequences
+    // are decoded later by parse_interpolated_string. The lexer accepts any
+    // `\<char>` so unknown escapes (e.g. `\%` in SQL LIKE patterns) don't
+    // fail the whole string with cascading errors.
+    let escape = just('\\').ignore_then(any());
 
-    let string_char = none_of("\\\"").or(escape);
+    let string_char = none_of("\\\"").ignored().or(escape.ignored());
 
     let string = just('"')
         .ignore_then(string_char.repeated().to_slice())
         .then_ignore(just('"'))
         .map(Token::String);
 
-    // Numbers (float must come before int to handle decimal points)
+    // Numbers (float must come before int to handle decimal points).
+    // No leading sign: `-` is always the Minus token, and negation is
+    // handled by the parsers. Folding the sign into the literal broke
+    // binary minus without spaces (`$a-1`) and made `-0.5` unlexable.
     let float = text::int(10)
         .then(just('.').then(text::digits(10)))
         .to_slice()
@@ -196,12 +196,20 @@ pub fn lexer<'src>(
         .unwrapped()
         .map(Token::Float);
 
-    let int = just('-')
-        .or_not()
-        .then(text::int(10))
+    // `validate` (not `try_map`): the token still lexes so there is no
+    // skip-one-char error cascade, and the emitted message survives instead
+    // of being merged away by the surrounding `choice`.
+    let int = text::int(10)
         .to_slice()
-        .from_str()
-        .unwrapped()
+        .validate(|s: &str, e, emitter| {
+            s.parse::<i64>().unwrap_or_else(|_| {
+                emitter.emit(Rich::custom(
+                    e.span(),
+                    format!("integer literal '{}' is out of range for a 64-bit integer", s),
+                ));
+                i64::MAX
+            })
+        })
         .map(Token::Int);
 
     // Multi-character operators (must come before single-char)
@@ -241,8 +249,18 @@ pub fn lexer<'src>(
     let dollar = just('$').to(Token::Dollar);
 
     // Regex literal: /pattern/
+    // The body may not contain whitespace (use \s or [ ] for a literal
+    // space). This disambiguates regexes from division: `$a / 2` fails the
+    // regex rule at the space and falls through to the Slash operator,
+    // instead of swallowing everything up to the next '/' in the file.
     let regex = just('/')
-        .ignore_then(any().and_is(just('/').not()).repeated().at_least(1).to_slice())
+        .ignore_then(
+            any()
+                .filter(|c: &char| *c != '/' && !c.is_whitespace())
+                .repeated()
+                .at_least(1)
+                .to_slice(),
+        )
         .then_ignore(just('/'))
         .map(Token::Regex);
 
@@ -380,8 +398,50 @@ mod tests {
         let tokens = lex("42 3.14 -100");
         assert_eq!(
             tokens,
-            vec![Token::Int(42), Token::Float(3.14), Token::Int(-100),]
+            vec![
+                Token::Int(42),
+                Token::Float(3.14),
+                Token::Minus,
+                Token::Int(100),
+            ]
         );
+    }
+
+    #[test]
+    fn test_int_overflow_is_error_not_panic() {
+        let (tokens, errors) = lexer().parse("limit 99999999999999999999").into_output_errors();
+        assert!(tokens.is_none() || !errors.is_empty());
+        assert!(!errors.is_empty(), "20-digit literal must be a lex error");
+        assert!(errors[0].to_string().contains("out of range"));
+    }
+
+    #[test]
+    fn test_unknown_escape_lexes_without_cascade() {
+        // \% is not a defined escape but must not fail the string
+        let tokens = lex(r#""path LIKE 'a\%'""#);
+        assert_eq!(tokens, vec![Token::String(r"path LIKE 'a\%'")]);
+    }
+
+    #[test]
+    fn test_division_with_spaces_is_slash_not_regex() {
+        let tokens = lex("$a / 2 > 10");
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Dollar,
+                Token::Ident("a"),
+                Token::Slash,
+                Token::Int(2),
+                Token::Gt,
+                Token::Int(10),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_regex_still_lexes() {
+        let tokens = lex("ignore_table /^cache_/");
+        assert_eq!(tokens, vec![Token::IgnoreTable, Token::Regex("^cache_")]);
     }
 
     #[test]
