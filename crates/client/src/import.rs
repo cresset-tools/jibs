@@ -214,7 +214,7 @@ impl LoaderPool {
                         init_timeout.as_secs(),
                         ready_count,
                         num_workers,
-                        mysql_url
+                        redact_mysql_url(mysql_url)
                     ));
                 }
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
@@ -643,7 +643,10 @@ pub async fn run_import(config: ImportConfig) -> Result<()> {
     let server_path = deploy_server(&session).await?;
 
     // Connect to local MySQL
-    info!("Connecting to local MySQL: {}", config.local_mysql);
+    info!(
+        "Connecting to local MySQL: {}",
+        redact_mysql_url(&config.local_mysql)
+    );
     let local_opts = Opts::from_url(&config.local_mysql)
         .map_err(|e| anyhow::anyhow!("Invalid local MySQL URL: {}", e))?;
     let mut local_conn = Conn::new(local_opts)?;
@@ -675,11 +678,18 @@ pub async fn run_import(config: ImportConfig) -> Result<()> {
                 let completed = Checkpoint::get_completed(&mut local_conn)?;
                 state_parts.push(format!("checkpoint ({} tables completed)", completed.len()));
             }
+            let hint = if config.get_invocations.is_some() {
+                "Use `jibs import --resume` to finish the interrupted import first, or\n\
+                 pass --clean to discard the state (this deletes any preserved rows\n\
+                 that only exist in the backup tables)."
+            } else {
+                "Use --resume to continue the interrupted import, or\n\
+                 Use --clean to discard the state and start fresh."
+            };
             return Err(anyhow::anyhow!(
-                "Found state from a previous interrupted import:\n  {}\n\n\
-                 Use --resume to continue the interrupted import, or\n\
-                 Use --clean to discard the state and start fresh.",
-                state_parts.join("\n  ")
+                "Found state from a previous interrupted import:\n  {}\n\n{}",
+                state_parts.join("\n  "),
+                hint
             ));
         } else {
             let completed = Checkpoint::get_completed(&mut local_conn)?;
@@ -697,11 +707,10 @@ pub async fn run_import(config: ImportConfig) -> Result<()> {
     // Allow inserting 0 into auto-increment columns (e.g. store_website.website_id = 0)
     local_conn.query_drop("SET SQL_MODE = 'NO_AUTO_VALUE_ON_ZERO'")?;
 
-    // Drop all FK constraints in the local database to prevent MySQL ERROR 1822.
-    // When tables are recreated in parallel (with only a PK, no secondary indexes),
-    // MySQL re-validates orphaned FK constraints from existing tables and fails if
-    // the required index is missing on the newly created referenced table.
-    drop_all_foreign_keys(&mut local_conn)?;
+    // Capture all FK constraints in the local database, then drop them to
+    // prevent MySQL ERROR 1822 during parallel table recreation. They are
+    // restored after the import completes (see restore_foreign_keys below).
+    preserve_and_drop_foreign_keys(&mut local_conn)?;
 
     // Create loader pool for parallel loading
     let client_workers = config.client_parallel.unwrap_or(config.parallel);
@@ -751,6 +760,13 @@ pub async fn run_import(config: ImportConfig) -> Result<()> {
     // Display report if enabled and we have table data
     if config.show_report && !outcome.stats.table_durations.is_empty() {
         display_report(&outcome.stats.table_durations);
+    }
+
+    // Restore FK constraints on success (while FOREIGN_KEY_CHECKS is still 0).
+    // On failure the persisted definitions are kept so a later successful run
+    // (e.g. after --resume) restores them.
+    if outcome.result.is_ok() {
+        restore_foreign_keys(&mut local_conn)?;
     }
 
     // Re-enable checks
@@ -912,16 +928,38 @@ fn apply_get_invocations(
     // - Relations (needed for BFS traversal)
     // - Excluded/ignored tables and patterns (still relevant for BFS)
     // - Full tables (kept as BFS dead-ends, but not imported)
-    // Everything else (preserves, sets, after_statements, fakers,
-    // anonymization) is not relevant for `get`.
+    // - Anonymization and fakers (applied server-side; must stay in the plan
+    //   or `get` would stream raw, un-anonymized production data)
+    // Post-processing (preserves, sets, after_statements) is not relevant for `get`.
     plan.aggregates = new_aggregates;
     plan.aggregates_only = true;
     plan.preserves.clear();
     plan.sets.clear();
     plan.after_statements.clear();
-    plan.anonymization.clear();
-    plan.fakers.clear();
     Ok(plan)
+}
+
+/// Mask the password portion of a MySQL URL for safe logging.
+fn redact_mysql_url(url: &str) -> String {
+    let Some(scheme_end) = url.find("://") else {
+        return url.to_string();
+    };
+    let rest = &url[scheme_end + 3..];
+    // Userinfo ends at the last '@' before the path
+    let authority_end = rest.find('/').unwrap_or(rest.len());
+    let Some(at) = rest[..authority_end].rfind('@') else {
+        return url.to_string();
+    };
+    let userinfo = &rest[..at];
+    let Some(colon) = userinfo.find(':') else {
+        return url.to_string();
+    };
+    format!(
+        "{}{}:***{}",
+        &url[..scheme_end + 3],
+        &userinfo[..colon],
+        &rest[at..]
+    )
 }
 
 /// Prefix for backup tables
@@ -937,15 +975,18 @@ fn preserve_backup_table(table: &str) -> String {
 
 /// Find all existing backup tables from a previous import
 fn find_backup_tables(conn: &mut Conn) -> Result<Vec<String>> {
+    // Filter by prefix in Rust rather than LIKE: `_` is a single-character
+    // wildcard in LIKE patterns, so 'LIKE '_jibs_preserve_%'' would also match
+    // (and under --clean, drop) unrelated tables like 'xjibsXpreserveXfoo'.
     let tables: Vec<String> = conn.query_map(
-        format!(
-            "SELECT TABLE_NAME FROM information_schema.TABLES \
-             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME LIKE '{}%'",
-            BACKUP_TABLE_PREFIX
-        ),
+        "SELECT TABLE_NAME FROM information_schema.TABLES \
+         WHERE TABLE_SCHEMA = DATABASE()",
         |table_name: String| table_name,
     )?;
-    Ok(tables)
+    Ok(tables
+        .into_iter()
+        .filter(|t| t.starts_with(BACKUP_TABLE_PREFIX))
+        .collect())
 }
 
 // ============================================================================
@@ -1005,6 +1046,220 @@ impl Checkpoint {
         conn.query_drop(format!("DROP TABLE IF EXISTS `{}`", CHECKPOINT_TABLE))?;
         Ok(())
     }
+}
+
+// ============================================================================
+// Foreign key preservation - captures FK constraints before the import drops
+// them, and restores them once the import completes
+// ============================================================================
+
+/// Name of the table that persists captured FK definitions across runs
+const FK_STORE_TABLE: &str = "_jibs_foreign_keys";
+
+/// A foreign key constraint definition read from information_schema
+struct ForeignKeyDef {
+    table: String,
+    constraint: String,
+    columns: Vec<String>,
+    ref_schema: String,
+    ref_table: String,
+    ref_columns: Vec<String>,
+    update_rule: String,
+    delete_rule: String,
+}
+
+/// Escape an identifier for use inside backticks
+fn escape_ident(name: &str) -> String {
+    name.replace('`', "``")
+}
+
+/// Build the ALTER TABLE statement that recreates a foreign key
+fn build_fk_ddl(fk: &ForeignKeyDef) -> String {
+    let quote_list = |cols: &[String]| {
+        cols.iter()
+            .map(|c| format!("`{}`", escape_ident(c)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    format!(
+        "ALTER TABLE `{}` ADD CONSTRAINT `{}` FOREIGN KEY ({}) \
+         REFERENCES `{}`.`{}` ({}) ON UPDATE {} ON DELETE {}",
+        escape_ident(&fk.table),
+        escape_ident(&fk.constraint),
+        quote_list(&fk.columns),
+        escape_ident(&fk.ref_schema),
+        escape_ident(&fk.ref_table),
+        quote_list(&fk.ref_columns),
+        fk.update_rule,
+        fk.delete_rule
+    )
+}
+
+/// Read all FK constraints in the current schema
+fn capture_foreign_keys(conn: &mut Conn) -> Result<Vec<ForeignKeyDef>> {
+    type FkRow = (String, String, String, String, String, String, String, String);
+    let rows: Vec<FkRow> = conn.query(
+        "SELECT kcu.TABLE_NAME, kcu.CONSTRAINT_NAME, kcu.COLUMN_NAME, \
+                kcu.REFERENCED_TABLE_SCHEMA, kcu.REFERENCED_TABLE_NAME, kcu.REFERENCED_COLUMN_NAME, \
+                rc.UPDATE_RULE, rc.DELETE_RULE \
+         FROM information_schema.KEY_COLUMN_USAGE kcu \
+         JOIN information_schema.REFERENTIAL_CONSTRAINTS rc \
+           ON rc.CONSTRAINT_SCHEMA = kcu.CONSTRAINT_SCHEMA \
+          AND rc.CONSTRAINT_NAME = kcu.CONSTRAINT_NAME \
+          AND rc.TABLE_NAME = kcu.TABLE_NAME \
+         WHERE kcu.TABLE_SCHEMA = DATABASE() AND kcu.REFERENCED_TABLE_NAME IS NOT NULL \
+         ORDER BY kcu.TABLE_NAME, kcu.CONSTRAINT_NAME, kcu.ORDINAL_POSITION",
+    )?;
+
+    let mut defs: Vec<ForeignKeyDef> = Vec::new();
+    for (table, constraint, column, ref_schema, ref_table, ref_column, update_rule, delete_rule) in
+        rows
+    {
+        match defs.last_mut() {
+            Some(last) if last.table == table && last.constraint == constraint => {
+                last.columns.push(column);
+                last.ref_columns.push(ref_column);
+            }
+            _ => defs.push(ForeignKeyDef {
+                table,
+                constraint,
+                columns: vec![column],
+                ref_schema,
+                ref_table,
+                ref_columns: vec![ref_column],
+                update_rule,
+                delete_rule,
+            }),
+        }
+    }
+    Ok(defs)
+}
+
+/// Persistent store for captured FK definitions, keyed by (table, constraint)
+struct ForeignKeyStore;
+
+impl ForeignKeyStore {
+    fn load(conn: &mut Conn) -> Result<HashMap<(String, String), String>> {
+        let exists: Option<String> = conn.query_first(format!(
+            "SELECT TABLE_NAME FROM information_schema.TABLES \
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = '{}'",
+            FK_STORE_TABLE
+        ))?;
+        if exists.is_none() {
+            return Ok(HashMap::new());
+        }
+        let rows: Vec<(String, String, String)> = conn.query(format!(
+            "SELECT table_name, constraint_name, ddl FROM `{}`",
+            FK_STORE_TABLE
+        ))?;
+        Ok(rows
+            .into_iter()
+            .map(|(t, c, ddl)| ((t, c), ddl))
+            .collect())
+    }
+
+    fn save(conn: &mut Conn, store: &HashMap<(String, String), String>) -> Result<()> {
+        conn.query_drop(format!(
+            "CREATE TABLE IF NOT EXISTS `{}` (
+                table_name VARCHAR(255) NOT NULL,
+                constraint_name VARCHAR(255) NOT NULL,
+                ddl TEXT NOT NULL,
+                PRIMARY KEY (table_name, constraint_name)
+            )",
+            FK_STORE_TABLE
+        ))?;
+        conn.exec_batch(
+            format!(
+                "REPLACE INTO `{}` (table_name, constraint_name, ddl) VALUES (?, ?, ?)",
+                FK_STORE_TABLE
+            ),
+            store
+                .iter()
+                .map(|((t, c), ddl)| (t.as_str(), c.as_str(), ddl.as_str())),
+        )?;
+        Ok(())
+    }
+
+    fn cleanup(conn: &mut Conn) -> Result<()> {
+        conn.query_drop(format!("DROP TABLE IF EXISTS `{}`", FK_STORE_TABLE))?;
+        Ok(())
+    }
+}
+
+/// Capture all FK constraints, persist their definitions, then drop them.
+///
+/// Dropping prevents MySQL ERROR 1822 when tables are recreated in parallel:
+/// when we DROP + CREATE a table that was previously referenced by FK
+/// constraints from other tables, MySQL re-validates those orphaned FK
+/// constraints against the new table. Since we only create a PRIMARY KEY
+/// (no secondary indexes), the required index for the FK may be missing,
+/// causing the error.
+///
+/// The definitions are persisted to a table so that an interrupted import can
+/// still restore them on a later successful run.
+fn preserve_and_drop_foreign_keys(conn: &mut Conn) -> Result<()> {
+    let captured = capture_foreign_keys(conn)?;
+
+    // Merge with FKs recorded by a previous interrupted run (already dropped
+    // from the schema, so not in `captured`). Current definitions win.
+    let mut store = ForeignKeyStore::load(conn)?;
+    for fk in &captured {
+        store.insert((fk.table.clone(), fk.constraint.clone()), build_fk_ddl(fk));
+    }
+    if !store.is_empty() {
+        ForeignKeyStore::save(conn, &store)?;
+    }
+
+    for fk in &captured {
+        conn.query_drop(format!(
+            "ALTER TABLE `{}` DROP FOREIGN KEY `{}`",
+            escape_ident(&fk.table),
+            escape_ident(&fk.constraint)
+        ))?;
+    }
+    if !captured.is_empty() {
+        info!(
+            "Dropped {} foreign key constraints (they are restored after the import)",
+            captured.len()
+        );
+    }
+    Ok(())
+}
+
+/// Restore FK constraints recorded before this (or a previous interrupted)
+/// import. Must run while FOREIGN_KEY_CHECKS=0 so existing rows are not
+/// validated — aggregate imports intentionally load partial data.
+fn restore_foreign_keys(conn: &mut Conn) -> Result<()> {
+    let store = ForeignKeyStore::load(conn)?;
+    if store.is_empty() {
+        ForeignKeyStore::cleanup(conn)?;
+        return Ok(());
+    }
+
+    let mut restored = 0usize;
+    let mut failed = 0usize;
+    for ((table, constraint), ddl) in &store {
+        match conn.query_drop(ddl) {
+            Ok(()) => restored += 1,
+            Err(e) => {
+                failed += 1;
+                warn!(
+                    "Could not restore foreign key `{}` on `{}`: {}\n  To restore it manually: {}",
+                    constraint, table, e, ddl
+                );
+            }
+        }
+    }
+    info!("Restored {} foreign key constraints", restored);
+    if failed > 0 {
+        warn!(
+            "{} foreign key constraints could not be restored (statements printed above); \
+             they will not be retried on future runs",
+            failed
+        );
+    }
+    ForeignKeyStore::cleanup(conn)?;
+    Ok(())
 }
 
 /// Outcome of the protocol run - always carries metrics even on error/interruption
@@ -1730,38 +1985,6 @@ async fn deploy_server(session: &SshSession) -> Result<String> {
     }
 }
 
-/// Drop all foreign key constraints in the local database.
-///
-/// This prevents MySQL ERROR 1822 when tables are recreated in parallel.
-/// When we DROP + CREATE a table that was previously referenced by FK constraints
-/// from other tables, MySQL re-validates those orphaned FK constraints against the
-/// new table. Since we only create a PRIMARY KEY (no secondary indexes), the
-/// required index for the FK is missing, causing the error.
-fn drop_all_foreign_keys(conn: &mut Conn) -> Result<()> {
-    let rows: Vec<(String, String)> = conn.query(
-        "SELECT TABLE_NAME, CONSTRAINT_NAME \
-         FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS \
-         WHERE CONSTRAINT_TYPE = 'FOREIGN KEY' AND TABLE_SCHEMA = DATABASE()",
-    )?;
-
-    if rows.is_empty() {
-        return Ok(());
-    }
-
-    for (table, constraint) in &rows {
-        conn.query_drop(format!(
-            "ALTER TABLE `{}` DROP FOREIGN KEY `{}`",
-            table, constraint
-        ))?;
-    }
-
-    info!(
-        "Dropped {} foreign key constraints from local database",
-        rows.len()
-    );
-    Ok(())
-}
-
 /// Create a table in local MySQL based on schema
 fn create_table(
     conn: &mut Conn,
@@ -2210,4 +2433,77 @@ fn restore_preserved_rows(conn: &mut Conn, table: &str) -> Result<()> {
 
     info!("Restored {} preserved rows to {}", row_count, table);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redact_masks_password() {
+        assert_eq!(
+            redact_mysql_url("mysql://root:s3cret@127.0.0.1:3308/imported"),
+            "mysql://root:***@127.0.0.1:3308/imported"
+        );
+    }
+
+    #[test]
+    fn redact_keeps_url_without_password() {
+        assert_eq!(
+            redact_mysql_url("mysql://root@localhost:3306"),
+            "mysql://root@localhost:3306"
+        );
+    }
+
+    #[test]
+    fn redact_handles_at_and_colon_in_password() {
+        // Password containing ':' — everything after the first ':' is masked
+        assert_eq!(
+            redact_mysql_url("mysql://user:pa:ss@host/db"),
+            "mysql://user:***@host/db"
+        );
+    }
+
+    #[test]
+    fn redact_passes_through_non_urls() {
+        assert_eq!(redact_mysql_url("not a url"), "not a url");
+    }
+
+    #[test]
+    fn fk_ddl_single_column() {
+        let fk = ForeignKeyDef {
+            table: "orders".to_string(),
+            constraint: "fk_orders_user".to_string(),
+            columns: vec!["user_id".to_string()],
+            ref_schema: "imported".to_string(),
+            ref_table: "users".to_string(),
+            ref_columns: vec!["id".to_string()],
+            update_rule: "CASCADE".to_string(),
+            delete_rule: "SET NULL".to_string(),
+        };
+        assert_eq!(
+            build_fk_ddl(&fk),
+            "ALTER TABLE `orders` ADD CONSTRAINT `fk_orders_user` FOREIGN KEY (`user_id`) \
+             REFERENCES `imported`.`users` (`id`) ON UPDATE CASCADE ON DELETE SET NULL"
+        );
+    }
+
+    #[test]
+    fn fk_ddl_multi_column_and_backticks() {
+        let fk = ForeignKeyDef {
+            table: "weird`table".to_string(),
+            constraint: "fk_multi".to_string(),
+            columns: vec!["a".to_string(), "b".to_string()],
+            ref_schema: "db".to_string(),
+            ref_table: "parent".to_string(),
+            ref_columns: vec!["x".to_string(), "y".to_string()],
+            update_rule: "NO ACTION".to_string(),
+            delete_rule: "RESTRICT".to_string(),
+        };
+        assert_eq!(
+            build_fk_ddl(&fk),
+            "ALTER TABLE `weird``table` ADD CONSTRAINT `fk_multi` FOREIGN KEY (`a`, `b`) \
+             REFERENCES `db`.`parent` (`x`, `y`) ON UPDATE NO ACTION ON DELETE RESTRICT"
+        );
+    }
 }

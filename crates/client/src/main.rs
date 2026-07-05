@@ -145,6 +145,10 @@ struct GetArgs {
     #[command(flatten)]
     connection: ConnectionArgs,
 
+    /// Discard state (backup tables, checkpoint) left by a previous interrupted import
+    #[arg(long)]
+    clean: bool,
+
     /// Get function invocations: func_name --param1 value1 [func_name2 --param2 value2 ...]
     #[arg(last = true, required = true)]
     queries: Vec<String>,
@@ -268,7 +272,7 @@ async fn run_get(args: GetArgs) -> Result<()> {
         vars: args.connection.vars.into_iter().collect(),
         var_file: args.connection.var_file,
         resume: false,
-        clean: true,
+        clean: args.clean,
         parallel: args.connection.parallel,
         client_parallel: args.connection.client_parallel,
         compression,
