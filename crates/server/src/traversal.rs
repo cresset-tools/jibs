@@ -65,7 +65,7 @@ fn send_chunk(
     metrics.add_rows_sent(chunk_row_count as u64);
 
     let compress_start = Instant::now();
-    let encoded = tsv_writer.take_encoded_chunk(table_id, chunk_row_count, compression);
+    let encoded = tsv_writer.take_encoded_chunk(table_id, chunk_row_count, compression)?;
     metrics.add_compress_time(compress_start.elapsed());
 
     // Payload length is everything after the 4-byte frame length prefix
@@ -138,6 +138,37 @@ fn get_backward_relations<'a>(
 // Static graph analysis
 // ============================================================================
 
+/// Expand an aggregate's exclude patterns against the table list.
+/// Invalid patterns are a hard error: a silently-dropped exclude pattern would
+/// import data the user explicitly asked to keep out.
+fn expand_exclude_patterns(
+    aggregate: &ResolvedAggregate,
+    table_names: impl Iterator<Item = impl AsRef<str>>,
+) -> Result<HashSet<String>> {
+    let mut exclude: HashSet<String> = aggregate.exclude_tables.iter().cloned().collect();
+    if !aggregate.exclude_patterns.is_empty() {
+        let regexes: Vec<regex::Regex> = aggregate
+            .exclude_patterns
+            .iter()
+            .map(|p| {
+                regex::Regex::new(p).map_err(|e| {
+                    ServerError::Config(format!(
+                        "Invalid exclude pattern /{}/ in aggregate '{}': {}",
+                        p, aggregate.name, e
+                    ))
+                })
+            })
+            .collect::<Result<_>>()?;
+        for table in table_names {
+            let table = table.as_ref();
+            if regexes.iter().any(|re| re.is_match(table)) {
+                exclude.insert(table.to_string());
+            }
+        }
+    }
+    Ok(exclude)
+}
+
 /// Compute the set of tables that could potentially be touched by aggregate BFS.
 ///
 /// Walks the relation graph statically (no MySQL queries) from each aggregate root,
@@ -145,12 +176,15 @@ fn get_backward_relations<'a>(
 /// - From root/backward-reached tables: follow both forward and backward relations
 /// - From forward-reached tables: follow forward relations only
 ///
-/// Tables in `full_tables` and globally excluded tables are treated as dead ends
-/// (matching data BFS behavior where they don't produce FK values for further traversal).
+/// `importable_tables` must be the set of tables selected for import (ignored
+/// tables removed) so the walk treats ignored tables as nonexistent, matching
+/// the data BFS. Tables in `full_tables` and globally excluded tables are
+/// treated as dead ends (matching data BFS behavior where they don't produce
+/// FK values for further traversal).
 fn compute_potential_aggregate_tables(
     plan: &ExecutionPlan,
-    all_tables: &HashSet<String>,
-) -> HashSet<String> {
+    importable_tables: &HashSet<String>,
+) -> Result<HashSet<String>> {
     let mut potential = HashSet::new();
 
     // Build relation indices
@@ -163,49 +197,48 @@ fn compute_potential_aggregate_tables(
 
     for aggregate in &plan.aggregates {
         // Build exclude set for this aggregate (per-aggregate + global excluded as dead ends)
-        let mut exclude: HashSet<String> = aggregate.exclude_tables.iter().cloned().collect();
-        if !aggregate.exclude_patterns.is_empty() {
-            let regexes: Vec<regex::Regex> = aggregate
-                .exclude_patterns
-                .iter()
-                .filter_map(|p| regex::Regex::new(p).ok())
-                .collect();
-            for table in all_tables {
-                if regexes.iter().any(|re| re.is_match(table)) {
-                    exclude.insert(table.clone());
-                }
-            }
-        }
+        let mut exclude = expand_exclude_patterns(aggregate, importable_tables.iter())?;
         exclude.extend(plan.excluded_tables.iter().cloned());
 
         if aggregate.root_only {
-            if all_tables.contains(&aggregate.root_table) {
+            if importable_tables.contains(&aggregate.root_table) {
                 potential.insert(aggregate.root_table.clone());
             }
             continue;
         }
 
-        // Static BFS from root: (table_name, can_go_backward)
+        // Static walk from root: (table_name, can_go_backward).
+        // `explored` records the strongest capability a table was explored
+        // with; a table first reached forward-only (false) is re-explored if
+        // it is later reached with backward capability (true), matching the
+        // data BFS which follows backward relations on such revisits.
         let mut queue: Vec<(String, bool)> = Vec::new();
-        let mut visited: HashSet<String> = HashSet::new();
+        let mut explored: HashMap<String, bool> = HashMap::new();
 
-        if all_tables.contains(&aggregate.root_table) {
+        if importable_tables.contains(&aggregate.root_table) {
             queue.push((aggregate.root_table.clone(), true));
-            visited.insert(aggregate.root_table.clone());
+            explored.insert(aggregate.root_table.clone(), true);
         }
 
         while let Some((table, can_go_backward)) = queue.pop() {
             potential.insert(table.clone());
 
+            let should_visit = |explored: &HashMap<String, bool>, t: &str, backward: bool| {
+                match explored.get(t) {
+                    None => true,
+                    Some(&had_backward) => backward && !had_backward,
+                }
+            };
+
             // Forward relations (from_table=table -> to_table)
             if let Some(rels) = by_source.get(table.as_str()) {
                 for rel in rels {
-                    if all_tables.contains(&rel.to_table)
+                    if importable_tables.contains(&rel.to_table)
                         && !plan.full_tables.contains(&rel.to_table)
                         && !exclude.contains(&rel.to_table)
-                        && !visited.contains(&rel.to_table)
+                        && should_visit(&explored, &rel.to_table, false)
                     {
-                        visited.insert(rel.to_table.clone());
+                        explored.insert(rel.to_table.clone(), false);
                         queue.push((rel.to_table.clone(), false));
                     }
                 }
@@ -215,12 +248,12 @@ fn compute_potential_aggregate_tables(
             if can_go_backward {
                 if let Some(rels) = by_target.get(table.as_str()) {
                     for rel in rels {
-                        if all_tables.contains(&rel.from_table)
+                        if importable_tables.contains(&rel.from_table)
                             && !plan.full_tables.contains(&rel.from_table)
                             && !exclude.contains(&rel.from_table)
-                            && !visited.contains(&rel.from_table)
+                            && should_visit(&explored, &rel.from_table, true)
                         {
-                            visited.insert(rel.from_table.clone());
+                            explored.insert(rel.from_table.clone(), true);
                             queue.push((rel.from_table.clone(), true));
                         }
                     }
@@ -229,7 +262,7 @@ fn compute_potential_aggregate_tables(
         }
     }
 
-    potential
+    Ok(potential)
 }
 
 // ============================================================================
@@ -270,13 +303,20 @@ fn run_aggregate_bfs(
             .push(relation);
     }
 
-    // Pre-cache schemas for all tables
-    let all_table_names: HashSet<String> = all_table_names_vec.iter().cloned().collect();
+    // Tables selected for import (ignored tables are absent from table_ids).
+    // Relation traversal must be restricted to this set: pending BFS entries
+    // for ignored tables have no table_id and would panic when streamed.
+    let importable_tables: HashSet<String> = table_ids.keys().cloned().collect();
+
+    // Pre-cache schemas for all importable tables
     for table_name in &all_table_names_vec {
-        conn.get_column_defs(table_name)?;
+        if importable_tables.contains(table_name) {
+            conn.get_column_defs(table_name)?;
+        }
     }
 
-    // Track visited rows per table (only PKs, not full rows)
+    // Rows already emitted to the client, per table (only PKs, not full rows).
+    // Global across aggregates: each row is sent at most once.
     let mut visited: HashMap<String, HashSet<CompactKey>> = HashMap::new();
 
     // Tables actually touched by aggregates
@@ -289,23 +329,27 @@ fn run_aggregate_bfs(
     let mut table_row_counts: HashMap<String, u64> = HashMap::new();
 
     for aggregate in &plan.aggregates {
+        if !importable_tables.contains(&aggregate.root_table) {
+            return Err(ServerError::Config(format!(
+                "Aggregate '{}' root table '{}' is not importable \
+                 (it is ignored via ignore_table or does not exist)",
+                aggregate.name, aggregate.root_table
+            )));
+        }
         aggregate_tables.insert(aggregate.root_table.clone());
 
         // Tables excluded from BFS for this aggregate (expand regex patterns)
-        let mut exclude_tables: HashSet<String> =
-            aggregate.exclude_tables.iter().cloned().collect();
-        if !aggregate.exclude_patterns.is_empty() {
-            let regexes: Vec<regex::Regex> = aggregate
-                .exclude_patterns
-                .iter()
-                .filter_map(|p| regex::Regex::new(p).ok())
-                .collect();
-            for table_name in &all_table_names_vec {
-                if regexes.iter().any(|re| re.is_match(table_name)) {
-                    exclude_tables.insert(table_name.clone());
-                }
-            }
-        }
+        let exclude_tables = expand_exclude_patterns(aggregate, importable_tables.iter())?;
+
+        // Per-aggregate expansion gates: rows whose forward / backward FK
+        // values have been extracted for THIS aggregate. Separate from the
+        // global `visited` emission set: a row first reached via a forward
+        // edge (backward relations not followed) must still have its backward
+        // FK values extracted when later reached via a backward edge, and a
+        // row visited by an earlier aggregate must still be expanded by this
+        // aggregate (whose exclude set may differ).
+        let mut expanded_fwd: HashMap<String, HashSet<CompactKey>> = HashMap::new();
+        let mut expanded_bwd: HashMap<String, HashSet<CompactKey>> = HashMap::new();
 
         // BFS pending set: coalesces FK values by (table, column, via_backward)
         let mut pending: HashMap<(String, String, bool), Vec<MySqlValue>> = HashMap::new();
@@ -331,7 +375,7 @@ fn run_aggregate_bfs(
             get_forward_relations(
                 root_table,
                 &relations_by_source,
-                &all_table_names,
+                &importable_tables,
                 &exclude_tables,
             )
         };
@@ -341,14 +385,12 @@ fn run_aggregate_bfs(
             get_backward_relations(
                 root_table,
                 &relations_by_target,
-                &all_table_names,
+                &importable_tables,
                 &exclude_tables,
             )
         };
 
-        let column_names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
-        let mut tsv_writer =
-            TsvWriter::new(column_names, anonymization, plan.fakers.clone());
+        let mut tsv_writer = TsvWriter::new(&columns, anonymization, plan.fakers.clone());
         let mut chunk_row_count: u16 = 0;
 
         // Accumulators for FK values
@@ -358,6 +400,8 @@ fn run_aggregate_bfs(
             vec![Vec::new(); forward_relations.len()];
 
         let visited_set = visited.entry(root_table.clone()).or_default();
+        let expanded_fwd_set = expanded_fwd.entry(root_table.clone()).or_default();
+        let expanded_bwd_set = expanded_bwd.entry(root_table.clone()).or_default();
 
         // Stream root table rows
         let root_query_ms: u64;
@@ -395,36 +439,40 @@ fn run_aggregate_bfs(
                 // Dedup check + FK extraction
                 let dedup_start = Instant::now();
                 let pk_key = row_pk_key(&row, &pk_columns);
-                let is_new = visited_set.insert(pk_key);
 
-                // Always extract backward FK values from root table rows,
-                // even for already-visited rows.
-                for (i, relation) in backward_relations.iter().enumerate() {
-                    if let Some(Ok(v)) =
-                        row.get_opt::<MySqlValue, _>(relation.to_column.as_str())
-                    {
-                        if !matches!(v, MySqlValue::NULL) {
-                            backward_fk_vecs[i].push(v);
+                // Extract backward FK values from root table rows once per
+                // aggregate, even for rows already emitted (e.g. by an
+                // earlier aggregate or an earlier visit via BFS).
+                if !backward_relations.is_empty() && expanded_bwd_set.insert(pk_key.clone()) {
+                    for (i, relation) in backward_relations.iter().enumerate() {
+                        if let Some(Ok(v)) =
+                            row.get_opt::<MySqlValue, _>(relation.to_column.as_str())
+                        {
+                            if !matches!(v, MySqlValue::NULL) {
+                                backward_fk_vecs[i].push(v);
+                            }
                         }
                     }
                 }
 
+                // Extract forward FK values once per aggregate
+                if !forward_relations.is_empty() && expanded_fwd_set.insert(pk_key.clone()) {
+                    for (i, relation) in forward_relations.iter().enumerate() {
+                        if let Some(Ok(v)) =
+                            row.get_opt::<MySqlValue, _>(relation.from_column.as_str())
+                        {
+                            if !matches!(v, MySqlValue::NULL) {
+                                forward_fk_vecs[i].push(v);
+                            }
+                        }
+                    }
+                }
+
+                let is_new = visited_set.insert(pk_key);
+                metrics.add_dedup_time(dedup_start.elapsed());
                 if !is_new {
-                    metrics.add_dedup_time(dedup_start.elapsed());
                     continue;
                 }
-
-                // Extract FK values for forward relations
-                for (i, relation) in forward_relations.iter().enumerate() {
-                    if let Some(Ok(v)) =
-                        row.get_opt::<MySqlValue, _>(relation.from_column.as_str())
-                    {
-                        if !matches!(v, MySqlValue::NULL) {
-                            forward_fk_vecs[i].push(v);
-                        }
-                    }
-                }
-                metrics.add_dedup_time(dedup_start.elapsed());
 
                 // Write TSV
                 let serialize_start = Instant::now();
@@ -525,6 +573,13 @@ fn run_aggregate_bfs(
                     continue;
                 }
 
+                // Defensive: relations are filtered by importable_tables, so
+                // non-importable (ignored) tables should never be pending;
+                // skip rather than panic on the table_ids lookup below.
+                if !table_ids.contains_key(&table) {
+                    continue;
+                }
+
                 aggregate_tables.insert(table.clone());
 
                 if plan.excluded_tables.contains(&table) {
@@ -546,27 +601,22 @@ fn run_aggregate_bfs(
                 let forward_relations = get_forward_relations(
                     &table,
                     &relations_by_source,
-                    &all_table_names,
+                    &importable_tables,
                     &exclude_tables,
                 );
                 let backward_relations = if reached_via_backward {
                     get_backward_relations(
                         &table,
                         &relations_by_target,
-                        &all_table_names,
+                        &importable_tables,
                         &exclude_tables,
                     )
                 } else {
                     vec![]
                 };
 
-                let column_names: Vec<String> =
-                    columns.iter().map(|c| c.name.clone()).collect();
-                let mut tsv_writer = TsvWriter::new(
-                    column_names,
-                    anonymization,
-                    plan.fakers.clone(),
-                );
+                let mut tsv_writer =
+                    TsvWriter::new(&columns, anonymization, plan.fakers.clone());
                 let mut chunk_row_count: u16 = 0;
 
                 let mut fwd_fk_vecs: Vec<Vec<MySqlValue>> =
@@ -575,6 +625,8 @@ fn run_aggregate_bfs(
                     vec![Vec::new(); backward_relations.len()];
 
                 let visited_set = visited.entry(table.clone()).or_default();
+                let expanded_fwd_set = expanded_fwd.entry(table.clone()).or_default();
+                let expanded_bwd_set = expanded_bwd.entry(table.clone()).or_default();
                 let row_count_entry = table_row_counts.entry(table.clone()).or_default();
 
                 let dedup_start = Instant::now();
@@ -619,37 +671,55 @@ fn run_aggregate_bfs(
                             batch_iterate_ns += iter_elapsed.as_nanos() as u64;
                             batch_row_count += 1;
 
-                            // Dedup check + FK extraction
+                            // Dedup check + FK extraction. Emission (`visited`)
+                            // and expansion (`expanded_*`) are gated separately:
+                            // a row already emitted via a forward edge still
+                            // needs its backward FK values extracted when it is
+                            // later reached via a backward edge.
                             let dedup_start = Instant::now();
                             let pk_key = row_pk_key(&row, &pk_columns);
-                            if !visited_set.insert(pk_key) {
+                            let do_forward = !forward_relations.is_empty()
+                                && expanded_fwd_set.insert(pk_key.clone());
+                            let do_backward = !backward_relations.is_empty()
+                                && expanded_bwd_set.insert(pk_key.clone());
+                            let is_new = visited_set.insert(pk_key);
+                            if !is_new && !do_forward && !do_backward {
                                 metrics.add_dedup_time(dedup_start.elapsed());
                                 continue;
                             }
 
-                            for (i, relation) in forward_relations.iter().enumerate()
-                            {
-                                if let Some(Ok(v)) = row.get_opt::<MySqlValue, _>(
-                                    relation.from_column.as_str(),
-                                ) {
-                                    if !matches!(v, MySqlValue::NULL) {
-                                        fwd_fk_vecs[i].push(v);
+                            if do_forward {
+                                for (i, relation) in forward_relations.iter().enumerate()
+                                {
+                                    if let Some(Ok(v)) = row.get_opt::<MySqlValue, _>(
+                                        relation.from_column.as_str(),
+                                    ) {
+                                        if !matches!(v, MySqlValue::NULL) {
+                                            fwd_fk_vecs[i].push(v);
+                                        }
                                     }
                                 }
                             }
 
-                            for (i, relation) in
-                                backward_relations.iter().enumerate()
-                            {
-                                if let Some(Ok(v)) = row.get_opt::<MySqlValue, _>(
-                                    relation.to_column.as_str(),
-                                ) {
-                                    if !matches!(v, MySqlValue::NULL) {
-                                        bwd_fk_vecs[i].push(v);
+                            if do_backward {
+                                for (i, relation) in
+                                    backward_relations.iter().enumerate()
+                                {
+                                    if let Some(Ok(v)) = row.get_opt::<MySqlValue, _>(
+                                        relation.to_column.as_str(),
+                                    ) {
+                                        if !matches!(v, MySqlValue::NULL) {
+                                            bwd_fk_vecs[i].push(v);
+                                        }
                                     }
                                 }
                             }
                             metrics.add_dedup_time(dedup_start.elapsed());
+
+                            // Already emitted — this visit only needed expansion
+                            if !is_new {
+                                continue;
+                            }
 
                             // Send schema on first new row for this table
                             if schemas_sent.insert(table.clone()) {
@@ -848,15 +918,18 @@ impl<'a> DependencyTraverser<'a> {
         // 1. Pre-cache schemas on self.conn, build table list
         let schema_start = Instant::now();
         let all_table_names_vec = self.conn.get_all_table_names()?;
-        let all_table_names: HashSet<String> = all_table_names_vec.iter().cloned().collect();
+        // Tables selected for import (ignored tables have no table_id)
+        let importable_tables: HashSet<String> = self.table_ids.keys().cloned().collect();
         for table_name in &all_table_names_vec {
-            self.conn.get_column_defs(table_name)?;
+            if importable_tables.contains(table_name) {
+                self.conn.get_column_defs(table_name)?;
+            }
         }
         self.metrics.set_schema_cache_time(schema_start.elapsed());
 
         // 2. Compute potential aggregate tables (static graph walk, no MySQL queries)
         let potential_aggregate =
-            compute_potential_aggregate_tables(self.plan, &all_table_names);
+            compute_potential_aggregate_tables(self.plan, &importable_tables)?;
 
         // 3. Create shared channel
         let num_workers = (parallel as usize).max(1);
@@ -1161,15 +1234,44 @@ fn build_root_query(aggregate: &ResolvedAggregate) -> String {
 /// A compact, hashable key for deduplication.
 /// Stores integers inline (no heap allocation) — covers ~99% of FK/PK values.
 /// Falls back to serialized bytes only for composite keys or rare types.
-#[derive(Hash, Eq, PartialEq)]
+#[derive(Clone, Debug, Hash, Eq, PartialEq)]
 enum CompactKey {
     Int(i64),
     UInt(u64),
     Bytes(Vec<u8>),
+    Null,
+}
+
+/// Parse a string as i64 only if it is the canonical decimal rendering.
+///
+/// Plain `str::parse` also accepts "0123", "+123", etc., which would make
+/// distinct VARCHAR key values collide after normalization ("0123" == "123")
+/// and silently drop rows from IN() lookups. Canonical values round-trip.
+fn parse_i64_canonical(s: &str) -> Option<i64> {
+    let i = s.parse::<i64>().ok()?;
+    if itoa::Buffer::new().format(i) == s {
+        Some(i)
+    } else {
+        None
+    }
+}
+
+/// Parse a string as u64 only if it is the canonical decimal rendering.
+fn parse_u64_canonical(s: &str) -> Option<u64> {
+    let u = s.parse::<u64>().ok()?;
+    if itoa::Buffer::new().format(u) == s {
+        Some(u)
+    } else {
+        None
+    }
 }
 
 /// Convert a single MySqlValue to a compact dedup key.
 /// For integer values (the common case), this avoids heap allocation entirely.
+///
+/// Text-protocol results (query_iter) return numbers as Bytes while
+/// binary-protocol results (exec_iter) return them typed, so canonical numeric
+/// strings are normalized to integers to unify the two representations.
 fn value_to_compact_key(value: &MySqlValue) -> CompactKey {
     match value {
         MySqlValue::Int(i) => CompactKey::Int(*i),
@@ -1177,22 +1279,25 @@ fn value_to_compact_key(value: &MySqlValue) -> CompactKey {
         MySqlValue::UInt(u) => CompactKey::UInt(*u),
         MySqlValue::Bytes(b) => {
             if let Ok(s) = std::str::from_utf8(b) {
-                if let Ok(i) = s.parse::<i64>() {
+                if let Some(i) = parse_i64_canonical(s) {
                     return CompactKey::Int(i);
                 }
-                if let Ok(u) = s.parse::<u64>() {
+                if let Some(u) = parse_u64_canonical(s) {
                     return CompactKey::UInt(u);
                 }
             }
             CompactKey::Bytes(b.clone())
         }
-        MySqlValue::NULL => CompactKey::Bytes(vec![0]),
+        MySqlValue::NULL => CompactKey::Null,
         _ => CompactKey::Bytes(serialize_pk(&[value.clone()])),
     }
 }
 
 /// Extract primary key from a row and return it as a CompactKey.
 /// Avoids intermediate Vec<MySqlValue> and Vec<u8> allocations for single-column integer PKs.
+///
+/// Tables without a primary key are keyed on the entire row: every row would
+/// otherwise share one key and all but the first would be dropped as duplicates.
 fn row_pk_key(row: &Row, pk_columns: &[String]) -> CompactKey {
     if pk_columns.len() == 1 {
         let value = row
@@ -1200,6 +1305,11 @@ fn row_pk_key(row: &Row, pk_columns: &[String]) -> CompactKey {
             .and_then(|r| r.ok())
             .unwrap_or(MySqlValue::NULL);
         value_to_compact_key(&value)
+    } else if pk_columns.is_empty() {
+        let values: Vec<MySqlValue> = (0..row.len())
+            .map(|i| row.as_ref(i).cloned().unwrap_or(MySqlValue::NULL))
+            .collect();
+        CompactKey::Bytes(serialize_pk(&values))
     } else {
         let pk = extract_pk_from_row(row, pk_columns);
         CompactKey::Bytes(serialize_pk(&pk))
@@ -1215,15 +1325,16 @@ fn dedupe_values(values: Vec<MySqlValue>) -> Vec<MySqlValue> {
         .collect()
 }
 
-/// Normalize a MySQL value to a canonical form for comparison
+/// Normalize a MySQL value to a canonical form for comparison.
+/// Only canonical decimal strings are converted (see `parse_i64_canonical`).
 fn normalize_value(value: &MySqlValue) -> MySqlValue {
     match value {
         MySqlValue::Bytes(b) => {
             if let Ok(s) = std::str::from_utf8(b) {
-                if let Ok(i) = s.parse::<i64>() {
+                if let Some(i) = parse_i64_canonical(s) {
                     return MySqlValue::Int(i);
                 }
-                if let Ok(u) = s.parse::<u64>() {
+                if let Some(u) = parse_u64_canonical(s) {
                     return MySqlValue::UInt(u);
                 }
             }
@@ -1299,8 +1410,7 @@ fn stream_full_table_to_channel(
     tx: &mpsc::SyncSender<ChannelMessage>,
     metrics: &Arc<MetricsCollector>,
 ) -> Result<()> {
-    let column_names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
-    let mut tsv_writer = TsvWriter::new(column_names, anonymization, fakers.clone());
+    let mut tsv_writer = TsvWriter::new(columns, anonymization, fakers.clone());
     let mut total_rows: u64 = 0;
     let mut chunk_row_count: u16 = 0;
 
@@ -1373,4 +1483,151 @@ fn stream_full_table_to_channel(
     .map_err(|_| crate::error::ServerError::Protocol("Channel closed".to_string()))?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn canonical_parse_rejects_non_canonical() {
+        assert_eq!(parse_i64_canonical("123"), Some(123));
+        assert_eq!(parse_i64_canonical("-5"), Some(-5));
+        assert_eq!(parse_i64_canonical("0"), Some(0));
+        assert_eq!(parse_i64_canonical("0123"), None);
+        assert_eq!(parse_i64_canonical("+123"), None);
+        assert_eq!(parse_i64_canonical("-0"), None);
+        assert_eq!(parse_i64_canonical("1e3"), None);
+        assert_eq!(parse_i64_canonical(""), None);
+    }
+
+    #[test]
+    fn compact_key_unifies_text_and_binary_protocol_numbers() {
+        // Text protocol returns Bytes("42"), binary protocol Int(42) — must dedup
+        assert_eq!(
+            value_to_compact_key(&MySqlValue::Bytes(b"42".to_vec())),
+            value_to_compact_key(&MySqlValue::Int(42))
+        );
+        assert_eq!(
+            value_to_compact_key(&MySqlValue::Bytes(b"42".to_vec())),
+            value_to_compact_key(&MySqlValue::UInt(42))
+        );
+    }
+
+    #[test]
+    fn compact_key_keeps_distinct_varchar_keys_distinct() {
+        // "0123" and "123" are different VARCHAR key values; naive numeric
+        // normalization collapsed them, dropping rows from IN() lookups
+        assert_ne!(
+            value_to_compact_key(&MySqlValue::Bytes(b"0123".to_vec())),
+            value_to_compact_key(&MySqlValue::Bytes(b"123".to_vec()))
+        );
+        assert_ne!(
+            value_to_compact_key(&MySqlValue::Bytes(b"+1".to_vec())),
+            value_to_compact_key(&MySqlValue::Bytes(b"1".to_vec()))
+        );
+    }
+
+    #[test]
+    fn compact_key_null_is_distinct_from_nul_byte() {
+        assert_ne!(
+            value_to_compact_key(&MySqlValue::NULL),
+            value_to_compact_key(&MySqlValue::Bytes(vec![0]))
+        );
+    }
+
+    #[test]
+    fn dedupe_values_preserves_non_canonical_strings() {
+        let values = vec![
+            MySqlValue::Bytes(b"123".to_vec()),
+            MySqlValue::Bytes(b"0123".to_vec()),
+            MySqlValue::Bytes(b"123".to_vec()),
+        ];
+        let deduped = dedupe_values(values);
+        assert_eq!(deduped.len(), 2);
+    }
+
+    fn rel(from_table: &str, from_column: &str, to_table: &str, to_column: &str) -> Relation {
+        Relation {
+            from_table: from_table.to_string(),
+            from_column: from_column.to_string(),
+            to_table: to_table.to_string(),
+            to_column: to_column.to_string(),
+        }
+    }
+
+    fn aggregate(name: &str, root: &str) -> ResolvedAggregate {
+        ResolvedAggregate {
+            name: name.to_string(),
+            root_table: root.to_string(),
+            where_clause: None,
+            order_by: None,
+            order_direction: None,
+            limit: None,
+            exclude_tables: vec![],
+            exclude_patterns: vec![],
+            root_only: false,
+        }
+    }
+
+    fn table_set(names: &[&str]) -> HashSet<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn static_walk_upgrades_forward_reached_table_to_backward() {
+        // R -> X (forward), X -> R (so X is also backward-reachable from R),
+        // W -> X (W is only reachable by following X's backward relations).
+        // If X is first explored forward-only and never re-explored with
+        // backward capability, W is missed — the data BFS would fetch it,
+        // and the table would wrongly be classified as a full-table import.
+        let mut plan = ExecutionPlan::new();
+        plan.relations = vec![
+            rel("R", "x_id", "X", "id"),
+            rel("X", "r_id", "R", "id"),
+            rel("W", "x_id", "X", "id"),
+        ];
+        plan.aggregates = vec![aggregate("test", "R")];
+
+        let tables = table_set(&["R", "X", "W"]);
+        let potential = compute_potential_aggregate_tables(&plan, &tables).unwrap();
+        assert!(potential.contains("R"));
+        assert!(potential.contains("X"));
+        assert!(
+            potential.contains("W"),
+            "W must be potential: X is backward-reachable, so the data BFS follows X's backward relations"
+        );
+    }
+
+    #[test]
+    fn static_walk_treats_non_importable_tables_as_nonexistent() {
+        // "ignored" is not in the importable set: the walk must not pass
+        // through it or include it.
+        let mut plan = ExecutionPlan::new();
+        plan.relations = vec![
+            rel("child", "root_id", "root", "id"),
+            rel("child", "ignored_id", "ignored", "id"),
+        ];
+        plan.aggregates = vec![aggregate("test", "root")];
+
+        let tables = table_set(&["root", "child"]);
+        let potential = compute_potential_aggregate_tables(&plan, &tables).unwrap();
+        assert!(potential.contains("root"));
+        assert!(potential.contains("child"));
+        assert!(!potential.contains("ignored"));
+    }
+
+    #[test]
+    fn invalid_exclude_pattern_is_an_error() {
+        let mut plan = ExecutionPlan::new();
+        let mut agg = aggregate("bad", "root");
+        agg.exclude_patterns = vec!["[".to_string()];
+        plan.aggregates = vec![agg];
+
+        let tables = table_set(&["root"]);
+        let result = compute_potential_aggregate_tables(&plan, &tables);
+        assert!(result.is_err());
+        let msg = result.err().unwrap().to_string();
+        assert!(msg.contains("bad"), "error should name the aggregate: {}", msg);
+    }
 }

@@ -18,6 +18,10 @@ exclude_data audit_log
 // Ignore sessions entirely
 ignore_table sessions
 
+// Ignore order_audit — it references orders, so aggregate BFS reaches it
+// via a backward relation and must skip it (regression: this used to panic)
+ignore_table order_audit
+
 // Anonymize user emails
 anonymize users {
     email -> emails
