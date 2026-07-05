@@ -1,12 +1,12 @@
 //! Integration test for server protocol
 
 use std::collections::HashMap;
-use std::io::{Cursor, Read, Write};
+use std::io::{Cursor, Write};
 use std::process::{Command, Stdio};
 
 use jibs_protocol::{
     framing::{read_message, write_message},
-    ClientMessage, CompressionMode, ExecutionPlan, ResolvedAggregate, ServerMessage,
+    ClientMessage, CompressionMode, ExecutionPlan, ResolvedAggregate,
 };
 
 #[test]
@@ -22,22 +22,30 @@ fn test_echo_mode_parses_init_message() {
             order_by: None,
             order_direction: None,
             limit: Some(100),
+            exclude_tables: vec![],
+            exclude_patterns: vec![],
+            root_only: false,
         }],
         excluded_tables: Default::default(),
         excluded_patterns: Default::default(),
         ignored_tables: Default::default(),
         ignored_patterns: Default::default(),
+        ignored_relations: vec![],
         anonymization: Default::default(),
         fakers: Default::default(),
         preserves: vec![],
         sets: vec![],
+        full_tables: Default::default(),
+        full_patterns: Default::default(),
         after_statements: vec![],
+        aggregates_only: false,
     };
 
     let init_msg = ClientMessage::Init {
         plan,
         compression: CompressionMode::None,
         parallel: 1,
+        collect_metrics: false,
     };
 
     // Serialize the message
@@ -88,6 +96,7 @@ fn test_message_roundtrip() {
         plan: plan.clone(),
         compression: CompressionMode::Zstd,
         parallel: 4,
+        collect_metrics: false,
     };
 
     let mut buffer = Vec::new();
@@ -101,6 +110,7 @@ fn test_message_roundtrip() {
             plan: decoded_plan,
             compression,
             parallel,
+            collect_metrics: _,
         } => {
             assert_eq!(compression, CompressionMode::Zstd);
             assert_eq!(parallel, 4);
