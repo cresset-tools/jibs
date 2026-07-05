@@ -66,3 +66,30 @@ CREATE TABLE sessions (
     expires_at TIMESTAMP NOT NULL,
     FOREIGN KEY (user_id) REFERENCES users(id)
 ) ENGINE=InnoDB;
+
+-- No-PK table attached to orders (regression: no-PK tables must import all
+-- rows through aggregate BFS, not just one)
+CREATE TABLE order_flags (
+    order_id INT UNSIGNED NOT NULL,
+    flag VARCHAR(50) NOT NULL,
+    FOREIGN KEY (order_id) REFERENCES orders(id)
+) ENGINE=InnoDB;
+
+-- Binary columns attached to orders (regression: binary data must survive
+-- the transfer byte-for-byte)
+CREATE TABLE order_receipts (
+    id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    order_id INT UNSIGNED NOT NULL,
+    receipt_pdf VARBINARY(64),
+    scan BLOB,
+    FOREIGN KEY (order_id) REFERENCES orders(id)
+) ENGINE=InnoDB;
+
+-- Table referencing orders that tests ignore via ignore_table (regression:
+-- BFS reaching an ignored table must skip it, not panic)
+CREATE TABLE order_audit (
+    id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    order_id INT UNSIGNED NOT NULL,
+    change_note VARCHAR(255),
+    FOREIGN KEY (order_id) REFERENCES orders(id)
+) ENGINE=InnoDB;
