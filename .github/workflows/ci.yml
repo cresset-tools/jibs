@@ -121,8 +121,15 @@ jobs:
           exit $fail
 
       # Mirrors test/test-resume.sh: seed a local-only row that a preserve rule
-      # protects, crash right after the users table (table 4) so the backup
-      # table exists but the restore hasn't happened, then resume.
+      # protects, crash the import so the backup table exists but the restore
+      # hasn't happened, then resume.
+      #
+      # --fail-after-tables must equal the total checkpointed table count (the
+      # 9 seed tables minus ignored sessions = 8): with --parallel 4 the table
+      # completion order is a race, so any smaller threshold can fire before
+      # users was reached, leaving no _jibs_preserve_ backup. After the last
+      # checkpoint the crash is still before post-processing, so the backup
+      # deterministically exists and the restore has not run.
       - name: Resume test (seed preserved row)
         run: |
           docker exec jibs-local mysql -u root -plocal_root_pass -e "
@@ -143,8 +150,8 @@ jobs:
 
       - name: Resume test (simulated crash)
         run: |
-          if ./target/debug/jibs import test/import-resume-test.jibs $JIBS_CONN --fail-after-tables 4; then
-            echo "::error::Import was expected to fail after 4 tables but succeeded"
+          if ./target/debug/jibs import test/import-resume-test.jibs $JIBS_CONN --fail-after-tables 8; then
+            echo "::error::Import was expected to crash after 8 tables but succeeded (did the seed schema gain tables? Keep --fail-after-tables equal to the checkpointed table count)"
             exit 1
           fi
           backup=$(docker exec jibs-local mysql -N -u root -plocal_root_pass imported -e "SHOW TABLES LIKE '_jibs_preserve_%'")
