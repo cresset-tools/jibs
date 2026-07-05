@@ -427,8 +427,23 @@ fn drain_completed_loads(
     }
 
     // Check if any deferred tables can now be checkpointed
-    finalize_completed_tables(&still_pending, deferred, local_conn, progress, stats, table_schemas)?;
+    finalize_completed_tables(
+        &still_pending,
+        deferred,
+        local_conn,
+        progress,
+        stats,
+        table_schemas,
+        fail_after_tables,
+    )?;
 
+    Ok(still_pending)
+}
+
+/// Simulated crash for resume testing (--fail-after-tables). Must be checked
+/// immediately after each table checkpoint so it fires deterministically
+/// regardless of load timing.
+fn check_fail_after(stats: &ImportStats, fail_after_tables: Option<usize>) -> Result<()> {
     if let Some(fail_after) = fail_after_tables {
         if stats.tables_imported >= fail_after {
             return Err(anyhow::anyhow!(
@@ -437,8 +452,7 @@ fn drain_completed_loads(
             ));
         }
     }
-
-    Ok(still_pending)
+    Ok(())
 }
 
 /// Finalize tables whose loads have all completed (non-blocking).
@@ -450,6 +464,7 @@ fn finalize_completed_tables(
     progress: &ImportProgress,
     stats: &mut ImportStats,
     table_schemas: &mut HashMap<String, Arc<Vec<ColumnDef>>>,
+    fail_after_tables: Option<usize>,
 ) -> Result<()> {
     if deferred.is_empty() {
         return Ok(());
@@ -475,6 +490,7 @@ fn finalize_completed_tables(
         stats.tables_imported_names.push(table.clone());
         table_schemas.remove(&table);
         Checkpoint::mark_complete(local_conn, &table, info.row_count)?;
+        check_fail_after(stats, fail_after_tables)?;
     }
 
     Ok(())
@@ -502,6 +518,7 @@ fn wait_for_all_loads(
     progress: &ImportProgress,
     stats: &mut ImportStats,
     table_schemas: &mut HashMap<String, Arc<Vec<ColumnDef>>>,
+    fail_after_tables: Option<usize>,
 ) -> Result<()> {
     for (table, rx) in pending_loads {
         let result = wait_for_load(&table, &rx)?;
@@ -516,6 +533,7 @@ fn wait_for_all_loads(
         stats.tables_imported_names.push(table.clone());
         table_schemas.remove(&table);
         Checkpoint::mark_complete(local_conn, &table, info.row_count)?;
+        check_fail_after(stats, fail_after_tables)?;
     }
 
     Ok(())
@@ -1443,6 +1461,7 @@ async fn run_protocol_inner(
                         &progress,
                         stats,
                         &mut table_schemas,
+                        config.fail_after_tables,
                     )?;
                     if config.collect_metrics {
                         client_metrics.add_wait_loads_time(wait_start.elapsed());
