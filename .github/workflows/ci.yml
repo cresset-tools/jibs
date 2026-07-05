@@ -11,6 +11,18 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # CI never debugs interactively: skipping debuginfo roughly halves compile and
+  # link time and shrinks the rust-cache artifacts (applies to dev and test profiles).
+  CARGO_PROFILE_DEV_DEBUG: 0
+  # Incremental artifacts can't be reused across CI runs; they only add overhead
+  # (and sccache skips incremental compiles entirely).
+  CARGO_INCREMENTAL: 0
+  # rust-cache deliberately drops workspace-crate artifacts, so jibs_parser
+  # (~8 min of single-threaded chumsky monomorphization) would recompile every
+  # run. sccache caches individual rustc invocations content-addressed, making
+  # unchanged workspace crates near-instant cache hits.
+  RUSTC_WRAPPER: sccache
+  SCCACHE_GHA_ENABLED: "true"
 
 jobs:
   test:
@@ -22,10 +34,15 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      - uses: mozilla/sccache-action@v0.0.10
+
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Keep compile work from failed runs; the next attempt reuses it.
+          cache-on-failure: true
 
       - name: Run unit tests
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
 
   e2e:
     name: E2E import tests
@@ -44,11 +61,26 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: Set up SSH keys
+        run: |
+          ./test/setup-ssh-keys.sh
+          chmod 600 test/ssh-keys/id_ed25519
+
+      # Start containers early (no --wait) so MySQL seeds while the build runs;
+      # the "Wait for test containers" step below gates on health.
+      - name: Start test containers
+        run: docker compose up -d
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-linux-musl
 
+      - uses: mozilla/sccache-action@v0.0.10
+
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Keep compile work from failed runs; the next attempt reuses it.
+          cache-on-failure: true
 
       - name: Install cargo-zigbuild
         run: pip install cargo-zigbuild
@@ -56,17 +88,12 @@ jobs:
       # The client embeds the musl server binary at compile time
       # (crates/client/build.rs), so the server must be built first.
       - name: Build server (x86_64 musl)
-        run: cargo zigbuild -p jibs_server --release --target x86_64-unknown-linux-musl
+        run: cargo zigbuild -p jibs_server --release --locked --target x86_64-unknown-linux-musl
 
       - name: Build client
-        run: cargo build -p jibs_client --features test-utils
+        run: cargo build -p jibs_client --features test-utils --locked
 
-      - name: Set up SSH keys
-        run: |
-          ./test/setup-ssh-keys.sh
-          chmod 600 test/ssh-keys/id_ed25519
-
-      - name: Start test containers
+      - name: Wait for test containers
         run: docker compose up -d --wait --wait-timeout 300
 
       - name: Aggregate import
