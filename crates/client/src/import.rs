@@ -307,6 +307,36 @@ impl LoaderPool {
     }
 }
 
+/// Build the LOAD DATA LOCAL INFILE statement for a table.
+///
+/// Binary-typed columns arrive hex-encoded in the TSV stream (the server
+/// cannot put raw bytes in a text stream safely), so they are read into
+/// user variables and decoded with UNHEX() in a SET clause.
+fn build_load_data_sql(table: &str, columns: &[ColumnDef]) -> String {
+    let mut col_list: Vec<String> = Vec::with_capacity(columns.len());
+    let mut set_clauses: Vec<String> = Vec::new();
+
+    for (i, col) in columns.iter().enumerate() {
+        if col.is_binary_type() {
+            col_list.push(format!("@jibs_hex_{}", i));
+            set_clauses.push(format!("`{}` = UNHEX(@jibs_hex_{})", col.name, i));
+        } else {
+            col_list.push(format!("`{}`", col.name));
+        }
+    }
+
+    let mut sql = format!(
+        r"LOAD DATA LOCAL INFILE 'data.tsv' INTO TABLE `{}` FIELDS TERMINATED BY '\t' ESCAPED BY '\\' LINES TERMINATED BY '\n' ({})",
+        table,
+        col_list.join(", ")
+    );
+    if !set_clauses.is_empty() {
+        sql.push_str(" SET ");
+        sql.push_str(&set_clauses.join(", "));
+    }
+    sql
+}
+
 /// Load TSV data with a provided connection (for worker pool)
 fn load_tsv_data_with_conn(
     conn: &mut Conn,
@@ -330,15 +360,8 @@ fn load_tsv_data_with_conn(
 
     conn.set_local_infile_handler(Some(handler));
 
-    // Build column list
-    let col_list: Vec<String> = columns.iter().map(|c| format!("`{}`", c.name)).collect();
-
     // Execute LOAD DATA LOCAL INFILE
-    let load_sql = format!(
-        r"LOAD DATA LOCAL INFILE 'data.tsv' INTO TABLE `{}` FIELDS TERMINATED BY '\t' ESCAPED BY '\\' LINES TERMINATED BY '\n' ({})",
-        table,
-        col_list.join(", ")
-    );
+    let load_sql = build_load_data_sql(table, columns);
 
     debug!("LOAD DATA SQL (worker): {}", load_sql);
     let result = conn.query_iter(&load_sql)?;
@@ -2077,16 +2100,9 @@ fn load_tsv_data(
 
     conn.set_local_infile_handler(Some(handler));
 
-    // Build column list
-    let col_list: Vec<String> = columns.iter().map(|c| format!("`{}`", c.name)).collect();
-
     // Execute LOAD DATA LOCAL INFILE
     // ESCAPED BY '\\' tells MySQL to interpret \N as NULL
-    let load_sql = format!(
-        r"LOAD DATA LOCAL INFILE 'data.tsv' INTO TABLE `{}` FIELDS TERMINATED BY '\t' ESCAPED BY '\\' LINES TERMINATED BY '\n' ({})",
-        table,
-        col_list.join(", ")
-    );
+    let load_sql = build_load_data_sql(table, columns);
 
     debug!("LOAD DATA SQL: {}", load_sql);
     let result = conn.query_iter(&load_sql)?;
@@ -2467,6 +2483,38 @@ mod tests {
     #[test]
     fn redact_passes_through_non_urls() {
         assert_eq!(redact_mysql_url("not a url"), "not a url");
+    }
+
+    fn col(name: &str, type_name: &str) -> ColumnDef {
+        ColumnDef {
+            name: name.to_string(),
+            type_name: type_name.to_string(),
+            full_type: type_name.to_lowercase(),
+            max_length: None,
+            nullable: true,
+            is_primary_key: false,
+            charset: None,
+            collation: None,
+            flags: Default::default(),
+        }
+    }
+
+    #[test]
+    fn load_data_sql_plain_columns() {
+        let columns = vec![col("id", "INT"), col("name", "VARCHAR")];
+        assert_eq!(
+            build_load_data_sql("users", &columns),
+            r"LOAD DATA LOCAL INFILE 'data.tsv' INTO TABLE `users` FIELDS TERMINATED BY '\t' ESCAPED BY '\\' LINES TERMINATED BY '\n' (`id`, `name`)"
+        );
+    }
+
+    #[test]
+    fn load_data_sql_binary_columns_use_unhex() {
+        let columns = vec![col("id", "INT"), col("data", "BLOB"), col("tag", "VARBINARY")];
+        assert_eq!(
+            build_load_data_sql("files", &columns),
+            r"LOAD DATA LOCAL INFILE 'data.tsv' INTO TABLE `files` FIELDS TERMINATED BY '\t' ESCAPED BY '\\' LINES TERMINATED BY '\n' (`id`, @jibs_hex_1, @jibs_hex_2) SET `data` = UNHEX(@jibs_hex_1), `tag` = UNHEX(@jibs_hex_2)"
+        );
     }
 
     #[test]

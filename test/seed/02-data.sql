@@ -67,3 +67,26 @@ INSERT INTO audit_log (table_name, record_id, action, new_values) VALUES
 INSERT INTO sessions (id, user_id, data, expires_at) VALUES
 ('sess_abc123', 1, 'session data blob', DATE_ADD(NOW(), INTERVAL 1 DAY)),
 ('sess_def456', 2, 'session data blob', DATE_ADD(NOW(), INTERVAL 1 DAY));
+
+-- Order flags (no-PK table): 5 rows for user 1's orders (1, 2), 1 for order 3
+INSERT INTO order_flags (order_id, flag) VALUES
+(1, 'gift'),
+(1, 'priority'),
+(1, 'fragile'),
+(2, 'gift'),
+(2, 'insured'),
+(3, 'priority');
+
+-- Order receipts with binary content: non-UTF-8 bytes, UTF-8-looking bytes,
+-- empty, and NULL. Orders 1-2 belong to user 1; order 3 does not.
+INSERT INTO order_receipts (order_id, receipt_pdf, scan) VALUES
+(1, X'DEADBEEFC0FFEE00FF', X'89504E470D0A1A0A0000'),
+(1, 'plain-text-bytes', X''),
+(2, X'FFFE0000BADC0DE5', NULL),
+(3, X'AAAAAAAAAAAAAAAA', X'BBBB');
+
+-- Order audit entries (ignored via ignore_table in test configs)
+INSERT INTO order_audit (order_id, change_note) VALUES
+(1, 'status changed to delivered'),
+(2, 'status changed to shipped'),
+(3, 'created');

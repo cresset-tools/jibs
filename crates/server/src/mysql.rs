@@ -311,16 +311,10 @@ fn escape_identifier(s: &str) -> String {
 pub fn write_tsv_value(buf: &mut Vec<u8>, value: &MySqlValue) {
     match value {
         MySqlValue::NULL => buf.extend_from_slice(b"\\N"),
-        MySqlValue::Bytes(b) => {
-            // Check if it's valid UTF-8 (only matters for hex fallback)
-            if std::str::from_utf8(b).is_ok() {
-                escape_tsv_bytes(buf, b);
-            } else {
-                // Binary data: hex encode
-                buf.extend_from_slice(b"0x");
-                buf.extend_from_slice(hex::encode(b).as_bytes());
-            }
-        }
+        // TSV escaping is byte-oriented, so arbitrary (non-UTF-8) bytes pass
+        // through unchanged. Columns with binary types are hex-encoded by
+        // TsvWriter before reaching this function.
+        MySqlValue::Bytes(b) => escape_tsv_bytes(buf, b),
         MySqlValue::Int(i) => {
             let mut itoa_buf = itoa::Buffer::new();
             buf.extend_from_slice(itoa_buf.format(*i).as_bytes());
