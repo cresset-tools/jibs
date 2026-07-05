@@ -1,10 +1,13 @@
 //! TSV (Tab-Separated Values) formatting for MySQL LOAD DATA INFILE
 
-use mysql::Row;
+use mysql::{Row, Value as MySqlValue};
 
-use crate::error::Result;
+use crate::error::{Result, ServerError};
 use crate::mysql::{escape_tsv_bytes, write_tsv_value};
-use jibs_protocol::{AnonymizeRule, AnonymizeTarget, CompressionMode, RAW_CHUNK_FLAG, RAW_CHUNK_HEADER_LEN};
+use jibs_protocol::{
+    AnonymizeRule, AnonymizeTarget, ColumnDef, CompressionMode, RAW_CHUNK_FLAG,
+    RAW_CHUNK_HEADER_LEN,
+};
 
 /// Sentinel string emitted by the resolver for `{unique()}` interpolation.
 const UNIQUE_SENTINEL: &str = "{unique()}";
@@ -27,6 +30,9 @@ pub struct TsvWriter {
     num_columns: usize,
     /// Pre-computed anonymization lookup: one entry per column, None = no anonymization
     anon_by_column: Vec<Option<AnonAction>>,
+    /// Per-column flag: binary-typed columns are hex-encoded in the TSV stream
+    /// (decoded with UNHEX() by the client's LOAD DATA)
+    binary_by_column: Vec<bool>,
     /// Faker pools stored as pre-escaped byte slices for zero-copy writes
     faker_pools: Vec<Vec<Vec<u8>>>,
     /// Raw (unescaped) faker pools for unique mode — need raw strings to insert counter
@@ -40,10 +46,13 @@ pub struct TsvWriter {
 impl TsvWriter {
     /// Create a new TSV writer
     pub fn new(
-        columns: Vec<String>,
+        column_defs: &[ColumnDef],
         anonymization: Vec<AnonymizeRule>,
         fakers: std::collections::HashMap<String, Vec<String>>,
     ) -> Self {
+        let columns: Vec<String> = column_defs.iter().map(|c| c.name.clone()).collect();
+        let binary_by_column: Vec<bool> =
+            column_defs.iter().map(|c| c.is_binary_type()).collect();
         // Pre-escape all faker pool values into byte buffers
         let mut faker_pool_names: Vec<String> = Vec::new();
         let mut faker_pools: Vec<Vec<Vec<u8>>> = Vec::new();
@@ -118,6 +127,7 @@ impl TsvWriter {
             buffer,
             num_columns,
             anon_by_column,
+            binary_by_column,
             faker_pools,
             faker_pools_raw,
             rng: rand::thread_rng(),
@@ -134,16 +144,30 @@ impl TsvWriter {
                 self.buffer.push(b'\t');
             }
 
+            let is_binary = self.binary_by_column[i];
+
             match &self.anon_by_column[i] {
                 Some(AnonAction::Null) => {
                     self.buffer.extend_from_slice(b"\\N");
                 }
                 Some(AnonAction::Faker(pool_idx)) => {
-                    let pool = &self.faker_pools[*pool_idx];
-                    if let Some(value) = pool.choose(&mut self.rng) {
-                        self.buffer.extend_from_slice(value);
+                    if is_binary {
+                        // Binary columns carry hex on the wire, so hex-encode
+                        // the raw faker value instead of the escaped one
+                        let pool = &self.faker_pools_raw[*pool_idx];
+                        if let Some(value) = pool.choose(&mut self.rng) {
+                            self.buffer
+                                .extend_from_slice(hex::encode(value.as_bytes()).as_bytes());
+                        } else {
+                            self.buffer.extend_from_slice(b"\\N");
+                        }
                     } else {
-                        self.buffer.extend_from_slice(b"\\N");
+                        let pool = &self.faker_pools[*pool_idx];
+                        if let Some(value) = pool.choose(&mut self.rng) {
+                            self.buffer.extend_from_slice(value);
+                        } else {
+                            self.buffer.extend_from_slice(b"\\N");
+                        }
                     }
                 }
                 Some(AnonAction::FakerUnique(pool_idx)) => {
@@ -154,13 +178,23 @@ impl TsvWriter {
                         let base = &pool[self.unique_counter as usize % pool.len()];
                         let counter_str = self.unique_counter.to_string();
                         let unique_value = base.replace(UNIQUE_SENTINEL, &counter_str);
-                        escape_tsv_bytes(&mut self.buffer, unique_value.as_bytes());
+                        if is_binary {
+                            self.buffer
+                                .extend_from_slice(hex::encode(unique_value.as_bytes()).as_bytes());
+                        } else {
+                            escape_tsv_bytes(&mut self.buffer, unique_value.as_bytes());
+                        }
                         self.unique_counter += 1;
                     }
                 }
                 None => {
                     // Direct index access — no column name lookup, no cloning
                     match row.as_ref(i) {
+                        Some(MySqlValue::Bytes(b)) if is_binary => {
+                            // Hex-encode so arbitrary bytes survive the TSV
+                            // stream; the client loads with UNHEX()
+                            self.buffer.extend_from_slice(hex::encode(b).as_bytes());
+                        }
                         Some(val) => write_tsv_value(&mut self.buffer, val),
                         None => self.buffer.extend_from_slice(b"\\N"),
                     }
@@ -184,7 +218,7 @@ impl TsvWriter {
         table_id: u16,
         row_count: u16,
         compression: CompressionMode,
-    ) -> Vec<u8> {
+    ) -> Result<Vec<u8>> {
         let tsv_start = RAW_CHUNK_HEADER_LEN;
         let tsv_len = self.buffer.len() - tsv_start;
 
@@ -201,21 +235,12 @@ impl TsvWriter {
             }
             CompressionMode::Zstd => {
                 let tsv_data = &self.buffer[tsv_start..];
-                let compressed = match zstd::encode_all(tsv_data, 3) {
-                    Ok(c) => c,
-                    Err(_) => {
-                        // Fallback: send uncompressed
-                        let payload_len = 2 + 2 + tsv_len;
-                        let flagged_len = (payload_len as u32) | RAW_CHUNK_FLAG;
-                        self.buffer[0..4].copy_from_slice(&flagged_len.to_le_bytes());
-                        self.buffer[4..6].copy_from_slice(&table_id.to_le_bytes());
-                        self.buffer[6..8].copy_from_slice(&row_count.to_le_bytes());
-                        let frame =
-                            std::mem::replace(&mut self.buffer, Vec::with_capacity(64 * 1024));
-                        self.buffer.resize(RAW_CHUNK_HEADER_LEN, 0);
-                        return frame;
-                    }
-                };
+                // Compression was negotiated stream-wide; there is no per-chunk
+                // flag, so falling back to an uncompressed chunk here would
+                // silently corrupt the stream. Fail instead.
+                let compressed = zstd::encode_all(tsv_data, 3).map_err(|e| {
+                    ServerError::Protocol(format!("zstd compression failed: {}", e))
+                })?;
 
                 // Build: header + u32 original_len + compressed data
                 let compressed_payload_len = 4 + compressed.len();
@@ -236,7 +261,7 @@ impl TsvWriter {
         };
 
         self.buffer.resize(RAW_CHUNK_HEADER_LEN, 0);
-        frame
+        Ok(frame)
     }
 
     /// Get the current TSV data size (excluding the preallocated frame header).

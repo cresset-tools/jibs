@@ -312,6 +312,21 @@ pub struct ColumnDef {
     pub flags: ColumnFlags,
 }
 
+impl ColumnDef {
+    /// True for column types whose values are raw bytes rather than text.
+    ///
+    /// Values of these types are hex-encoded in the TSV stream by the server
+    /// and decoded with UNHEX() in the client's LOAD DATA statement, so
+    /// arbitrary binary data survives the transfer. Both sides must agree on
+    /// this classification, which is why it lives in the shared protocol crate.
+    pub fn is_binary_type(&self) -> bool {
+        matches!(
+            self.type_name.as_str(),
+            "BINARY" | "VARBINARY" | "TINYBLOB" | "BLOB" | "MEDIUMBLOB" | "LONGBLOB" | "BIT"
+        )
+    }
+}
+
 /// Column flags from MySQL
 #[derive(Debug, Clone, Default, Encode, Decode)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
