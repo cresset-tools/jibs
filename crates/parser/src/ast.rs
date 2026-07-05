@@ -108,8 +108,8 @@ pub struct StringLiteral<'src> {
 /// Part of an interpolated string
 #[derive(Debug, Clone, PartialEq)]
 pub enum StringPart<'src> {
-    /// Plain text
-    Text(&'src str),
+    /// Plain text (owned when escape sequences were decoded)
+    Text(std::borrow::Cow<'src, str>),
     /// Interpolated expression {$var} or {expr}
     Interpolation(Spanned<Expr<'src>>),
 }
