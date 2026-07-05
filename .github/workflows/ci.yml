@@ -1,0 +1,145 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run unit tests
+        run: cargo test --workspace
+
+  e2e:
+    name: E2E import tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      # Shared connection args for all import runs (word-split on use)
+      JIBS_CONN: >-
+        --host testuser@localhost
+        --port 2222
+        --identity test/ssh-keys/id_ed25519
+        --no-host-key-checking
+        --remote-mysql mysql://root:remote_root_pass@mysql-remote:3306/production
+        --local-mysql mysql://root:local_root_pass@127.0.0.1:3308/imported
+        --parallel 4
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-zigbuild
+        run: pip install cargo-zigbuild
+
+      # The client embeds the musl server binary at compile time
+      # (crates/client/build.rs), so the server must be built first.
+      - name: Build server (x86_64 musl)
+        run: cargo zigbuild -p jibs_server --release --target x86_64-unknown-linux-musl
+
+      - name: Build client
+        run: cargo build -p jibs_client --features test-utils
+
+      - name: Set up SSH keys
+        run: |
+          ./test/setup-ssh-keys.sh
+          chmod 600 test/ssh-keys/id_ed25519
+
+      - name: Start test containers
+        run: docker compose up -d --wait --wait-timeout 300
+
+      - name: Aggregate import
+        run: ./target/debug/jibs import test/import-aggregate.jibs $JIBS_CONN --clean
+
+      - name: Full table import
+        run: ./target/debug/jibs import test/import-all.jibs $JIBS_CONN --clean
+
+      - name: Verify imported row counts
+        run: |
+          fail=0
+          for tbl in users products orders order_items; do
+            remote=$(docker exec jibs-remote mysql -N -u root -premote_root_pass production -e "SELECT COUNT(*) FROM $tbl")
+            imported=$(docker exec jibs-local mysql -N -u root -plocal_root_pass imported -e "SELECT COUNT(*) FROM $tbl")
+            echo "$tbl: remote=$remote imported=$imported"
+            if [ "$remote" != "$imported" ]; then
+              echo "::error::Row count mismatch for $tbl"
+              fail=1
+            fi
+          done
+          exit $fail
+
+      # Mirrors test/test-resume.sh: seed a local-only row that a preserve rule
+      # protects, crash right after the users table (table 4) so the backup
+      # table exists but the restore hasn't happened, then resume.
+      - name: Resume test (seed preserved row)
+        run: |
+          docker exec jibs-local mysql -u root -plocal_root_pass -e "
+            DROP DATABASE IF EXISTS imported;
+            CREATE DATABASE imported;
+            USE imported;
+            CREATE TABLE users (
+              id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+              email VARCHAR(255) NOT NULL,
+              name VARCHAR(100) NOT NULL,
+              password_hash VARCHAR(255),
+              created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+              updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            INSERT INTO users (email, name, password_hash) VALUES
+              ('local-admin@test.local', 'Local Admin', 'local_secret_hash');
+          "
+
+      - name: Resume test (simulated crash)
+        run: |
+          if ./target/debug/jibs import test/import-resume-test.jibs $JIBS_CONN --fail-after-tables 4; then
+            echo "::error::Import was expected to fail after 4 tables but succeeded"
+            exit 1
+          fi
+          backup=$(docker exec jibs-local mysql -N -u root -plocal_root_pass imported -e "SHOW TABLES LIKE '_jibs_preserve_%'")
+          if [ -z "$backup" ]; then
+            echo "::error::Expected _jibs_preserve_ backup tables after simulated crash"
+            exit 1
+          fi
+          echo "Crashed as expected, backup tables present: $backup"
+
+      - name: Resume test (resume after crash)
+        run: ./target/debug/jibs import test/import-resume-test.jibs $JIBS_CONN --resume
+
+      - name: Verify resume restored state
+        run: |
+          leftover=$(docker exec jibs-local mysql -N -u root -plocal_root_pass imported -e "SHOW TABLES LIKE '_jibs_preserve_%'")
+          if [ -n "$leftover" ]; then
+            echo "::error::Backup tables still exist after resume: $leftover"
+            exit 1
+          fi
+          preserved=$(docker exec jibs-local mysql -N -u root -plocal_root_pass imported -e "SELECT password_hash FROM users WHERE email = 'local-admin@test.local'")
+          if [ "$preserved" != "local_secret_hash" ]; then
+            echo "::error::Preserved row was not restored correctly (got: $preserved)"
+            exit 1
+          fi
+          echo "Backup tables cleaned up and preserved row restored"
+
+      - name: Dump container logs
+        if: failure()
+        run: docker compose logs

@@ -20,6 +20,8 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+      # First boot runs the seed scripts; give it time before counting failures
+      start_period: 60s
 
   # Local database where we import data to
   mysql-local:
@@ -41,6 +43,7 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+      start_period: 60s
 
   # SSH server for E2E testing (simulates remote host)
   ssh-server:
