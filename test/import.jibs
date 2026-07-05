@@ -14,10 +14,13 @@ relation orders.user_id -> users.id
 relation order_items.order_id -> orders.id
 relation order_items.product_id -> products.id
 
+// Which user's orders to import (override with --var user_id=N)
+var user_id: int = 1
+
 // Import all orders for a specific user (with related data)
 aggregate user_orders {
     root orders
-    where "user_id = ${user_id}"
+    where "user_id = {$user_id}"
 }
 
 // Anonymize sensitive user data

@@ -52,8 +52,10 @@ aggregate products {
     where "entity_id IN (SELECT product_id FROM catalog_category_product WHERE category_id = 42)"
 }
 
-// Incremental imports
-include products where "sku = 'HERO-PRODUCT'"
+// On-demand fetches: jibs get <config> -- product_by_sku --sku HERO-PRODUCT
+get product_by_sku (sku: string) {
+    products where "sku = '{$sku}'"
+}
 
 // Preserve local values
 preserve core_config_data where "path LIKE 'dev/%'"
