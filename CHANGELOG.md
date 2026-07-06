@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.3.0](https://github.com/cresset-tools/jibs/compare/jibs-v0.2.1...jibs-v0.3.0) (2026-07-06)
+
+
+### Features
+
+* sign release archives with Sigstore for bougie's verified prefetch ([f8e1921](https://github.com/cresset-tools/jibs/commit/f8e1921502ba65df82b8b57f6bc777ee127c6047))
+* sign release archives with Sigstore for bougie's verified prefetch ([f2a2a68](https://github.com/cresset-tools/jibs/commit/f2a2a68b81a9c7780ebcec228fd5001c118736d8))
+
 ## [0.2.1](https://github.com/cresset-tools/jibs/compare/jibs-v0.2.0...jibs-v0.2.1) (2026-07-06)
 
 
