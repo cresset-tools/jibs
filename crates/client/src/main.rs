@@ -8,8 +8,15 @@
 //! - Coordinating data transfer
 //! - Loading data into local MySQL
 
+mod checkpoint;
+mod dry_run;
 mod error;
+mod foreign_keys;
 mod import;
+mod loader;
+mod protocol;
+mod report;
+mod sql;
 mod json_config;
 mod metrics;
 mod progress;

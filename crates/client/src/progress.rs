@@ -8,6 +8,8 @@
 //! terminal cursor tracking.
 
 use std::collections::{HashMap, VecDeque};
+
+use crate::report::format_number;
 use std::io::IsTerminal;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -557,15 +559,3 @@ fn format_row_progress(current: u64, total: u64) -> String {
     )
 }
 
-/// Format a number with thousand separators
-fn format_number(n: u64) -> String {
-    let s = n.to_string();
-    let mut result = String::new();
-    for (i, c) in s.chars().rev().enumerate() {
-        if i > 0 && i % 3 == 0 {
-            result.insert(0, ',');
-        }
-        result.insert(0, c);
-    }
-    result
-}
