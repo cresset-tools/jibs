@@ -372,6 +372,44 @@ impl RemoteProcess {
     }
 }
 
+/// Read half of the protocol stream. Implemented by the unsplit process
+/// (pre-protocol exchange) and the split reader (main loop) so that message
+/// receiving code is written once.
+#[allow(async_fn_in_trait)]
+pub trait ProtocolRead {
+    async fn read_exact(&mut self, buf: &mut [u8]) -> Result<()>;
+}
+
+impl ProtocolRead for RemoteProcess {
+    async fn read_exact(&mut self, buf: &mut [u8]) -> Result<()> {
+        RemoteProcess::read_exact(self, buf).await
+    }
+}
+
+impl ProtocolRead for ProcessReader {
+    async fn read_exact(&mut self, buf: &mut [u8]) -> Result<()> {
+        ProcessReader::read_exact(self, buf).await
+    }
+}
+
+/// Write half of the protocol stream (see [`ProtocolRead`])
+#[allow(async_fn_in_trait)]
+pub trait ProtocolWrite {
+    async fn write(&mut self, data: &[u8]) -> Result<()>;
+}
+
+impl ProtocolWrite for RemoteProcess {
+    async fn write(&mut self, data: &[u8]) -> Result<()> {
+        RemoteProcess::write(self, data).await
+    }
+}
+
+impl ProtocolWrite for ProcessWriter {
+    async fn write(&mut self, data: &[u8]) -> Result<()> {
+        ProcessWriter::write(self, data).await
+    }
+}
+
 /// Read half of a split RemoteProcess
 pub struct ProcessReader {
     reader: tokio::process::ChildStdout,
