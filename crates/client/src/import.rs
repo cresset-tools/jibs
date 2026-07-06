@@ -770,6 +770,9 @@ pub async fn run_import(config: ImportConfig) -> Result<()> {
     info!("Starting remote server: {}", server_path);
     let mut server = session.start_process(&server_path).await?;
 
+    // Protocol version handshake — before any framed message
+    perform_handshake(&mut server).await?;
+
     // Send credentials via protocol (not visible in process listing)
     let mut encoder: MessageWriter<()> = MessageWriter::with_capacity(4096, ());
     let creds_msg = ClientMessage::Credentials {
@@ -1837,6 +1840,55 @@ async fn run_protocol_inner(
     // Send shutdown
     send_message_writer(&mut writer, &mut encoder, &ClientMessage::Shutdown).await?;
 
+    Ok(())
+}
+
+/// Exchange protocol preambles with the remote server: send ours, then read
+/// and validate the server's greeting. Both sides write before reading, so
+/// there is no deadlock. Runs before any framed message, so a client/server
+/// version mismatch is a clear, actionable error instead of bincode decode
+/// garbage mid-stream.
+async fn perform_handshake(server: &mut RemoteProcess) -> Result<()> {
+    use jibs_protocol::handshake::{self, PREAMBLE_LEN};
+
+    server
+        .write(&handshake::encode_preamble())
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to send protocol preamble: {}", e))?;
+
+    // A server that predates the handshake sends no greeting (it waits for a
+    // framed message that never comes) — the timeout turns that into an
+    // actionable error instead of a hang.
+    let mut buf = [0u8; PREAMBLE_LEN];
+    let read_greeting = async {
+        let mut filled = 0;
+        while filled < PREAMBLE_LEN {
+            let n = server
+                .read(&mut buf[filled..])
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to read server greeting: {}", e))?;
+            if n == 0 {
+                anyhow::bail!(
+                    "Server closed the connection before sending a protocol greeting. \
+                     The remote jibs-server is older than this client — \
+                     run ./scripts/build.sh to rebuild client and server together, then retry."
+                );
+            }
+            filled += n;
+        }
+        Ok(())
+    };
+    match tokio::time::timeout(Duration::from_secs(10), read_greeting).await {
+        Err(_) => anyhow::bail!(
+            "Timed out waiting for the server protocol greeting. \
+             The remote jibs-server is probably older than this client — \
+             run ./scripts/build.sh to rebuild client and server together, then retry."
+        ),
+        Ok(result) => result?,
+    }
+
+    handshake::validate_preamble(&buf).map_err(|e| anyhow::anyhow!("{}", e))?;
+    debug!("Protocol handshake complete (v{})", handshake::PROTOCOL_VERSION);
     Ok(())
 }
 
