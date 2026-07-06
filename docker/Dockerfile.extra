@@ -1,0 +1,27 @@
+# syntax=docker/dockerfile:1
+
+# Runnable variant images: the static jibs binary dropped onto a real OS base
+# (alpine, debian-slim, ...). Unlike the scratch base image these are meant
+# to be *run*, so they install openssh-client — the jibs client drives the
+# system `ssh` binary (ControlMaster + exec) to reach the remote host, and
+# scratch/slim bases ship none.
+#
+# Built by .github/workflows/build-docker.yml over a matrix of base images.
+# The only RUN is the ssh install; the expensive Rust compile lives in the
+# base image (docker/Dockerfile).
+
+# The OS base, e.g. alpine:3.22 or debian:trixie-slim.
+ARG BASE_IMAGE=alpine:3.22
+# The jibs base image to lift the binary out of — pinned by digest in CI so
+# a variant always matches the base it was cut from.
+ARG JIBS_IMAGE=ghcr.io/cresset-tools/jibs:latest
+
+FROM ${JIBS_IMAGE} AS jibs
+
+FROM ${BASE_IMAGE}
+# Per-base openssh-client install (apk for alpine, apt for debian), passed in
+# by the workflow matrix so this one Dockerfile serves every variant.
+ARG SSH_INSTALL="apk add --no-cache openssh-client"
+RUN sh -c "${SSH_INSTALL}"
+COPY --from=jibs /jibs /usr/local/bin/
+ENTRYPOINT ["/usr/local/bin/jibs"]

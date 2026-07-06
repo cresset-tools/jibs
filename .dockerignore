@@ -1,0 +1,5 @@
+# Keep the docker build context to what the cargo build needs.
+.git/
+target/
+vendor/bougie/
+vscode-extension/node_modules/
