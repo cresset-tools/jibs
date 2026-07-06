@@ -1,12 +1,16 @@
 //! String interpolation parser
 //!
-//! Parses strings containing `{$variable}` or `{expression}` interpolations.
+//! Parses strings containing `{$variable}` or `{expression}` interpolations,
+//! decoding escape sequences along the way. Interpolation expressions are
+//! lexed with the main lexer (regex literals disabled — `/` is always
+//! division here) and parsed with the main expression parser, so the two
+//! expression dialects can't drift apart.
 
 use std::borrow::Cow;
 
-use chumsky::{input::ValueInput, prelude::*};
-
-use crate::ast::{BinaryOp, Expr, Literal, Spanned, StringLiteral, StringPart, UnaryOp};
+use crate::ast::{Expr, Spanned, StringLiteral, StringPart};
+use crate::lexer::{lex_with_options, LexOptions};
+use crate::parser::parse_expr_tokens;
 use crate::Span;
 
 /// An error inside a string literal (bad escape handling is lenient, so in
@@ -85,7 +89,7 @@ pub fn parse_interpolated_string(
                         message: "unclosed interpolation: missing '}' \
                                   (write \\{ for a literal brace)"
                             .to_string(),
-                        span: (base_offset + interp_start..base_offset + input.len()).into(),
+                        span: Span::new(base_offset + interp_start, base_offset + input.len()),
                     });
                     break;
                 };
@@ -140,281 +144,40 @@ fn parse_interpolation_expr(
         }
     };
 
-    let adjust = |span: Span| -> Span { (offset + span.start..offset + span.end).into() };
+    let adjust = |span: Span| -> Span { Span::new(offset + span.start, offset + span.end) };
 
-    let (tokens, lex_errors) = interp_lexer().parse(input).into_output_errors();
+    // Regex literals are disabled inside interpolations: `/` is division
+    let (tokens, lex_errors) =
+        lex_with_options(input, LexOptions { regex_literals: false });
 
     if let Some(e) = lex_errors.first() {
         return Err(InterpolationError {
-            message: format!("invalid interpolation: {}", e),
-            span: adjust(*e.span()),
+            message: format!("invalid interpolation: {}", e.message),
+            span: adjust(Span::new(e.span.start, e.span.end)),
         });
     }
-
-    let tokens = tokens.unwrap_or_default();
 
     if tokens.is_empty() {
         return Err(InterpolationError {
             message: "empty interpolation (write \\{ for a literal brace)".to_string(),
-            span: (offset..offset + input.len()).into(),
+            span: Span::new(offset, offset + input.len()),
         });
     }
 
-    let len = input.len();
-    let eoi_span: Span = (len..len).into();
-
-    let (expr, parse_errors) = interp_expr_parser()
-        .parse(tokens.as_slice().map(eoi_span, |(t, s)| (t, s)))
-        .into_output_errors();
-
-    if let Some(e) = parse_errors.first() {
-        return Err(InterpolationError {
-            message: format!("invalid interpolation: {}{}", e, bare_ident_hint()),
-            span: adjust(*e.span()),
-        });
+    let eoi = Span::new(input.len(), input.len());
+    match parse_expr_tokens(&tokens, eoi) {
+        Ok((expr, span)) => Ok((expr, adjust(span))),
+        Err(e) => Err(InterpolationError {
+            message: format!("invalid interpolation: {}{}", e.message, bare_ident_hint()),
+            span: adjust(Span::new(e.span.start, e.span.end)),
+        }),
     }
-
-    let (e, span) = expr.ok_or_else(|| InterpolationError {
-        message: format!("invalid interpolation{}", bare_ident_hint()),
-        span: (offset..offset + input.len()).into(),
-    })?;
-
-    // Adjust span to account for position in original string
-    Ok((e, adjust(span)))
-}
-
-/// Token type for interpolation expressions
-#[derive(Clone, Debug, PartialEq)]
-pub enum InterpToken<'src> {
-    Int(i64),
-    Float(f64),
-    Bool(bool),
-    String(&'src str),
-    Ident(&'src str),
-    Dollar,
-    Plus,
-    Minus,
-    Star,
-    Slash,
-    Percent,
-    Eq,
-    NotEq,
-    Lt,
-    Gt,
-    LtEq,
-    GtEq,
-    And,
-    Or,
-    Not,
-    LParen,
-    RParen,
-}
-
-impl std::fmt::Display for InterpToken<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        match self {
-            InterpToken::Int(n) => write!(f, "{n}"),
-            InterpToken::Float(n) => write!(f, "{n}"),
-            InterpToken::Bool(b) => write!(f, "{b}"),
-            InterpToken::String(s) => write!(f, "\"{s}\""),
-            InterpToken::Ident(s) => write!(f, "{s}"),
-            InterpToken::Dollar => write!(f, "$"),
-            InterpToken::Plus => write!(f, "+"),
-            InterpToken::Minus => write!(f, "-"),
-            InterpToken::Star => write!(f, "*"),
-            InterpToken::Slash => write!(f, "/"),
-            InterpToken::Percent => write!(f, "%"),
-            InterpToken::Eq => write!(f, "=="),
-            InterpToken::NotEq => write!(f, "!="),
-            InterpToken::Lt => write!(f, "<"),
-            InterpToken::Gt => write!(f, ">"),
-            InterpToken::LtEq => write!(f, "<="),
-            InterpToken::GtEq => write!(f, ">="),
-            InterpToken::And => write!(f, "&&"),
-            InterpToken::Or => write!(f, "||"),
-            InterpToken::Not => write!(f, "!"),
-            InterpToken::LParen => write!(f, "("),
-            InterpToken::RParen => write!(f, ")"),
-        }
-    }
-}
-
-/// Lexer for interpolation expressions
-fn interp_lexer<'src>(
-) -> impl Parser<'src, &'src str, Vec<Spanned<InterpToken<'src>>>, extra::Err<Rich<'src, char, Span>>>
-{
-    // No leading sign on numbers: `-` is the Minus token and the expression
-    // parser's unary Neg handles negation, so `{$a-1}` lexes as a binary
-    // minus instead of the literal -1. `validate` keeps the overflow message
-    // from being merged away by the surrounding `choice`.
-    let int = text::int(10)
-        .to_slice()
-        .validate(|s: &str, e, emitter| {
-            s.parse::<i64>().unwrap_or_else(|_| {
-                emitter.emit(Rich::custom(
-                    e.span(),
-                    format!("integer literal '{}' is out of range for a 64-bit integer", s),
-                ));
-                i64::MAX
-            })
-        })
-        .map(InterpToken::Int);
-
-    let float = text::int(10)
-        .then(just('.').then(text::digits(10)))
-        .to_slice()
-        .from_str()
-        .unwrapped()
-        .map(InterpToken::Float);
-
-    let string = just('"')
-        .ignore_then(none_of('"').repeated().to_slice())
-        .then_ignore(just('"'))
-        .map(InterpToken::String);
-
-    let ident = text::ascii::ident().map(|s: &str| match s {
-        "true" => InterpToken::Bool(true),
-        "false" => InterpToken::Bool(false),
-        _ => InterpToken::Ident(s),
-    });
-
-    // Multi-char operators
-    let eq = just("==").to(InterpToken::Eq);
-    let not_eq = just("!=").to(InterpToken::NotEq);
-    let lt_eq = just("<=").to(InterpToken::LtEq);
-    let gt_eq = just(">=").to(InterpToken::GtEq);
-    let and = just("&&").to(InterpToken::And);
-    let or = just("||").to(InterpToken::Or);
-
-    // Single-char tokens
-    let dollar = just('$').to(InterpToken::Dollar);
-    let plus = just('+').to(InterpToken::Plus);
-    let minus = just('-').to(InterpToken::Minus);
-    let star = just('*').to(InterpToken::Star);
-    let slash = just('/').to(InterpToken::Slash);
-    let percent = just('%').to(InterpToken::Percent);
-    let lt = just('<').to(InterpToken::Lt);
-    let gt = just('>').to(InterpToken::Gt);
-    let not = just('!').to(InterpToken::Not);
-    let lparen = just('(').to(InterpToken::LParen);
-    let rparen = just(')').to(InterpToken::RParen);
-
-    let operator = choice((
-        eq, not_eq, lt_eq, gt_eq, and, or, dollar, plus, minus, star, slash, percent, lt, gt, not,
-        lparen, rparen,
-    ));
-
-    let token = choice((float, int, string, operator, ident));
-
-    token
-        .map_with(|tok, e| (tok, e.span()))
-        .padded()
-        .repeated()
-        .collect()
-}
-
-/// Expression parser for interpolations
-fn interp_expr_parser<'tokens, 'src: 'tokens, I>(
-) -> impl Parser<'tokens, I, Spanned<Expr<'src>>, extra::Err<Rich<'tokens, InterpToken<'src>, Span>>>
-       + Clone
-where
-    I: ValueInput<'tokens, Token = InterpToken<'src>, Span = Span>,
-{
-    recursive(|expr| {
-        // Primary expressions
-        let primary = choice((
-            // unique() function call
-            select! { InterpToken::Ident("unique") => () }
-                .ignore_then(just(InterpToken::LParen))
-                .ignore_then(just(InterpToken::RParen))
-                .to(Expr::Unique),
-            // Variable reference $name
-            just(InterpToken::Dollar)
-                .ignore_then(select! { InterpToken::Ident(s) => s })
-                .map(Expr::Variable),
-            // Literals
-            select! {
-                InterpToken::Int(n) => Expr::Literal(Literal::Int(n)),
-                InterpToken::Float(n) => Expr::Literal(Literal::Float(n)),
-                InterpToken::Bool(b) => Expr::Literal(Literal::Bool(b)),
-                InterpToken::String(s) => Expr::Literal(Literal::String(StringLiteral {
-                    parts: vec![StringPart::Text(Cow::Borrowed(s))],
-                })),
-            },
-            // Parenthesized
-            expr.clone()
-                .delimited_by(just(InterpToken::LParen), just(InterpToken::RParen))
-                .map(|(e, _)| e),
-        ))
-        .map_with(|e, ctx| (e, ctx.span()));
-
-        // Unary
-        let unary = just(InterpToken::Not)
-            .to(UnaryOp::Not)
-            .or(just(InterpToken::Minus).to(UnaryOp::Neg))
-            .repeated()
-            .foldr_with(primary, |op, e, ctx| {
-                (Expr::Unary(op, Box::new(e)), ctx.span())
-            });
-
-        // Multiplicative
-        let op = just(InterpToken::Star)
-            .to(BinaryOp::Mul)
-            .or(just(InterpToken::Slash).to(BinaryOp::Div))
-            .or(just(InterpToken::Percent).to(BinaryOp::Mod));
-        let multiplicative = unary.clone().foldl_with(op.then(unary).repeated(), |a, (op, b), e| {
-            (Expr::Binary(Box::new(a), op, Box::new(b)), e.span())
-        });
-
-        // Additive
-        let op = just(InterpToken::Plus)
-            .to(BinaryOp::Add)
-            .or(just(InterpToken::Minus).to(BinaryOp::Sub));
-        let additive = multiplicative
-            .clone()
-            .foldl_with(op.then(multiplicative).repeated(), |a, (op, b), e| {
-                (Expr::Binary(Box::new(a), op, Box::new(b)), e.span())
-            });
-
-        // Comparison
-        let op = just(InterpToken::Lt)
-            .to(BinaryOp::Lt)
-            .or(just(InterpToken::Gt).to(BinaryOp::Gt))
-            .or(just(InterpToken::LtEq).to(BinaryOp::LtEq))
-            .or(just(InterpToken::GtEq).to(BinaryOp::GtEq));
-        let comparison = additive
-            .clone()
-            .foldl_with(op.then(additive).repeated(), |a, (op, b), e| {
-                (Expr::Binary(Box::new(a), op, Box::new(b)), e.span())
-            });
-
-        // Equality
-        let op = just(InterpToken::Eq)
-            .to(BinaryOp::Eq)
-            .or(just(InterpToken::NotEq).to(BinaryOp::NotEq));
-        let equality = comparison
-            .clone()
-            .foldl_with(op.then(comparison).repeated(), |a, (op, b), e| {
-                (Expr::Binary(Box::new(a), op, Box::new(b)), e.span())
-            });
-
-        // Logical AND
-        let and_expr = equality.clone().foldl_with(
-            just(InterpToken::And).ignore_then(equality).repeated(),
-            |a, b, e| (Expr::Binary(Box::new(a), BinaryOp::And, Box::new(b)), e.span()),
-        );
-
-        // Logical OR
-        and_expr.clone().foldl_with(
-            just(InterpToken::Or).ignore_then(and_expr).repeated(),
-            |a, b, e| (Expr::Binary(Box::new(a), BinaryOp::Or, Box::new(b)), e.span()),
-        )
-    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ast::{BinaryOp, UnaryOp};
 
     fn parse_ok(input: &str) -> StringLiteral<'_> {
         parse_interpolated_string(input, 0).expect("expected successful parse")
@@ -568,6 +331,52 @@ mod tests {
     }
 
     #[test]
+    fn test_keyword_variable_names_in_interpolation() {
+        // `limit` is a statement keyword, but a fine variable name inside
+        // an interpolation
+        let result = parse_ok("{$limit}");
+        match &result.parts[0] {
+            StringPart::Interpolation((expr, _)) => {
+                assert_eq!(*expr, Expr::Variable("limit"));
+            }
+            _ => panic!("Expected Interpolation"),
+        }
+    }
+
+    #[test]
+    fn test_division_in_interpolation() {
+        // Regex literals are disabled inside interpolations, so unspaced
+        // division with multiple slashes works
+        let result = parse_ok("{$a/$b/$c}");
+        match &result.parts[0] {
+            StringPart::Interpolation((expr, _)) => {
+                assert!(matches!(expr, Expr::Binary(_, BinaryOp::Div, _)));
+            }
+            _ => panic!("Expected Interpolation"),
+        }
+    }
+
+    #[test]
+    fn test_unique_function() {
+        let result = parse_ok("user{unique()}@example.test");
+        assert_eq!(result.parts.len(), 3);
+        match &result.parts[0] {
+            StringPart::Text(s) => assert_eq!(*s, "user"),
+            _ => panic!("Expected Text"),
+        }
+        match &result.parts[1] {
+            StringPart::Interpolation((expr, _)) => {
+                assert!(matches!(expr, Expr::Unique));
+            }
+            _ => panic!("Expected Interpolation with Unique"),
+        }
+        match &result.parts[2] {
+            StringPart::Text(s) => assert_eq!(*s, "@example.test"),
+            _ => panic!("Expected Text"),
+        }
+    }
+
+    #[test]
     fn test_complex_expression() {
         let result = parse_ok("{$a * 2 + $b}");
         assert_eq!(result.parts.len(), 1);
@@ -601,26 +410,6 @@ mod tests {
         // "/"
         match &result.parts[4] {
             StringPart::Text(s) => assert_eq!(*s, "/"),
-            _ => panic!("Expected Text"),
-        }
-    }
-
-    #[test]
-    fn test_unique_function() {
-        let result = parse_ok("user{unique()}@example.test");
-        assert_eq!(result.parts.len(), 3);
-        match &result.parts[0] {
-            StringPart::Text(s) => assert_eq!(*s, "user"),
-            _ => panic!("Expected Text"),
-        }
-        match &result.parts[1] {
-            StringPart::Interpolation((expr, _)) => {
-                assert!(matches!(expr, Expr::Unique));
-            }
-            _ => panic!("Expected Interpolation with Unique"),
-        }
-        match &result.parts[2] {
-            StringPart::Text(s) => assert_eq!(*s, "@example.test"),
             _ => panic!("Expected Text"),
         }
     }

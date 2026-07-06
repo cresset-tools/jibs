@@ -2,50 +2,59 @@
 //!
 //! A domain-specific language for directing MySQL database imports from remote
 //! (production) databases to local development environments.
-
-use chumsky::prelude::*;
+//!
+//! The lexer and parser are hand-written (recursive descent). An earlier
+//! chumsky-based implementation took ~9 minutes to compile in debug mode due
+//! to combinator type blowup; this one compiles in seconds and gives us full
+//! control over error messages and recovery.
 
 pub mod ast;
 pub mod interpolation;
 pub mod lexer;
 pub mod parser;
 
-/// A span in the source code
-pub type Span = SimpleSpan;
+/// A span in the source code (byte offsets)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct Span {
+    pub start: usize,
+    pub end: usize,
+}
+
+impl Span {
+    pub fn new(start: usize, end: usize) -> Self {
+        Self { start, end }
+    }
+
+    pub fn into_range(self) -> std::ops::Range<usize> {
+        self.start..self.end
+    }
+}
+
+impl From<std::ops::Range<usize>> for Span {
+    fn from(r: std::ops::Range<usize>) -> Self {
+        Self { start: r.start, end: r.end }
+    }
+}
+
+impl std::fmt::Display for Span {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}..{}", self.start, self.end)
+    }
+}
 
 /// Parse a DSL source string into an AST
 pub fn parse(source: &str) -> Result<ast::Program<'_>, Vec<ParseError>> {
-    let (tokens, lex_errors) = lexer::lexer().parse(source).into_output_errors();
+    let (tokens, mut errors) = lexer::lex(source);
 
-    let mut errors: Vec<ParseError> = lex_errors
-        .into_iter()
-        .map(|e| ParseError {
-            span: e.span().into_range(),
-            message: e.to_string(),
-        })
-        .collect();
+    let eoi = Span::new(source.len(), source.len());
+    let (program, parse_errors) = parser::parse_tokens(&tokens, eoi);
+    errors.extend(parse_errors);
 
-    if let Some(tokens) = tokens {
-        let len = source.len();
-        let (ast, parse_errors) = parser::parser()
-            .parse(
-                tokens
-                    .as_slice()
-                    .map((len..len).into(), |(t, s)| (t, s)),
-            )
-            .into_output_errors();
-
-        errors.extend(parse_errors.into_iter().map(|e| ParseError {
-            span: e.span().into_range(),
-            message: e.to_string(),
-        }));
-
-        if errors.is_empty() {
-            return Ok(ast.unwrap());
-        }
+    if errors.is_empty() {
+        Ok(program)
+    } else {
+        Err(errors)
     }
-
-    Err(errors)
 }
 
 /// A parse error with span information
