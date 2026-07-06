@@ -6,7 +6,7 @@ Uses schema-relations.py logic to discover relations (explicit FK + inferred),
 then categorizes tables and adds anonymization rules.
 
 Usage:
-    python3 scripts/generate-magento-jibs.py magento-default-schema.sql > magento.jibs
+    python3 scripts/generate-magento-jibs.py your-schema.sql > shop.jibs
 """
 
 import re

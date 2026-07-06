@@ -1,8 +1,11 @@
-// Magento 2 import configuration
-// Generated from schema dump - review and adjust as needed
+// Magento 2 (Open Source) import configuration
 //
-// 411 tables: 302 imported, 92 schema-only, 17 ignored
-// 582 relations (407 explicit FK, 175 inferred)
+// Generated with scripts/generate-magento-jibs.py from a stock Magento 2
+// schema and curated by hand. Covers the core tables every Magento 2 install
+// has; regenerate against your own schema dump to pick up the tables of your
+// installed third-party modules:
+//
+//     python3 scripts/generate-magento-jibs.py your-schema.sql > shop.jibs
 
 // ─── Variables ───
 var admin_password_hash: string = "$2y$10$placeholder"
@@ -50,19 +53,19 @@ faker fake_streets [
 ]
 
 faker fake_phones [
-    "+31600000001",
-    "+31600000002",
-    "+31600000003",
-    "+31600000004",
-    "+31600000005"
+    "+15550100001",
+    "+15550100002",
+    "+15550100003",
+    "+15550100004",
+    "+15550100005"
 ]
 
 faker fake_postcodes [
-    "1000AA",
-    "2000BB",
-    "3000CC",
-    "4000DD",
-    "5000EE"
+    "10001",
+    "20002",
+    "30003",
+    "40004",
+    "50005"
 ]
 
 // ─── Table relations ───
@@ -78,7 +81,6 @@ relation sales_creditmemo_comment.user_id -> admin_user.user_id
 relation sales_invoice_comment.user_id -> admin_user.user_id
 relation sales_shipment_comment.user_id -> admin_user.user_id
 
-relation braintree_credit_prices.product_id -> catalog_product_entity.entity_id
 relation cataloginventory_stock_status.product_id -> catalog_product_entity.entity_id
 relation catalogrule_product.product_id -> catalog_product_entity.entity_id
 relation catalogrule_product_price.product_id -> catalog_product_entity.entity_id
@@ -107,7 +109,6 @@ relation customer_visitor.customer_id -> customer_entity.entity_id
 relation gift_message.customer_id -> customer_entity.entity_id
 relation login_as_customer.customer_id -> customer_entity.entity_id
 relation magento_login_as_customer_log.customer_id -> customer_entity.entity_id
-relation mollie_pending_payment_reminder.customer_id -> customer_entity.entity_id
 relation newsletter_subscriber.customer_id -> customer_entity.entity_id
 relation quote.customer_id -> customer_entity.entity_id
 relation quote_address.customer_id -> customer_entity.entity_id
@@ -159,17 +160,12 @@ relation sales_order_payment.quote_payment_id -> quote_payment.payment_id
 
 relation rating_option_vote.rating_id -> rating.rating_id
 
-relation mollie_order_lines.order_id -> sales_order.entity_id
-relation mollie_payment_transaction_to_order.order_id -> sales_order.entity_id
-relation mollie_pending_payment_reminder.order_id -> sales_order.entity_id
-relation mollie_sent_payment_reminder.order_id -> sales_order.entity_id
 relation sales_creditmemo_grid.order_id -> sales_order.entity_id
 relation sales_invoice_grid.order_id -> sales_order.entity_id
 relation sales_order_tax.order_id -> sales_order.entity_id
 relation sales_shipment_grid.order_id -> sales_order.entity_id
 relation sales_shipment_track.order_id -> sales_order.entity_id
 
-relation amasty_amshopby_option_setting.store_id -> store.store_id
 relation catalog_product_bundle_option_value.store_id -> store.store_id
 relation design_config_grid_flat.store_id -> store.store_id
 relation paypal_settlement_report_row.store_id -> store.store_id
@@ -251,28 +247,10 @@ exclude_data newsletter_queue_link
 exclude_data newsletter_queue_store_link
 exclude_data newsletter_problem
 
-// ─── Extension tables (common in Dutch Magento shops) ───
-exclude_data /^aw_arep/
-exclude_data /^aw_fue2/
-exclude_data /^aw_onsale_rule_product/
-exclude_data /^mst_cache_warmer_page/
-exclude_data /^amasty_geoip_block/
-exclude_data /^amasty_geoip_location/
-exclude_data /^amasty_blog_views/
-exclude_data /^amasty_xsearch_users_search/
-exclude_data /^amasty_conditions_quote/
-exclude_data /^channable_/
-exclude_data /^dealer4dealer_/
-exclude_data /^elasticsuite_tracker_/
-exclude_data /^fme_/
-exclude_data /^kl_/
-exclude_data /^mageplaza_smtp_abandonedcart/
-exclude_data /^mailchimp_/
-exclude_data /^mm_webforms_result/
-exclude_data /^mollie_/
-exclude_data /^vendic_/
-exclude_data /^xtento_orderexport_profile_history/
-exclude_data /^mc_api_queue/
+// ─── Third-party module tables ───
+// Add exclude_data patterns here for your installed modules' log, queue,
+// and analytics tables (payment providers, feed exporters, email marketing,
+// search trackers, ...). Regenerating from your schema dump suggests these.
 
 // ─── Full imports for reference tables ───
 full review_entity, review_status
@@ -403,7 +381,7 @@ anonymize sales_shipment_grid {
 aggregate products {
     root catalog_product_entity
     where "FALSE"
-    exclude /^sales_/, /^quote/, /^yotpo_/, /^customer_/, /^url_rewrite/
+    exclude /^sales_/, /^quote/, /^customer_/, /^url_rewrite/
 }
 
 get product_by_sku (sku: string) {
