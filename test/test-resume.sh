@@ -34,19 +34,22 @@ docker exec jibs-local mysql -u root -plocal_root_pass -e "
 echo "Preserved row created:"
 docker exec jibs-local mysql -u root -plocal_root_pass imported -e "SELECT * FROM users"
 
-# Step 1: Run import with --fail-after-tables 4
-# Table order is: order_items, orders, products, users
-# We fail after users (table 4) so the backup table exists but restore hasn't happened
+# Step 1: Run import with --fail-after-tables 8
+# 8 = all checkpointed tables (9 seed tables minus ignored sessions). With
+# parallel loading the completion order is a race, so any smaller value can
+# crash before users was reached, leaving no backup table. After the last
+# checkpoint the crash still precedes post-processing, so _jibs_preserve_users
+# exists and the restore hasn't happened.
 echo ""
-echo "=== Step 1: Run import with --fail-after-tables 4 ==="
-echo "(This should fail after users table, leaving _jibs_preserve_users)"
+echo "=== Step 1: Run import with --fail-after-tables 8 ==="
+echo "(This should fail after the last table, leaving _jibs_preserve_users)"
 ./target/debug/jibs import test/import-resume-test.jibs \
     --host testuser@localhost \
     --port 2222 \
     --identity test/ssh-keys/id_ed25519 \
     --remote-mysql "mysql://jibs:jibs_pass@mysql-remote:3306/production" \
     --local-mysql "mysql://root:local_root_pass@localhost:3308/imported" \
-    --fail-after-tables 4 2>&1 || echo "(Expected failure)"
+    --fail-after-tables 8 2>&1 || echo "(Expected failure)"
 
 # Step 2: Check backup tables exist
 echo ""
