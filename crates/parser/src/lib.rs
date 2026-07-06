@@ -57,6 +57,44 @@ pub fn parse(source: &str) -> Result<ast::Program<'_>, Vec<ParseError>> {
     }
 }
 
+/// Render parse errors as human-readable reports with source snippets,
+/// line/column numbers, and labeled spans.
+///
+/// `color` enables ANSI colors (pass `stderr().is_terminal()` for CLI use,
+/// `false` when embedding the result in an error message or log).
+pub fn render_errors(filename: &str, source: &str, errors: &[ParseError], color: bool) -> String {
+    use ariadne::{Color, Config, Label, Report, ReportKind, Source};
+
+    // ariadne 0.4 indexes by character, our spans are byte offsets
+    let byte_to_char = |byte: usize| -> usize {
+        let mut byte = byte.min(source.len());
+        while byte > 0 && !source.is_char_boundary(byte) {
+            byte -= 1;
+        }
+        source[..byte].chars().count()
+    };
+
+    let mut out = Vec::new();
+    for error in errors {
+        let range = byte_to_char(error.span.start)..byte_to_char(error.span.end);
+        let result = Report::build(ReportKind::Error, filename, range.start)
+            .with_config(Config::default().with_color(color))
+            .with_message(&error.message)
+            .with_label(
+                Label::new((filename, range))
+                    .with_message(&error.message)
+                    .with_color(Color::Red),
+            )
+            .finish()
+            .write((filename, Source::from(source)), &mut out);
+        if result.is_err() {
+            // Fall back to the plain message if rendering fails
+            out.extend_from_slice(format!("{}\n", error).as_bytes());
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 /// A parse error with span information
 #[derive(Debug, Clone)]
 pub struct ParseError {
@@ -71,3 +109,28 @@ impl std::fmt::Display for ParseError {
 }
 
 impl std::error::Error for ParseError {}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn render_errors_shows_snippet_and_location() {
+        let source = "var x: int = 99999999999999999999\n";
+        let errors = crate::parse(source).unwrap_err();
+        let rendered = crate::render_errors("test.jibs", source, &errors, false);
+        assert!(rendered.contains("out of range"), "message: {}", rendered);
+        assert!(rendered.contains("test.jibs:1:14"), "location: {}", rendered);
+        assert!(rendered.contains("var x: int ="), "snippet: {}", rendered);
+    }
+
+    #[test]
+    fn render_errors_handles_non_ascii_sources() {
+        // The error span sits after multibyte characters; ariadne indexes by
+        // character, so byte offsets must be converted (this used to panic
+        // or misplace labels)
+        let source = "// commentaire avec des caractères accentués\nvar x: int = 99999999999999999999\n";
+        let errors = crate::parse(source).unwrap_err();
+        let rendered = crate::render_errors("test.jibs", source, &errors, false);
+        assert!(rendered.contains("out of range"));
+        assert!(rendered.contains("test.jibs:2:14"), "location: {}", rendered);
+    }
+}

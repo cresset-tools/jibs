@@ -372,13 +372,9 @@ impl JsonResolver {
             // Parse as .jibs file using the DSL parser
             let program = jibs_parser::parse(&content).map_err(|errors| {
                 ClientError::Parse(format!(
-                    "Parse error in '{}': {}",
+                    "in imported file '{}':\n{}",
                     import_path,
-                    errors
-                        .iter()
-                        .map(|e| e.to_string())
-                        .collect::<Vec<_>>()
-                        .join(", ")
+                    jibs_parser::render_errors(import_path, &content, &errors, false)
                 ))
             })?;
 

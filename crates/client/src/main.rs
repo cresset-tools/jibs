@@ -366,13 +366,31 @@ fn run_check(args: CheckArgs) -> Result<()> {
                 Ok(())
             }
             Err(errors) => {
-                for error in &errors {
-                    eprintln!("Error: {}", error);
-                }
-                anyhow::bail!("Parse failed with {} errors", errors.len());
+                eprint!("{}", render_parse_errors(&args.config, &source, &errors));
+                anyhow::bail!(
+                    "{} parse error{} in {}",
+                    errors.len(),
+                    if errors.len() == 1 { "" } else { "s" },
+                    args.config.display()
+                );
             }
         }
     }
+}
+
+/// Render parse errors with source snippets (colored when stderr is a tty)
+fn render_parse_errors(
+    path: &std::path::Path,
+    source: &str,
+    errors: &[jibs_parser::ParseError],
+) -> String {
+    use std::io::IsTerminal;
+    jibs_parser::render_errors(
+        &path.display().to_string(),
+        source,
+        errors,
+        std::io::stderr().is_terminal(),
+    )
 }
 
 fn run_plan(args: PlanArgs) -> Result<()> {
@@ -407,13 +425,12 @@ fn run_plan(args: PlanArgs) -> Result<()> {
         let source = std::fs::read_to_string(&args.config)?;
 
         let program = jibs_parser::parse(&source).map_err(|errors| {
+            eprint!("{}", render_parse_errors(&args.config, &source, &errors));
             anyhow::anyhow!(
-                "Parse failed: {}",
-                errors
-                    .iter()
-                    .map(|e| e.to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                "{} parse error{} in {}",
+                errors.len(),
+                if errors.len() == 1 { "" } else { "s" },
+                args.config.display()
             )
         })?;
 

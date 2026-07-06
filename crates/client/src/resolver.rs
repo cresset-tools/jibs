@@ -179,13 +179,9 @@ impl Resolver {
 
         let program = jibs_parser::parse(&source).map_err(|errors| {
             ClientError::Parse(format!(
-                "Parse error in '{}': {}",
+                "in imported file '{}':\n{}",
                 import_path,
-                errors
-                    .iter()
-                    .map(|e| e.to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                jibs_parser::render_errors(import_path, &source, &errors, false)
             ))
         })?;
 

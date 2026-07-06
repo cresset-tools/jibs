@@ -635,12 +635,16 @@ pub async fn run_import(config: ImportConfig) -> Result<()> {
             let source = std::fs::read_to_string(config_path)?;
             let program = jibs_parser::parse(&source).map_err(|errors| {
                 anyhow::anyhow!(
-                    "Parse failed: {}",
-                    errors
-                        .iter()
-                        .map(|e| e.to_string())
-                        .collect::<Vec<_>>()
-                        .join(", ")
+                    "{} parse error{} in {}:\n{}",
+                    errors.len(),
+                    if errors.len() == 1 { "" } else { "s" },
+                    config_path.display(),
+                    jibs_parser::render_errors(
+                        &config_path.display().to_string(),
+                        &source,
+                        &errors,
+                        false,
+                    )
                 )
             })?;
 
