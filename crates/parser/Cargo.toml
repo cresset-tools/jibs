@@ -3,7 +3,13 @@ name = "jibs_parser"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "Parser for the Jibs DSL"
 
 [dependencies]
 ariadne.workspace = true
+
+# Not distributed: the server is embedded in the client, the parser bin is a
+# debug tool, the protocol crate is a library.
+[package.metadata.dist]
+dist = false

@@ -18,7 +18,7 @@ cargo zigbuild -p jibs_server --release --target x86_64-unknown-linux-musl
 
 # Build client (native)
 echo "Building client..."
-cargo build --release -p jibs_client
+cargo build --release -p jibs
 
 echo "Build complete!"
 echo "Server binaries:"

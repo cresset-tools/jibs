@@ -3,6 +3,7 @@ name = "jibs_protocol"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "Protocol types for Jibs client-server communication"
 
 [dependencies]
@@ -12,3 +13,8 @@ serde = { workspace = true, optional = true }
 [features]
 default = []
 serde = ["dep:serde"]
+
+# Not distributed: the server is embedded in the client, the parser bin is a
+# debug tool, the protocol crate is a library.
+[package.metadata.dist]
+dist = false

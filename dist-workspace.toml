@@ -1,0 +1,120 @@
+# dist configuration, following the shared cresset-tools pattern (see wick /
+# magequery). Produces per-target binary archives plus a shell installer.
+# release-please owns the whole release: it publishes the `jibs-v<version>`
+# GitHub Release (creating the tag), and the `release: published` event
+# triggers dist to build the binaries and upload them onto that release.
+#
+# jibs twist: the client embeds cross-compiled Linux musl `jibs-server`
+# binaries at build time (crates/client/build.rs). The github-build-setup
+# steps below build those on every runner (including macOS, via zig) before
+# dist builds the client, and JIBS_REQUIRE_EMBEDDED_SERVER=1 makes build.rs
+# fail hard if they are missing — a release can never ship a client with
+# empty embedded servers.
+#
+# Edit this file when adding targets / installers, then regenerate the
+# workflow with:
+#     dist generate
+# which rewrites .github/workflows/release.yml. NOTE: `dist generate` emits an
+# `on: push: tags` trigger; we hand-edit it to `on: release: published`
+# (release-please creates tags via the API, which doesn't reliably fire
+# `push`). Re-apply that trigger edit after any regenerate. `allow-dirty =
+# ["ci"]` tells dist we own that file so its `generate --check` won't abort.
+
+[workspace]
+members = ["cargo:."]
+
+[dist]
+# Pin the dist version CI runs. Bumps come through PRs so the generated
+# release.yml stays in lockstep.
+cargo-dist-version = "0.32.0"
+
+# CI provider.
+ci = "github"
+
+# `curl ... | sh` installer. No PowerShell installer: the client shells out
+# to the system OpenSSH binary and is untested on Windows, so we don't ship
+# Windows binaries (yet).
+installers = ["shell"]
+
+# Archive format.
+unix-archive = ".tar.gz"
+
+# Target triples we ship prebuilt client binaries for. Linux gets both gnu
+# and musl (older distros and Alpine both work); macOS is Apple Silicon.
+# The *embedded server* targets are fixed (x86_64 + aarch64 Linux musl,
+# built in github-build-setup) regardless of the client target.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "x86_64-unknown-linux-musl",
+    "aarch64-apple-darwin",
+]
+
+# Keep the tarballs to just the binary the installer drops on PATH.
+auto-includes = false
+
+# release-please publishes the GitHub Release (with the changelog body) and
+# creates the tag; dist only attaches the built binaries.
+create-release = false
+
+# We hand-edit release.yml's trigger to `on: release: published`, so tell dist
+# we own the CI file and skip its `generate --check`.
+allow-dirty = ["ci"]
+
+# Don't run dist on PRs. CI already covers building.
+pr-run-mode = "skip"
+
+# release-please tags as `jibs-v<version>` rather than the bare `v<version>`
+# dist defaults to.
+tag-namespace = "jibs"
+
+# Where the shell installer drops the binary. Matches uv's layout so installs
+# land on PATH without extra config.
+install-path = ["$XDG_BIN_HOME/", "$XDG_DATA_HOME/../bin", "~/.local/bin"]
+
+# Mirror first, GitHub fallback. The "simple" host MUST be listed in `hosting`
+# for it to reach the generated installer. Order here is the download
+# precedence the shell installer uses (try the mirror, fall back to the
+# GitHub release if it's offline / hasn't ingested the new tag yet). Shared
+# cresset origin mirror (origin.bougie.tools; see publish-mirror.yml +
+# cresset-tools/infra).
+hosting = ["simple", "github"]
+simple-download-url = "https://releases.bougie.tools/github/jibs/releases/download/{tag}"
+
+# Extra steps injected into every build-local-artifacts job BEFORE the dist
+# build: cross-compile the musl server binaries the client embeds.
+github-build-setup = "build-setup.yml"
+
+# Run publish-mirror after the release is announced to fan the dist artifacts
+# out to the origin server. (release.yml is hand-edited, so this also exists
+# as an explicit `custom-publish-mirror` job there; keep them in sync.)
+post-announce-jobs = ["./publish-mirror"]
+
+# publish-mirror only needs to read the uploaded artifacts.
+github-custom-job-permissions = { "publish-mirror" = { contents = "read" } }
+
+# What the installer prints after a successful install.
+install-success-msg = """
+jibs is installed!
+
+Get started:
+
+    jibs check your-config.jibs        validate a configuration
+    jibs import your-config.jibs \\
+        --host user@prod --dry-run     see what an import would do
+
+Docs: https://github.com/cresset-tools/jibs/blob/main/SPEC.md
+"""
+
+# The bundled MySQL client compiles C (mysql_common -> cc/cmake), and zstd
+# compiles C too. musl-tools provides the musl-targeting C compiler for the
+# static Linux client build. (The embedded musl servers are cross-compiled
+# with zig instead — see build-setup.yml.)
+[dist.dependencies.apt]
+cmake = '*'
+musl-tools = '*'
+
+[dist.dependencies.homebrew]
+cmake = '*'
+
+[dist.binaries]
+"*" = ["jibs"]
