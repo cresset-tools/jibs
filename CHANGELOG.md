@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.0](https://github.com/cresset-tools/jibs/compare/jibs-v0.3.0...jibs-v0.4.0) (2026-07-06)
+
+
+### Features
+
+* publish container images to GHCR on release ([#24](https://github.com/cresset-tools/jibs/issues/24)) ([a974a68](https://github.com/cresset-tools/jibs/commit/a974a6885cb8e78f9d618979ae569a19be25fac5))
+
 ## [0.3.0](https://github.com/cresset-tools/jibs/compare/jibs-v0.2.1...jibs-v0.3.0) (2026-07-06)
 
 
