@@ -15,7 +15,10 @@ pub use handshake::{
     encode_preamble, read_preamble, validate_preamble, write_preamble, HandshakeError,
     PREAMBLE_LEN, PROTOCOL_MAGIC, PROTOCOL_VERSION,
 };
-pub use messages::{ClientMessage, QueryTiming, ServerMessage, ServerMetrics, TableDisposition};
+pub use messages::{
+    AggregateRootCount, ClientMessage, QueryTiming, ServerMessage, ServerMetrics,
+    TableDisposition,
+};
 pub use plan::{
     AnonymizeRule, AnonymizeTarget, Assignment, ColumnDef, ColumnFlags, CompressionMode,
     ExecutionPlan, PreserveRule, Relation, ResolvedAggregate, SetRule, SortDirection, TableInfo,

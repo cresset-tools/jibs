@@ -96,6 +96,10 @@ pub enum ClientMessage {
         parallel: u32,
         /// Whether to collect detailed timing metrics
         collect_metrics: bool,
+        /// Dry run: classify tables and count matching aggregate root rows,
+        /// but don't stream any data. The server replies with Ready followed
+        /// by DryRunReport and exits.
+        dry_run: bool,
     },
     /// Start streaming data
     Start,
@@ -142,4 +146,23 @@ pub enum ServerMessage {
     },
     /// Error occurred
     Error { message: String, recoverable: bool },
+    /// Dry run result: what the import would do, without streaming any data
+    DryRunReport {
+        /// How each table would be handled (by interned table_id).
+        /// Aggregate means traversal-reachable — the actual row selection
+        /// depends on the data. Ignored tables are absent entirely.
+        table_dispositions: Vec<(u16, TableDisposition)>,
+        /// Per aggregate: how many root rows currently match its where clause
+        root_counts: Vec<AggregateRootCount>,
+    },
+}
+
+/// Matching root row count for one aggregate (dry run)
+#[derive(Debug, Clone, Encode, Decode)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct AggregateRootCount {
+    /// Aggregate name from the plan
+    pub aggregate: String,
+    /// Rows in the root table matching the where clause (before limit)
+    pub matching_rows: u64,
 }

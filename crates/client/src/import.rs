@@ -11,8 +11,8 @@ use mysql::{Conn, LocalInfileHandler, Opts};
 use tracing::{debug, info, warn};
 
 use jibs_protocol::{
-    ClientMessage, ColumnDef, CompressionMode, ExecutionPlan, MessageWriter, PreserveRule,
-    ServerMessage, ServerMetrics, SetRule, Value,
+    AggregateRootCount, ClientMessage, ColumnDef, CompressionMode, ExecutionPlan, MessageWriter,
+    PreserveRule, ServerMessage, ServerMetrics, SetRule, TableDisposition, TableInfo, Value,
 };
 
 use crate::metrics::ClientMetrics;
@@ -579,6 +579,8 @@ pub struct ImportConfig {
     pub var_file: Option<PathBuf>,
     pub resume: bool,
     pub clean: bool,
+    /// Report what would be imported without touching the local database
+    pub dry_run: bool,
     pub parallel: usize,
     /// Number of client-side loader pool workers (None = use `parallel` value)
     pub client_parallel: Option<usize>,
@@ -686,6 +688,11 @@ pub async fn run_import(config: ImportConfig) -> Result<()> {
 
     // Deploy server binary if needed
     let server_path = deploy_server(&session).await?;
+
+    // Dry run: ask the server what would happen; never touch the local DB
+    if config.dry_run {
+        return run_dry_run(&config, &session, &server_path, plan).await;
+    }
 
     // Connect to local MySQL
     info!(
@@ -1382,6 +1389,7 @@ async fn run_protocol_inner(
         compression: config.compression,
         parallel: config.parallel,
         collect_metrics: config.collect_metrics,
+        dry_run: false,
     };
     send_message(&mut server, &mut encoder, &init_msg).await?;
 
@@ -1805,6 +1813,12 @@ async fn run_protocol_inner(
             ServerMessage::Ready { .. } => {
                 return Err(anyhow::anyhow!("Unexpected Ready message"));
             }
+
+            ServerMessage::DryRunReport { .. } => {
+                return Err(anyhow::anyhow!(
+                    "Unexpected DryRunReport message (dry_run was not requested)"
+                ));
+            }
         }
     }
 
@@ -1841,6 +1855,166 @@ async fn run_protocol_inner(
     send_message_writer(&mut writer, &mut encoder, &ClientMessage::Shutdown).await?;
 
     Ok(())
+}
+
+/// Dry run: start the remote server with dry_run set, print what the import
+/// would do, and exit without ever connecting to the local database.
+async fn run_dry_run(
+    config: &ImportConfig,
+    session: &SshSession,
+    server_path: &str,
+    plan: ExecutionPlan,
+) -> Result<()> {
+    info!("Starting remote server (dry run): {}", server_path);
+    let mut server = session.start_process(server_path).await?;
+
+    perform_handshake(&mut server).await?;
+
+    let mut encoder: MessageWriter<()> = MessageWriter::with_capacity(4096, ());
+    send_message(
+        &mut server,
+        &mut encoder,
+        &ClientMessage::Credentials { mysql_url: config.remote_mysql.clone() },
+    )
+    .await?;
+    send_message(
+        &mut server,
+        &mut encoder,
+        &ClientMessage::Init {
+            plan: plan.clone(),
+            compression: config.compression,
+            parallel: 1,
+            collect_metrics: false,
+            dry_run: true,
+        },
+    )
+    .await?;
+
+    let tables = match recv_message(&mut server, config.max_message_size).await? {
+        ServerMessage::Ready { tables, .. } => tables,
+        ServerMessage::Error { message, .. } => {
+            return Err(anyhow::anyhow!("Server error: {}", message))
+        }
+        other => return Err(anyhow::anyhow!("Unexpected message: {:?}", other)),
+    };
+
+    let (dispositions, root_counts) = match recv_message(&mut server, config.max_message_size)
+        .await?
+    {
+        ServerMessage::DryRunReport { table_dispositions, root_counts } => {
+            (table_dispositions, root_counts)
+        }
+        ServerMessage::Error { message, .. } => {
+            return Err(anyhow::anyhow!("Server error: {}", message))
+        }
+        other => return Err(anyhow::anyhow!("Unexpected message: {:?}", other)),
+    };
+
+    print_dry_run_report(&plan, &tables, &dispositions, &root_counts);
+    Ok(())
+}
+
+/// Print what an import would do, based on the server's dry-run report
+fn print_dry_run_report(
+    plan: &ExecutionPlan,
+    tables: &[TableInfo],
+    dispositions: &[(u16, TableDisposition)],
+    root_counts: &[AggregateRootCount],
+) {
+    let by_id: HashMap<u16, &TableInfo> = tables.iter().map(|t| (t.table_id, t)).collect();
+
+    println!();
+    println!("DRY RUN — no changes were made to the local database");
+
+    if !root_counts.is_empty() {
+        println!();
+        println!("Aggregates:");
+        for count in root_counts {
+            let agg = plan.aggregates.iter().find(|a| a.name == count.aggregate);
+            let mut line = format!("  {}", count.aggregate);
+            if let Some(agg) = agg {
+                line.push_str(&format!(" (root {})", agg.root_table));
+            }
+            line.push_str(&format!(": {} matching root row(s)", count.matching_rows));
+            if let Some(limit) = agg.and_then(|a| a.limit) {
+                if limit >= 0 && (limit as u64) < count.matching_rows {
+                    line.push_str(&format!(", limited to {}", limit));
+                }
+            }
+            println!("{}", line);
+            if let Some(where_clause) = agg.and_then(|a| a.where_clause.as_ref()) {
+                println!("      where {}", where_clause);
+            }
+        }
+    }
+
+    let mut aggregate_tables: Vec<&TableInfo> = Vec::new();
+    let mut full_tables: Vec<&TableInfo> = Vec::new();
+    let mut excluded_tables: Vec<&TableInfo> = Vec::new();
+    for (tid, disposition) in dispositions {
+        let Some(info) = by_id.get(tid) else { continue };
+        match disposition {
+            TableDisposition::Aggregate => aggregate_tables.push(info),
+            TableDisposition::Full | TableDisposition::Empty => full_tables.push(info),
+            TableDisposition::Excluded => excluded_tables.push(info),
+        }
+    }
+    aggregate_tables.sort_by(|a, b| a.name.cmp(&b.name));
+    full_tables.sort_by(|a, b| a.name.cmp(&b.name));
+    excluded_tables.sort_by(|a, b| a.name.cmp(&b.name));
+
+    if !aggregate_tables.is_empty() {
+        println!();
+        println!(
+            "Aggregate tables — rows selected by traversal ({}):",
+            aggregate_tables.len()
+        );
+        for table in &aggregate_tables {
+            println!("  {:<42} up to ~{} rows", table.name, table.estimated_rows);
+        }
+    }
+
+    if !full_tables.is_empty() {
+        let total: u64 = full_tables.iter().map(|t| t.estimated_rows).sum();
+        println!();
+        println!(
+            "Full tables — imported completely ({}, ~{} rows):",
+            full_tables.len(),
+            total
+        );
+        for table in &full_tables {
+            println!("  {:<42} ~{} rows", table.name, table.estimated_rows);
+        }
+    }
+
+    if !excluded_tables.is_empty() {
+        let names: Vec<&str> = excluded_tables.iter().map(|t| t.name.as_str()).collect();
+        println!();
+        println!(
+            "Excluded — structure only, no data ({}):",
+            excluded_tables.len()
+        );
+        println!("  {}", names.join(", "));
+    }
+
+    println!();
+    println!(
+        "Post-import: {} preserve rule(s), {} set block(s), {} after statement(s)",
+        plan.preserves.len(),
+        plan.sets.len(),
+        plan.after_statements.len()
+    );
+    if !plan.anonymization.is_empty() {
+        let mut summary: Vec<String> = plan
+            .anonymization
+            .iter()
+            .map(|(table, rules)| format!("{} ({} column(s))", table, rules.len()))
+            .collect();
+        summary.sort();
+        println!("Anonymization: {}", summary.join(", "));
+    }
+    println!();
+    println!("Row counts are estimates. Run again without --dry-run to import.");
 }
 
 /// Exchange protocol preambles with the remote server: send ours, then read

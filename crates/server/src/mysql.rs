@@ -281,6 +281,17 @@ impl MySqlConnection {
         self.primary_keys.get(table)
     }
 
+    /// Count rows in a table matching an optional WHERE clause (dry run)
+    pub fn count_rows(&mut self, table: &str, where_clause: Option<&str>) -> Result<u64> {
+        let mut query = format!("SELECT COUNT(*) FROM `{}`", escape_identifier(table));
+        if let Some(clause) = where_clause {
+            query.push_str(" WHERE ");
+            query.push_str(clause);
+        }
+        let count: Option<u64> = self.conn.query_first(&query)?;
+        Ok(count.unwrap_or(0))
+    }
+
     /// Execute a query and return a streaming iterator over rows.
     /// This avoids loading all rows into memory at once.
     pub fn query_iter(

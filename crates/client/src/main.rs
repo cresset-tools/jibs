@@ -126,6 +126,10 @@ struct ImportArgs {
     #[arg(long, conflicts_with = "clean")]
     resume: bool,
 
+    /// Show what would be imported without touching the local database
+    #[arg(long, conflicts_with_all = ["resume", "clean"])]
+    dry_run: bool,
+
     /// Clean up backup tables from a previous interrupted import and start fresh
     #[arg(long, conflicts_with = "resume")]
     clean: bool,
@@ -233,6 +237,7 @@ async fn run_import(args: ImportArgs) -> Result<()> {
         var_file: args.connection.var_file,
         resume: args.resume,
         clean: args.clean,
+        dry_run: args.dry_run,
         parallel: args.connection.parallel,
         client_parallel: args.connection.client_parallel,
         compression,
@@ -273,6 +278,7 @@ async fn run_get(args: GetArgs) -> Result<()> {
         var_file: args.connection.var_file,
         resume: false,
         clean: args.clean,
+        dry_run: false,
         parallel: args.connection.parallel,
         client_parallel: args.connection.client_parallel,
         compression,

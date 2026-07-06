@@ -46,6 +46,7 @@ fn test_echo_mode_parses_init_message() {
         compression: CompressionMode::None,
         parallel: 1,
         collect_metrics: false,
+        dry_run: false,
     };
 
     // Serialize the handshake preamble followed by the message
@@ -145,6 +146,7 @@ fn test_old_client_without_preamble_is_rejected() {
         compression: CompressionMode::None,
         parallel: 1,
         collect_metrics: false,
+        dry_run: false,
     };
     let mut buffer = Vec::new();
     write_message(&mut buffer, &init_msg).unwrap();
@@ -167,6 +169,7 @@ fn test_message_roundtrip() {
         compression: CompressionMode::Zstd,
         parallel: 4,
         collect_metrics: false,
+        dry_run: false,
     };
 
     let mut buffer = Vec::new();
@@ -181,6 +184,7 @@ fn test_message_roundtrip() {
             compression,
             parallel,
             collect_metrics: _,
+            dry_run: _,
         } => {
             assert_eq!(compression, CompressionMode::Zstd);
             assert_eq!(parallel, 4);

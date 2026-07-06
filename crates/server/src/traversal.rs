@@ -9,8 +9,9 @@ use jibs_protocol::MessageWriter;
 use mysql::{Row, Value as MySqlValue};
 
 use jibs_protocol::{
-    AnonymizeRule, ColumnDef, CompressionMode, ExecutionPlan, Relation, ResolvedAggregate,
-    ServerMessage, ServerMetrics, SortDirection, TableDisposition, RAW_CHUNK_HEADER_LEN,
+    AggregateRootCount, AnonymizeRule, ColumnDef, CompressionMode, ExecutionPlan, Relation,
+    ResolvedAggregate, ServerMessage, ServerMetrics, SortDirection, TableDisposition,
+    RAW_CHUNK_HEADER_LEN,
 };
 
 use crate::error::{Result, ServerError};
@@ -263,6 +264,63 @@ fn compute_potential_aggregate_tables(
     }
 
     Ok(potential)
+}
+
+/// Compute what an import would do, without streaming any data (dry run):
+/// classify every table the way stream_all_tables would, and count how many
+/// root rows currently match each aggregate's where clause.
+///
+/// Aggregate classification is the static reachability estimate — the actual
+/// rows imported depend on the data. Tables classified Full may turn out
+/// Empty at import time.
+pub fn compute_dry_run_report(
+    conn: &mut MySqlConnection,
+    plan: &ExecutionPlan,
+    table_ids: &HashMap<String, u16>,
+) -> Result<(Vec<(u16, TableDisposition)>, Vec<AggregateRootCount>)> {
+    let all_table_names_vec = conn.get_all_table_names()?;
+    let importable_tables: HashSet<String> = table_ids.keys().cloned().collect();
+    let potential_aggregate = compute_potential_aggregate_tables(plan, &importable_tables)?;
+
+    let mut dispositions: Vec<(u16, TableDisposition)> = Vec::new();
+    for table in &all_table_names_vec {
+        if plan.ignored_tables.contains(table) {
+            continue;
+        }
+        if plan.aggregates_only && !potential_aggregate.contains(table) {
+            continue;
+        }
+        let tid = table_ids[table];
+        let disposition = if plan.excluded_tables.contains(table) {
+            TableDisposition::Excluded
+        } else if potential_aggregate.contains(table) {
+            TableDisposition::Aggregate
+        } else {
+            TableDisposition::Full
+        };
+        dispositions.push((tid, disposition));
+    }
+    dispositions.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut root_counts = Vec::new();
+    for aggregate in &plan.aggregates {
+        // Same config validation as the real BFS, surfaced before any import
+        if !importable_tables.contains(&aggregate.root_table) {
+            return Err(ServerError::Config(format!(
+                "Aggregate '{}' root table '{}' is not importable \
+                 (it is ignored via ignore_table or does not exist)",
+                aggregate.name, aggregate.root_table
+            )));
+        }
+        let matching_rows =
+            conn.count_rows(&aggregate.root_table, aggregate.where_clause.as_deref())?;
+        root_counts.push(AggregateRootCount {
+            aggregate: aggregate.name.clone(),
+            matching_rows,
+        });
+    }
+
+    Ok((dispositions, root_counts))
 }
 
 // ============================================================================
