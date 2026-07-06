@@ -27,6 +27,69 @@ fn collect_jibs_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// Extract ```jibs fenced code blocks from a markdown file.
+/// Returns (starting line number, block content) pairs.
+fn extract_jibs_blocks(markdown: &str) -> Vec<(usize, String)> {
+    let mut blocks = Vec::new();
+    let mut current: Option<(usize, String)> = None;
+    for (i, line) in markdown.lines().enumerate() {
+        match &mut current {
+            None => {
+                if line.trim() == "```jibs" {
+                    current = Some((i + 2, String::new()));
+                }
+            }
+            Some((_, content)) => {
+                if line.trim() == "```" {
+                    blocks.push(current.take().unwrap());
+                } else {
+                    content.push_str(line);
+                    content.push('\n');
+                }
+            }
+        }
+    }
+    blocks
+}
+
+/// Every ```jibs example in the documentation must parse — this is what
+/// keeps SPEC.md and GRAMMAR.md from drifting behind the language.
+#[test]
+fn all_doc_examples_parse() {
+    let root = repo_root();
+    let mut failures = Vec::new();
+    let mut total = 0;
+
+    for doc in ["SPEC.md", "GRAMMAR.md"] {
+        let path = root.join(doc);
+        let content = std::fs::read_to_string(&path).expect("read doc");
+        for (line, block) in extract_jibs_blocks(&content) {
+            total += 1;
+            if let Err(errors) = jibs_parser::parse(&block) {
+                let rendered: Vec<String> = errors.iter().map(|e| e.to_string()).collect();
+                failures.push(format!(
+                    "{}:{} (jibs block):\n  {}",
+                    doc,
+                    line,
+                    rendered.join("\n  ")
+                ));
+            }
+        }
+    }
+
+    assert!(
+        total >= 20,
+        "expected to find the docs' jibs examples, found only {}",
+        total
+    );
+    assert!(
+        failures.is_empty(),
+        "{} documentation example(s) failed to parse:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}
+
 #[test]
 fn all_repo_jibs_files_parse() {
     let root = repo_root();

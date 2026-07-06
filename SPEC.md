@@ -1,6 +1,12 @@
-# MySQL Import DSL Specification
+# Jibs DSL Specification
 
-A domain-specific language for directing MySQL database imports from remote (production) databases to local development environments.
+A domain-specific language for directing MySQL database imports from remote
+(production) databases to local development environments. Configuration files
+use the `.jibs` extension.
+
+Code examples in this document marked as `jibs` are parsed by the test suite
+(`crates/parser/tests/corpus.rs`), so they cannot drift from the
+implementation.
 
 ## Overview
 
@@ -9,8 +15,8 @@ This DSL enables:
 - Automatic foreign key relationship following (aggregates)
 - Manual soft relation definitions
 - Data anonymization with fake data
-- Incremental imports
-- Post-import transformations
+- On-demand fetches of specific rows (`get` functions)
+- Preserving local rows and post-import transformations
 - Conditional configuration
 
 ## Table of Contents
@@ -18,29 +24,31 @@ This DSL enables:
 1. [Variables](#variables)
 2. [String Interpolation](#string-interpolation)
 3. [Imports](#imports)
-5. [Faker Data Sources](#faker-data-sources)
-6. [Relations](#relations)
-7. [Anonymization](#anonymization)
-8. [Table Handling](#table-handling)
-9. [Aggregates](#aggregates)
-10. [Incremental Imports](#incremental-imports)
-11. [Preserve](#preserve)
-12. [Set (Upsert)](#set-upsert)
-13. [After Transformations](#after-transformations)
-14. [Conditionals](#conditionals)
-15. [Comments](#comments)
-16. [CLI Interface](#cli-interface)
-17. [Variable Files](#variable-files)
+4. [Faker Data Sources](#faker-data-sources)
+5. [Relations](#relations)
+6. [Anonymization](#anonymization)
+7. [Table Handling](#table-handling)
+8. [Aggregates](#aggregates)
+9. [Get Functions](#get-functions)
+10. [Preserve](#preserve)
+11. [Set (Upsert)](#set-upsert)
+12. [After Transformations](#after-transformations)
+13. [Conditionals](#conditionals)
+14. [Comments](#comments)
+15. [CLI Interface](#cli-interface)
+16. [Variable Files](#variable-files)
+17. [Complete Example](#complete-example)
 
 ---
 
 ## Variables
 
-Variables allow runtime configuration of the import. They are typed and can have default values.
+Variables allow runtime configuration of the import. They are typed and can
+have default values.
 
 ### Syntax
 
-```
+```text
 var <name>: <type>
 var <name>: <type> = <default_value>
 ```
@@ -54,24 +62,25 @@ var <name>: <type> = <default_value>
 | `bool` | Boolean | `true`, `false` |
 | `float` | Floating point | `3.14`, `-0.5` |
 | `string[]` | Array of strings | `["a", "b", "c"]` |
-| `int[]` | Array of integers | `[1, 2, 3]` |
+| `int[]` | Array of integers | `[1, -2, 3]` |
 | `bool[]` | Array of booleans | `[true, false]` |
-| `float[]` | Array of floats | `[1.5, 2.5]` |
+| `float[]` | Array of floats | `[1.5, -2.5]` |
 
 ### Examples
 
-```
+```jibs
 // Required variable (must be provided at runtime)
 var base_url: string
 
-// Variable with default value
+// Variables with default values
 var admin_email: string = "admin@local.test"
 var debug_mode: bool = false
 var order_limit: int = 100
 var tax_rate: float = 0.21
+var offset: int = -3
 
 // Array variables
-var test_emails: string[] = ["user1@test.com", "user2@test.com", "user3@test.com"]
+var test_emails: string[] = ["user1@test.com", "user2@test.com"]
 var allowed_ids: int[] = [1, 2, 3, 4, 5]
 var feature_flags: bool[] = [true, false, true]
 var discount_rates: float[] = [0.1, 0.15, 0.2]
@@ -81,7 +90,10 @@ var discount_rates: float[] = [0.1, 0.15, 0.2]
 
 Variables are referenced with the `$` prefix:
 
-```
+```jibs
+var order_limit: int = 100
+var base_url: string = "https://local.test/"
+
 aggregate orders {
     root sales_order
     limit $order_limit
@@ -93,30 +105,28 @@ set core_config_data {
 }
 ```
 
+A variable without a default must be provided at runtime with `--var` or
+`--var-file`, otherwise resolution fails. Values from `--var` are strings and
+are converted to the declared type.
+
 ---
 
 ## String Interpolation
 
-Strings support variable interpolation using `{$variable}` syntax. This allows building dynamic strings from variables and expressions.
+Strings support interpolation using `{$variable}` or `{expression}` syntax.
 
 ### Syntax
 
-```
+```text
 "text {$variable} more text"
 "text {$variable + 1} more text"
-"text {expression} more text"
 ```
 
 ### Basic Variable Interpolation
 
-```
+```jibs
 var base_domain: string = "example.com"
 var port: int = 8080
-
-set core_config_data {
-    match path = "web/secure/base_url", scope = "default", scope_id = 0
-    value = "https://{$base_domain}/"
-}
 
 set core_config_data {
     match path = "web/unsecure/base_url", scope = "default", scope_id = 0
@@ -135,22 +145,11 @@ All types are automatically converted to strings when interpolated:
 | `float` | Decimal representation (`3.14` → `"3.14"`) |
 | `bool` | `"true"` or `"false"` |
 
-```
-var order_limit: int = 100
-var debug: bool = true
-
-// Results in: "Importing 100 orders"
-set core_config_data {
-    match path = "import/status/message", scope = "default", scope_id = 0
-    value = "Importing {$order_limit} orders"
-}
-```
-
 ### Expressions in Interpolation
 
 Interpolation supports full expressions including arithmetic and comparisons:
 
-```
+```jibs
 var base_port: int = 8000
 var instance: int = 1
 
@@ -161,169 +160,117 @@ set core_config_data {
 }
 ```
 
-```
-var env: string = "staging"
-var version: int = 2
-
-// Build dynamic paths
-set core_config_data {
-    match path = "api/endpoint", scope = "default", scope_id = 0
-    value = "https://api-{$env}.example.com/v{$version}/"
-}
-```
-
 ### Supported Expression Operators
 
 | Type | Operators |
 |------|-----------|
 | Arithmetic | `+`, `-`, `*`, `/`, `%` |
-| String | `+` (concatenation inside interpolation) |
 | Comparison | `==`, `!=`, `>`, `<`, `>=`, `<=` |
-| Logical | `&&`, `||`, `!` |
+| Logical | `&&`, `\|\|`, `!` |
 | Grouping | `(`, `)` |
 
-### Complex Examples
+Statement keywords (like `limit` or `order`) are valid variable names inside
+interpolations: `"{$limit}"` works even though `limit` is a keyword in the
+statement grammar.
 
-**Building URLs with multiple components:**
-```
-var protocol: string = "https"
-var domain: string = "shop.example.com"
-var port: int = 443
-var path: string = "api/v2"
+### unique()
 
-set core_config_data {
-    match path = "api/base_url", scope = "default", scope_id = 0
-    value = "{$protocol}://{$domain}:{$port}/{$path}/"
+Inside faker pool values, `{unique()}` is replaced with an incrementing
+counter when rows are written, letting a small pool generate values that
+satisfy UNIQUE constraints:
+
+```jibs
+faker emails ["user{unique()}@example.test"]
+
+anonymize customer_entity {
+    email -> emails
 }
-```
-
-**Using in WHERE clauses:**
-```
-var category_base: int = 100
-var category_offset: int = 5
-
-aggregate products {
-    root catalog_product_entity
-    where "entity_id IN (
-        SELECT product_id
-        FROM catalog_category_product
-        WHERE category_id = {$category_base + $category_offset}
-    )"
-}
-```
-
-**Conditional string building (via ternary - if supported):**
-```
-var use_ssl: bool = true
-var domain: string = "example.com"
-
-// If ternary is supported:
-// value = "{$use_ssl ? "https" : "http"}://{$domain}/"
 ```
 
 ### Escaping
 
-To include a literal `{` in a string, escape it with a backslash:
+| Escape | Meaning |
+|--------|---------|
+| `\{` | Literal `{` (prevents interpolation) |
+| `\\` | Literal backslash |
+| `\"` | Literal double quote |
+| `\n` | Newline |
+| `\t` | Tab |
+| `\<other>` | Kept as-is (both characters) |
 
+Unknown escapes passing through unchanged means SQL escape sequences like
+`\%` in `LIKE` patterns reach MySQL untouched:
+
+```jibs
+preserve core_config_data where "path LIKE 'dev\_%'"
 ```
-value = "Use \{$variable} for interpolation"
-// Results in: "Use {$variable} for interpolation"
-```
+
+A `{` that does not start a valid interpolation is a parse error (with a
+`did you mean {$name}?` hint for the common `${name}` typo) — write `\{`
+for a literal brace.
 
 ### Where Interpolation Works
 
 String interpolation is supported in:
-- Variable default values
-- `where` clause strings
-- `set` block values
-- `match` clause string values
-- `after` block SQL statements
+- Variable default values (including string arrays)
+- `where` clause strings (aggregates, get functions, preserve)
+- `set` block values and `match` clause string values
 - `faker` list values
-- `import` paths
+- Strings inside `#[when(...)]` conditions
+
+It is **not** applied in:
+- `import` paths (raw strings)
+- `after` block SQL statements (raw strings, both `"..."` and `"""..."""`)
 
 ---
 
 ## Imports
 
-Import other DSL files to compose configurations. Useful for sharing common rules across projects.
+Import other `.jibs` files to compose configurations. Useful for sharing
+common rules across projects.
 
 ### Syntax
 
-```
+```text
 import "<path>"
 ```
 
-### Path Resolution
-
-1. Relative to the current file
-2. Relative to directories in `MYSQLIMPORT_INCLUDE_PATH` environment variable
-3. Relative to directories specified via `--include-dir` CLI flag
+Paths are resolved relative to the importing file. Import paths are raw
+strings: no interpolation is applied.
 
 ### Examples
 
-```
+```jibs
 // Import from same directory
-import "anonymization-rules.dsl"
+import "anonymization-rules.jibs"
 
 // Import from subdirectory
-import "magento/base.dsl"
-
-// Import shared configuration (resolved via include path)
-import "common/gdpr-anonymization.dsl"
-```
-
-### Composition Example
-
-**magento-base.dsl:**
-```
-faker names ["John", "Jane", "Bob", "Alice"]
-faker emails ["user1@example.test", "user2@example.test"]
-
-anonymize customer_entity {
-    email     -> emails
-    firstname -> names
-    lastname  -> names
-}
-
-ignore_table report_event
-ignore_table sales_bestsellers_aggregated_daily
-```
-
-**shop-specific.dsl:**
-```
-import "magento-base.dsl"
-
-var base_url: string
-var order_limit: int = 100
-
-aggregate orders {
-    root sales_order
-    limit $order_limit
-}
+import "magento/base.jibs"
 ```
 
 ### Import Resolution
 
-- **Circular imports are detected**: If file A imports B which imports A, an error is raised
-- **Diamond imports are allowed**: If A imports B and C, and both B and C import D, D is only processed once
-- **Resolution is depth-first**: Each import is fully resolved (including its nested imports) before proceeding to the next import statement
+- Each file is processed at most once: if a file is imported again (directly,
+  via a diamond `A -> B,C -> D`, or via a cycle), the repeat import is
+  silently skipped.
+- Resolution is depth-first: each import is fully resolved (including its
+  nested imports) before proceeding to the next statement.
 
 ### Statement Ordering
 
-When multiple files are involved via imports, statements are collected in depth-first order:
+When multiple files are involved, statements are collected in depth-first
+order:
 
 1. First import's statements (including its nested imports, depth-first)
-2. Second import's statements (including its nested imports, depth-first)
+2. Second import's statements (including its nested imports)
 3. ... and so on for each import in the file
 4. Current file's statements (top to bottom)
 
 This ordering affects:
-- **Variable declarations**: Later declarations can override earlier ones
-- **Faker definitions**: Later definitions with the same name override earlier ones
-- **Relation definitions**: All relations are collected and merged
-- **Anonymization rules**: Later rules for the same table override earlier ones
-- **Table handling** (`ignore_table`, `exclude_data`): Later rules override earlier ones
-- **After blocks**: Executed in collection order (see After Transformations section)
+- **Variable declarations**: later declarations with the same name override earlier ones
+- **Faker definitions**: later definitions with the same name override earlier ones
+- **Anonymization rules**: later rules for the same table override earlier ones
+- **After blocks**: executed in collection order (see [After Transformations](#after-transformations))
 
 ---
 
@@ -333,7 +280,7 @@ Define lists of fake data to use for anonymization.
 
 ### Syntax
 
-```
+```text
 // Inline array of values
 faker <name> [<value1>, <value2>, ...]
 
@@ -344,95 +291,81 @@ faker <name> $<variable>
 faker <name> [...$<variable>, <value>, ...]
 ```
 
-### Basic Examples
+### Examples
 
-```
+```jibs
 faker names ["John", "Jane", "Bob", "Alice", "Charlie", "Diana"]
-faker emails ["user1@example.test", "user2@example.test", "user3@example.test"]
+faker emails ["user1@example.test", "user2@example.test"]
 faker phones ["+31600000001", "+31600000002", "+31600000003"]
-faker streets ["123 Main St", "456 Oak Ave", "789 Pine Rd"]
-faker cities ["Amsterdam", "Rotterdam", "Utrecht", "Den Haag"]
-faker companies ["Acme Corp", "Globex Inc", "Initech", "Umbrella Co"]
-```
 
-### Using Variables
+// Define the values in a variable and use it directly
+var base_emails: string[] = ["admin@test.com", "user@test.com"]
+faker admin_emails $base_emails
 
-You can define faker values in a `string[]` variable and reference it directly:
-
-```
-// Define the values in a variable
-var base_emails: string[] = ["admin@test.com", "user@test.com", "support@test.com"]
-
-// Use the variable directly as faker source
-faker emails $base_emails
-```
-
-### Spread Operator
-
-The spread operator (`...`) allows combining values from variables with inline values:
-
-```
+// Spread operator combines variables and inline values
 var team_emails: string[] = ["alice@company.com", "bob@company.com"]
-var support_emails: string[] = ["help@company.com", "info@company.com"]
-
-// Combine variable values with inline values
-faker all_emails [...$team_emails, "extra@test.com", "backup@test.com"]
-
-// Combine multiple variables
-faker combined_emails [...$team_emails, ...$support_emails]
-
-// Mix spreads and inline values
-faker mixed [...$team_emails, "inline@test.com", ...$support_emails, "another@test.com"]
+faker all_emails [...$team_emails, "extra@test.com", ...$base_emails]
 ```
 
 ### Behavior
 
-- Values are selected deterministically based on a hash of the original value
-- The same input always produces the same fake output (for referential consistency)
-- The list wraps around if there are more unique values than faker entries
-- Spread operator only works with `string[]` variables
+- A **random** value from the pool is chosen for each row. The same input
+  value does not map to the same fake value; runs are not deterministic.
+- For columns with UNIQUE constraints, use `{unique()}` in the pool values
+  (see [String Interpolation](#unique)) — plain pools will produce duplicate
+  values as soon as there are more rows than pool entries.
+- The spread operator (`...$var`) requires a `string[]` variable.
 
 ---
 
 ## Relations
 
-Define soft foreign key relationships that are not declared in the database schema.
+Foreign key relationships drive aggregate traversal. Single-column foreign
+key constraints are discovered automatically from the remote schema;
+`relation` adds soft relationships that are not declared in the schema, and
+`ignore_relation` removes discovered ones.
 
 ### Syntax
 
-```
+```text
 relation <table>.<column> -> <referenced_table>.<referenced_column>
+ignore_relation <table>.<column> -> <referenced_table>.<referenced_column>
 ```
+
+Direction is from child table to parent table: the arrow points at the
+referenced (parent) table.
 
 ### Examples
 
-```
+```jibs
 // Customer group reference (not a formal FK in Magento)
 relation customer_entity.group_id -> customer_group.customer_group_id
 
 // Order to customer reference
 relation sales_order.customer_id -> customer_entity.entity_id
 
-// Product to category (through junction table)
-relation catalog_category_product.product_id -> catalog_product_entity.entity_id
-relation catalog_category_product.category_id -> catalog_category_entity.entity_id
+// Drop a discovered FK that would pull in too much data
+ignore_relation sales_order.store_id -> store.store_id
 ```
 
 ### Behavior
 
-- Relations are used in addition to auto-discovered foreign keys from the schema
-- When importing an aggregate, these relations are followed to import related data
-- Direction is from child table to parent table (the arrow points to the referenced/parent table)
+- Explicit relations are used in addition to auto-discovered foreign keys.
+- Composite (multi-column) foreign keys are not auto-discovered.
+- `ignore_relation` filters a relation out of the discovered set, so
+  aggregate traversal will not follow it.
 
 ---
 
 ## Anonymization
 
-Define rules for replacing sensitive data with fake values.
+Define rules for replacing sensitive data with fake values. Anonymization is
+applied **on the remote server as rows are read**, so sensitive values never
+leave the remote host. It applies to every import mode, including `get`.
 
 ### Syntax
 
-```
+```text
 anonymize <table> {
     <column> -> <faker_name>
     <column> -> null
@@ -441,7 +374,10 @@ anonymize <table> {
 
 ### Examples
 
-```
+```jibs
+faker emails ["user1@example.test", "user2@example.test"]
+faker names ["John", "Jane", "Bob", "Alice"]
+
 anonymize customer_entity {
     email       -> emails
     firstname   -> names
@@ -449,67 +385,74 @@ anonymize customer_entity {
     password    -> null
     rp_token    -> null
 }
-
-anonymize sales_order_address {
-    email       -> emails
-    firstname   -> names
-    lastname    -> names
-    company     -> companies
-    street      -> streets
-    city        -> cities
-    telephone   -> phones
-    fax         -> null
-}
-
-anonymize newsletter_subscriber {
-    subscriber_email -> emails
-}
 ```
 
 ### Special Values
 
 | Value | Behavior |
 |-------|----------|
-| `<faker_name>` | Replace with value from faker list |
+| `<faker_name>` | Replace with a random value from the faker pool |
 | `null` | Set column to NULL |
 
 ---
 
 ## Table Handling
 
-Control how tables are handled during import.
+Control how tables are handled during import. All three statements accept
+either an exact table name or a `/regex/` pattern that is matched against
+all table names on the remote server.
 
 ### Exclude Data
 
 Import table structure but no data. Creates an empty table locally.
 
-```
-exclude_data <table>
-```
-
-**Examples:**
-```
+```jibs
 exclude_data sales_order_payment
 exclude_data customer_log
-exclude_data persistent_session
+
+// All tables whose name ends in _log
+exclude_data /_log$/
 ```
 
 ### Ignore Table
 
-Completely ignore the table. Don't create structure, don't import data, don't touch existing local table.
+Completely ignore the table: don't create structure, don't import data,
+don't touch any existing local table.
 
-```
-ignore_table <table>
-```
-
-**Examples:**
-```
+```jibs
 ignore_table report_event
-ignore_table report_viewed_product_index
-ignore_table sales_bestsellers_aggregated_daily
-ignore_table sales_bestsellers_aggregated_monthly
-ignore_table sales_bestsellers_aggregated_yearly
+
+// Regex: all report and cache tables
+ignore_table /^report_/
+ignore_table /^cache/
 ```
+
+An aggregate whose root table is ignored is a configuration error. Relations
+into ignored tables are not followed.
+
+### Full Tables
+
+Force tables to be imported in full even when they are reachable from an
+aggregate. During aggregate traversal they act as dead ends (their rows do
+not pull in further related rows). Accepts a comma-separated list.
+
+```jibs
+full customer_group, store
+full /^catalog_category/
+```
+
+### Table Name Quirks
+
+Table names that clash with keywords or contain unusual characters can be
+written with backticks:
+
+```jibs
+ignore_table `quote_2023-08-17`
+```
+
+Regex pattern bodies cannot contain whitespace (use `\s` or `[ ]` for a
+literal space) — this is what distinguishes them from the division operator
+in expressions.
 
 ### Use Cases
 
@@ -518,171 +461,191 @@ ignore_table sales_bestsellers_aggregated_yearly
 | Sensitive data (payments, tokens) | `exclude_data` - keep structure for app compatibility |
 | Report/analytics tables | `ignore_table` - not needed locally, may be huge |
 | Cache tables | `exclude_data` - keep structure, data regenerates |
-| Log tables | `exclude_data` or `ignore_table` depending on need |
+| Small reference tables (statuses, groups) | `full` - always complete |
 
 ---
 
 ## Aggregates
 
-Define a root entity and automatically import all related data following foreign key relationships (both schema-defined and soft relations).
+Define a root entity and automatically import all related data following
+foreign key relationships (both schema-defined and soft relations).
 
 ### Syntax
 
-```
+```text
 aggregate <name> {
     root <table>
     where "<sql_condition>"
     order by <column> [asc|desc]
-    limit <number>
+    limit <number or $variable>
+    exclude <table_or_pattern>, ...
+    root_only
 }
 ```
 
-### Clauses
+Only `root` is required. Clauses must appear in the order shown.
 
-| Clause | Required | Description |
-|--------|----------|-------------|
-| `root` | Yes | The main table (aggregate root) |
-| `where` | No | SQL WHERE condition to filter rows |
-| `order by` | No | Sort order for limit selection |
-| `limit` | No | Maximum rows to import (can be variable) |
+| Clause | Description |
+|--------|-------------|
+| `root` | The main table (aggregate root) |
+| `where` | SQL WHERE condition to filter root rows (interpolated) |
+| `order by` | Sort order for limit selection |
+| `limit` | Maximum root rows to import (literal or `$variable`) |
+| `exclude` | Tables (or `/regex/` patterns) to skip during traversal |
+| `root_only` | Import only the root table's rows, no traversal |
 
 ### Examples
 
-**Import recent orders:**
-```
+```jibs
+var order_limit: int = 100
+
+// Import recent orders and everything they reference
 aggregate orders {
     root sales_order
     where "created_at > DATE_SUB(NOW(), INTERVAL 90 DAY)"
     order by created_at desc
-    limit 100
-}
-```
-
-**Import products from specific category:**
-```
-aggregate products {
-    root catalog_product_entity
-    where "entity_id IN (
-        SELECT product_id
-        FROM catalog_category_product
-        WHERE category_id = 42
-    )"
-}
-```
-
-**Import active customers only:**
-```
-aggregate customers {
-    root customer_entity
-    where "is_active = 1"
-    limit 500
-}
-```
-
-**Import with variable limit:**
-```
-var order_limit: int = 100
-
-aggregate orders {
-    root sales_order
-    order by created_at desc
     limit $order_limit
 }
+
+// Import products from one category, but skip the url_rewrite subtree
+aggregate products {
+    root catalog_product_entity
+    where "entity_id IN (SELECT product_id FROM catalog_category_product WHERE category_id = 42)"
+    exclude /^url_rewrite/, catalog_product_flat_1
+}
+
+// Only the matching rows themselves
+aggregate flagged_customers {
+    root customer_entity
+    where "is_active = 0"
+    root_only
+}
 ```
 
-### Behavior
+### Traversal Behavior
 
-1. Select rows from root table matching the filter criteria
-2. Auto-discover foreign key relationships from schema
-3. Include soft relations defined via `relation`
-4. Recursively import all child entities that reference the selected root rows
-5. Import all parent entities referenced by the selected rows
-6. Apply anonymization rules during import
+Starting from the root rows:
+
+1. **Forward relations** (rows this row references — its parents/dependencies)
+   are always followed, so imported rows never dangle.
+2. **Backward relations** (rows that reference this row — its children) are
+   followed from the root table and from tables reached via backward
+   relations. They are *not* followed from tables that were only reached
+   forward — otherwise importing one order would pull in its customer and
+   then *all* of that customer's other data.
+3. Rows are deduplicated: each row is transferred at most once, even when
+   multiple aggregates or paths reach it.
+4. Tables named in `full` statements are imported completely and act as
+   traversal dead ends. Tables in `exclude` clauses or `exclude_data` /
+   `ignore_table` statements are skipped.
+5. Anonymization rules apply during the transfer.
+
+Tables that are *reachable* from an aggregate root through relations are
+reserved for aggregate traversal; all other tables are imported in full
+(unless excluded/ignored).
 
 ---
 
-## Incremental Imports
+## Get Functions
 
-Add specific rows to an already-defined aggregate without reimporting everything.
+Define parameterized fetches that can be invoked from the command line with
+`jibs get`. Use them to pull specific rows (and everything they reference)
+into an existing local database without redoing a full import — e.g. "get me
+this one production order".
 
 ### Syntax
 
+```text
+get <name> (<param>: <type> [= default], ...) {
+    <aggregate_name>
+    where "<sql_condition>"
+    order by <column> [asc|desc]
+    limit <number or $variable>
+    exclude <table_or_pattern>, ...
+    root_only
+}
 ```
-include <aggregate_name> where "<sql_condition>"
-```
+
+The body names an aggregate defined elsewhere in the file; the optional
+clauses override or replace that aggregate's clauses for this fetch. The
+`where` string can interpolate the function's parameters.
 
 ### Examples
 
-```
-// First, define the aggregate
+```jibs
 aggregate products {
     root catalog_product_entity
-    where "entity_id IN (
-        SELECT product_id FROM catalog_category_product WHERE category_id = 42
-    )"
+    where "FALSE"
 }
 
-// Later, add specific products
-include products where "sku = 'HERO-PRODUCT'"
-include products where "sku IN ('PROMO-2024-A', 'PROMO-2024-B')"
-include products where "entity_id = 12345"
-```
-
-```
-aggregate orders {
-    root sales_order
-    limit 100
+get product_by_sku (sku: string) {
+    products where "sku = '{$sku}'"
 }
 
-// Add a specific order that a developer needs
-include orders where "increment_id = '100000999'"
+get products_updated_since (days: int = 7, max: int = 100) {
+    products
+    where "updated_at > DATE_SUB(NOW(), INTERVAL {$days} DAY)"
+    limit $max
+}
+```
+
+The `where "FALSE"` pattern makes an aggregate import nothing during a
+regular `jibs import`, reserving it for `get` invocations.
+
+### Invocation
+
+```bash
+jibs get shop.jibs [connection options] -- product_by_sku --sku HERO-PRODUCT
+
+# Multiple invocations in one run
+jibs get shop.jibs [connection options] -- \
+    product_by_sku --sku HERO-PRODUCT \
+    products_updated_since --days 30
 ```
 
 ### Behavior
 
-1. The `where` clause applies to the aggregate's root table
-2. Foreign key relationships are followed just like with the main aggregate
-3. If the data already exists locally, it is updated
-4. Anonymization rules apply to incremental imports
+- Only the named aggregates are fetched (`aggregates_only` mode); full-table
+  imports are skipped.
+- Traversal, deduplication, and **anonymization** work exactly as in a
+  regular import.
+- Fetched tables are dropped and recreated locally with the fetched rows.
+- `get` refuses to run if state from an interrupted import exists (backup
+  tables or a checkpoint); pass `--clean` to discard that state explicitly.
 
 ---
 
 ## Preserve
 
-Keep local values for specific rows; don't overwrite during import.
+Keep local values for specific rows; don't overwrite them during import.
 
 ### Syntax
 
-```
+```text
 preserve <table> where "<sql_condition>"
 ```
 
 ### Examples
 
-```
+```jibs
 // Keep local development settings
 preserve core_config_data where "path LIKE 'dev/%'"
 
-// Keep local URLs
-preserve core_config_data where "path IN (
-    'web/secure/base_url',
-    'web/unsecure/base_url',
-    'web/secure/base_link_url',
-    'web/unsecure/base_link_url'
-)"
-
-// Keep local admin settings
+// Keep local admin account
 preserve admin_user where "username = 'localadmin'"
-
-// Keep local API keys
-preserve core_config_data where "path LIKE 'payment/%/api_key'"
 ```
 
 ### Behavior
 
-1. Row is imported from remote
-2. After import, local value is restored
-3. Effectively: row exists in sync but keeps local data
+1. Before the table is imported, matching local rows are copied to a backup
+   table (`_jibs_preserve_<table>`).
+2. The table is imported from remote as usual.
+3. After the import, the preserved rows are written back (`REPLACE INTO`)
+   and the backup table is dropped.
+
+If an import is interrupted, the backup tables remain so a later `--resume`
+can finish the restore. `--clean` discards them (destroying preserved rows
+whose originals were already overwritten) — hence the explicit flag.
 
 ---
 
@@ -692,7 +655,7 @@ Set specific values after import. If the row doesn't exist, it is created.
 
 ### Syntax
 
-```
+```text
 set <table> {
     match <column> = <value>, <column> = <value>, ...
     <column> = <value>
@@ -700,44 +663,17 @@ set <table> {
 }
 ```
 
-### Clauses
-
 | Clause | Description |
 |--------|-------------|
-| `match` | Columns used to find existing row or create new one |
+| `match` | Columns used to find the existing row (or create a new one) |
 | Other assignments | Columns to set/update |
+
+Values can be literals, `$variables`, or interpolated strings.
 
 ### Examples
 
-**Set base URL:**
-```
-set core_config_data {
-    match path = "web/secure/base_url", scope = "default", scope_id = 0
-    value = $base_url
-}
-```
-
-**Set multiple config values:**
-```
-set core_config_data {
-    match path = "trans_email/ident_general/email", scope = "default", scope_id = 0
-    value = $admin_email
-}
-
-set core_config_data {
-    match path = "trans_email/ident_general/name", scope = "default", scope_id = 0
-    value = "Local Admin"
-}
-
-set core_config_data {
-    match path = "dev/debug/enabled", scope = "default", scope_id = 0
-    value = "1"
-}
-```
-
-**Using variables:**
-```
-var base_url: string
+```jibs
+var base_url: string = "https://local.test/"
 var admin_email: string = "admin@local.test"
 
 set core_config_data {
@@ -746,38 +682,41 @@ set core_config_data {
 }
 
 set core_config_data {
-    match path = "contact/email/recipient_email", scope = "default", scope_id = 0
+    match path = "trans_email/ident_general/email", scope = "default", scope_id = 0
     value = $admin_email
 }
 ```
 
 ### Behavior
 
-1. Look for row matching all `match` column values
-2. If found: update the other columns
-3. If not found: insert new row with match columns + other columns
+1. Look for a row matching all `match` column values.
+2. If found: update the other columns.
+3. If not found: insert a new row with the match columns plus the other
+   columns.
 
 ---
 
 ## After Transformations
 
-Execute arbitrary SQL after import completes.
+Execute arbitrary SQL after import completes. SQL strings are **raw**: no
+interpolation or escape processing is applied, so SQL wildcards and quotes
+can be written directly.
 
 ### Syntax
 
-```
+```text
 after {
     """<multiline_sql_statement>"""
     "<single_line_sql_statement>"
 }
 ```
 
-Both multiline strings (`"""..."""`) and regular strings (`"..."`) are supported. Use multiline strings for complex queries spanning multiple lines, and regular strings for simple one-liners.
+Both multiline strings (`"""..."""`) and regular strings (`"..."`) are
+supported.
 
 ### Examples
 
-**Move orders to future (for testing date-sensitive logic):**
-```
+```jibs
 after {
     """
     UPDATE sales_order
@@ -785,108 +724,60 @@ after {
         updated_at = DATE_ADD(updated_at, INTERVAL 10 YEAR)
     """
 
-    """
-    UPDATE sales_order_grid
-    SET created_at = DATE_ADD(created_at, INTERVAL 10 YEAR)
-    """
-}
-```
-
-**Simple single-line statements:**
-```
-after {
     "TRUNCATE TABLE cache"
-    "UPDATE users SET active = 1"
     "DELETE FROM sessions WHERE expired_at < NOW()"
-}
-```
-
-**Mixed multiline and single-line:**
-```
-after {
-    """
-    UPDATE catalog_product_entity_int
-    SET value = 1
-    WHERE attribute_id = (
-        SELECT attribute_id FROM eav_attribute
-        WHERE attribute_code = 'status' AND entity_type_id = 4
-    )
-    """
-    "TRUNCATE TABLE customer_log"
 }
 ```
 
 ### Behavior
 
-- Statements execute in order after all data imports complete
-- Each statement is executed as a separate query
-- Errors stop execution (transaction rollback behavior TBD)
+- Statements execute in order after all data imports, preserve restores, and
+  `set` blocks complete.
+- Each statement is executed as a separate query.
+- An error stops execution; already-executed statements are not rolled back.
 
 ### Execution Order with Imports
 
-When using imports, `after` blocks are collected and executed in depth-first order based on import position:
+When using imports, `after` blocks are collected and executed in depth-first
+order based on import position:
 
 1. First import's `after` statements (including its nested imports, depth-first)
-2. Second import's `after` statements (including its nested imports, depth-first)
+2. Second import's `after` statements (including its nested imports)
 3. ... and so on for each import in the file
 4. Current file's `after` statements (top to bottom)
 
-**Example:**
-
-Given this structure:
-```
-// root.jibs
-import "a.jibs"
-import "b.jibs"
-after { """SELECT 'root'""" }
-
-// a.jibs
-import "c.jibs"
-after { """SELECT 'a'""" }
-
-// b.jibs
-after { """SELECT 'b'""" }
-
-// c.jibs
-after { """SELECT 'c'""" }
-```
-
-The execution order is: `c`, `a`, `b`, `root`
+**Example:** given `root.jibs` importing `a.jibs` then `b.jibs`, where
+`a.jibs` imports `c.jibs`, and every file has an `after` block, the
+execution order is: `c`, `a`, `b`, `root`.
 
 ---
 
 ## Conditionals
 
-Apply configuration conditionally based on variable values using Rust-like attributes.
+Apply any statement conditionally based on variable values using Rust-like
+attributes.
 
 ### Syntax
 
-```
+```text
 #[when(<expression>)]
 <statement>
 ```
 
-### Supported Operators
-
-| Type | Operators |
-|------|-----------|
-| Comparison | `==`, `!=`, `>`, `<`, `>=`, `<=` |
-| Logical | `&&`, `||`, `!` |
-| Grouping | `(`, `)` |
+The attribute can be applied to **any** statement kind. Expressions use the
+same operators as string interpolation (see
+[Supported Expression Operators](#supported-expression-operators)).
 
 ### Examples
 
-**Simple boolean:**
-```
+```jibs
 var skip_payments: bool = true
+var order_limit: int = 100
+var env: string = "staging"
+var debug_mode: bool = true
 
 #[when($skip_payments)]
 exclude_data sales_order_payment
-```
-
-**Comparison:**
-```
-var order_limit: int = 100
 
 #[when($order_limit > 50)]
 aggregate large_orders {
@@ -894,92 +785,43 @@ aggregate large_orders {
     order by created_at desc
     limit $order_limit
 }
-```
-
-**Equality:**
-```
-var env: string = "staging"
 
 #[when($env == "staging")]
 set core_config_data {
     match path = "dev/debug/enabled", scope = "default", scope_id = 0
     value = "1"
 }
-```
 
-**Negation:**
-```
 #[when(!$skip_payments)]
 aggregate payments {
     root sales_order_payment
 }
-```
-
-**Complex expressions:**
-```
-var debug_mode: bool = true
-var env: string = "development"
 
 #[when($debug_mode && $env != "production")]
 after {
-    """
-    UPDATE core_config_data SET value = '1' WHERE path = 'dev/log/active'
-    """
+    "UPDATE core_config_data SET value = '1' WHERE path = 'dev/log/active'"
 }
 
-#[when($env == "staging" || $env == "development")]
-exclude_data sales_order_payment
-```
-
-**Grouped expressions:**
-```
 #[when(($env == "staging" || $env == "development") && $debug_mode)]
-set core_config_data {
-    match path = "dev/template/allow_symlink", scope = "default", scope_id = 0
-    value = "1"
-}
+exclude_data customer_log
 ```
 
-### Applicable Statements
-
-Conditionals can be applied to:
-- `exclude_data`
-- `ignore_table`
-- `aggregate`
-- `include`
-- `preserve`
-- `set`
-- `after`
-- `anonymize`
+Note that an attribute applies to exactly one following statement.
 
 ---
 
 ## Comments
 
-Single-line comments start with `//`.
+Single-line comments start with `//` and run to the end of the line. They
+can appear on their own line or after a statement.
 
-### Syntax
-
-```
-// This is a comment
-```
-
-### Examples
-
-```
+```jibs
 // === VARIABLES ===
 var base_url: string  // Required: no default
 
-// Import base configuration
-import "magento-base.dsl"
-
-// Skip payment data in non-production environments
-#[when($env != "production")]
-exclude_data sales_order_payment
-
 aggregate orders {
     root sales_order
-    // Only import recent orders to keep database small
+    // Only import recent orders to keep the database small
     where "created_at > DATE_SUB(NOW(), INTERVAL 90 DAY)"
     limit 100  // Adjust as needed
 }
@@ -989,97 +831,88 @@ aggregate orders {
 
 ## CLI Interface
 
-### Basic Usage
+The `jibs` binary connects to a remote host over SSH, runs a helper binary
+there (uploaded automatically), streams the selected data, and loads it into
+a local MySQL server.
 
-```bash
-mysqlimport --config <config.dsl> [options]
+### Commands
+
+```text
+jibs import [CONFIG] [options]        Import data from a remote database
+jibs get <CONFIG> [options] -- ...    Fetch specific aggregates (get functions)
+jibs check <CONFIG>                   Parse and validate a config file
+jibs plan <CONFIG> [--var ...]        Print the resolved execution plan (JSON)
 ```
 
-### Options
+`jibs import` without a config file imports all tables.
+
+### Connection Options (import and get)
 
 | Option | Description |
 |--------|-------------|
-| `--config <file>` | Path to DSL configuration file |
-| `--var-file <file>` | Load variables from file |
-| `--var <name>=<value>` | Set variable value (overrides var-file) |
-| `--include-dir <dir>` | Add directory to import search path |
-| `--dry-run` | Show what would be imported without executing |
-| `--verbose` | Show detailed progress |
+| `--host <user@host>` | Remote SSH host (required; set the SSH port with `--port`) |
+| `--port <port>` | SSH port (default: 22) |
+| `--identity <file>` | Path to SSH private key |
+| `--remote-mysql <url>` | MySQL URL on the remote host (default: `mysql://root@localhost:3306`) |
+| `--local-mysql <url>` | Local MySQL URL (default: `mysql://root@localhost:3306`) |
+| `--var <name>=<value>` | Set a variable (repeatable) |
+| `--var-file <file>` | Load variables from a JSON file |
+| `--parallel <n>` | Parallel server-side workers (default: 1) |
+| `--client-parallel <n>` | Parallel local loader workers (defaults to `--parallel`) |
+| `--no-compress` | Disable zstd compression |
+| `--strict-host-key-checking` | Reject unknown SSH host keys |
+| `--accept-new-host-keys` | Accept and save new host keys, reject mismatches |
+| `--no-host-key-checking` | Disable host key checking (insecure) |
+| `--max-message-size <bytes>` | Maximum protocol message size (default: 100MB) |
+| `--metrics` | Print detailed timing metrics |
+| `--report` | Print a report of the slowest tables |
+
+### Import-Specific Options
+
+| Option | Description |
+|--------|-------------|
+| `--resume` | Resume a previously interrupted import |
+| `--clean` | Discard state from a previous interrupted import and start fresh |
+
+An interrupted import leaves a checkpoint table and possibly preserve-backup
+tables in the local database; the next import must choose `--resume` or
+`--clean`. Foreign key constraints in the local schema are dropped during an
+import and automatically restored afterwards (or on the next successful run
+after an interruption).
 
 ### Examples
 
 ```bash
-# Basic usage
-mysqlimport --config shop.dsl
+# Full import according to shop.jibs
+jibs import shop.jibs \
+    --host deploy@prod-db.example.com \
+    --remote-mysql 'mysql://reader:secret@localhost:3306/shop' \
+    --local-mysql 'mysql://root:root@127.0.0.1:3306/shop_dev' \
+    --parallel 4
 
-# With variable file
-mysqlimport --config shop.dsl --var-file production.vars
-
-# Override specific variables
-mysqlimport --config shop.dsl --var-file production.vars --var base_url="https://staging.dev/"
-
-# Multiple variable overrides
-mysqlimport --config shop.dsl \
-    --var base_url="https://local.dev/" \
-    --var admin_email="me@local.test" \
+# Override variables
+jibs import shop.jibs --host deploy@prod \
+    --var base_domain=local.test \
     --var order_limit=50
 
-# With include directories
-mysqlimport --config shop.dsl \
-    --include-dir /etc/mysqlimport/common \
-    --include-dir ./shared
+# Resume after an interruption
+jibs import shop.jibs --host deploy@prod --resume
 
-# Dry run
-mysqlimport --config shop.dsl --dry-run --verbose
-```
+# Fetch one production order into the local database
+jibs get shop.jibs --host deploy@prod -- order_by_increment_id --id 100000999
 
-### Environment Variables
+# Validate a config file (parse errors show source snippets)
+jibs check shop.jibs
 
-| Variable | Description |
-|----------|-------------|
-| `MYSQLIMPORT_INCLUDE_PATH` | Colon-separated list of directories for import resolution |
-
-```bash
-export MYSQLIMPORT_INCLUDE_PATH="/etc/mysqlimport/common:/home/user/.mysqlimport"
-mysqlimport --config shop.dsl
+# Inspect what would be imported
+jibs plan shop.jibs --var base_domain=local.test
 ```
 
 ---
 
 ## Variable Files
 
-### Simple Format (.vars)
-
-```
-base_domain = "local.dev"
-base_port = 8080
-admin_email = "admin@local.test"
-skip_payments = true
-order_limit = 100
-tax_rate = 0.21
-```
-
-**Rules:**
-- One variable per line
-- Format: `name = value`
-- Strings must be quoted
-- Booleans: `true` or `false`
-- Numbers: integer or floating point
-- Comments with `//`
-
-**Example with comments:**
-```
-// Local development settings
-base_domain = "local.dev"
-base_port = 8080
-admin_email = "admin@local.test"
-
-// Import settings
-skip_payments = true    // Don't import payment data
-order_limit = 100       // Only import 100 most recent orders
-```
-
-### JSON Format (.vars.json)
+Variables can be loaded from a JSON file with `--var-file`:
 
 ```json
 {
@@ -1094,7 +927,7 @@ order_limit = 100       // Only import 100 most recent orders
 
 ### Precedence
 
-1. Default values in DSL (`var x: int = 100`)
+1. Default values in the DSL (`var x: int = 100`)
 2. Variable file (`--var-file`)
 3. CLI overrides (`--var x=200`)
 
@@ -1104,11 +937,11 @@ Later sources override earlier ones.
 
 ## Complete Example
 
-**magento-shop.dsl:**
-```
-// Base configuration for Magento shop import
+**magento-shop.jibs:**
+```jibs
+// Base configuration for a Magento shop import
 
-import "magento-anonymization.dsl"
+import "magento-anonymization.jibs"
 
 // === VARIABLES ===
 var base_domain: string
@@ -1116,7 +949,6 @@ var base_port: int = 80
 var admin_email: string = "admin@local.test"
 var env: string = "development"
 var skip_payments: bool = true
-var skip_logs: bool = true
 var order_limit: int = 100
 var product_category: int = 42
 
@@ -1126,19 +958,15 @@ relation sales_order.customer_id -> customer_entity.entity_id
 
 // === TABLE HANDLING ===
 // Always ignore reporting tables
-ignore_table report_event
-ignore_table report_viewed_product_index
-ignore_table sales_bestsellers_aggregated_daily
-ignore_table sales_bestsellers_aggregated_monthly
-ignore_table sales_bestsellers_aggregated_yearly
+ignore_table /^report_/
+ignore_table /^sales_bestsellers_aggregated/
 
-// Conditionally handle payment data
+// Small reference tables: always import completely
+full customer_group, store
+
+// Conditionally skip payment data
 #[when($skip_payments)]
 exclude_data sales_order_payment
-
-#[when($skip_logs)]
-exclude_data customer_log
-exclude_data visitor_log
 
 // === AGGREGATES ===
 aggregate orders {
@@ -1150,27 +978,19 @@ aggregate orders {
 
 aggregate products {
     root catalog_product_entity
-    where "entity_id IN (
-        SELECT product_id
-        FROM catalog_category_product
-        WHERE category_id = $product_category
-    )"
+    where "entity_id IN (SELECT product_id FROM catalog_category_product WHERE category_id = {$product_category})"
+    exclude /^url_rewrite/
 }
 
-aggregate customers {
-    root customer_entity
-    where "is_active = 1"
-    limit 500
+// === ON-DEMAND FETCHES ===
+get product_by_sku (sku: string) {
+    products where "sku = '{$sku}'"
 }
-
-// === INCREMENTAL ===
-include products where "sku = 'HERO-PRODUCT'"
 
 // === PRESERVE LOCAL VALUES ===
 preserve core_config_data where "path LIKE 'dev/%'"
-preserve core_config_data where "path LIKE 'web/%base_url%'"
 
-// === SET VALUES (using string interpolation) ===
+// === SET VALUES ===
 set core_config_data {
     match path = "web/secure/base_url", scope = "default", scope_id = 0
     value = "https://{$base_domain}/"
@@ -1186,11 +1006,6 @@ set core_config_data {
     value = $admin_email
 }
 
-set core_config_data {
-    match path = "web/cookie/cookie_domain", scope = "default", scope_id = 0
-    value = ".{$base_domain}"
-}
-
 // === POST-IMPORT ===
 #[when($env == "development")]
 after {
@@ -1202,23 +1017,17 @@ after {
 }
 ```
 
-**magento-anonymization.dsl:**
-```
+**magento-anonymization.jibs:**
+```jibs
 // Shared anonymization rules for Magento
 
-// Array variables for reusable faker data
 var base_names: string[] = ["John", "Jane", "Bob", "Alice"]
 var extra_names: string[] = ["Charlie", "Diana", "Eve", "Frank"]
 
-// Using spread operator to combine arrays
+// Spread operator combines arrays; unique() guarantees unique emails
 faker names [...$base_names, ...$extra_names]
-
-// Direct inline array
-faker emails ["user1@example.test", "user2@example.test", "user3@example.test"]
+faker emails ["user{unique()}@example.test"]
 faker phones ["+31600000001", "+31600000002", "+31600000003"]
-faker streets ["123 Main St", "456 Oak Ave", "789 Pine Rd", "321 Elm Blvd"]
-faker cities ["Amsterdam", "Rotterdam", "Utrecht", "Den Haag"]
-faker companies ["Acme Corp", "Globex Inc", "Initech", "Umbrella Co"]
 
 anonymize customer_entity {
     email       -> emails
@@ -1232,37 +1041,21 @@ anonymize sales_order_address {
     email       -> emails
     firstname   -> names
     lastname    -> names
-    company     -> companies
-    street      -> streets
-    city        -> cities
     telephone   -> phones
     fax         -> null
 }
 
-anonymize newsletter_subscriber {
-    subscriber_email -> emails
-}
-
 anonymize sales_order {
-    customer_email    -> emails
+    customer_email     -> emails
     customer_firstname -> names
     customer_lastname  -> names
 }
 ```
 
-**production.vars:**
-```
-base_domain = "local.dev"
-base_port = 80
-admin_email = "developer@company.com"
-env = "development"
-skip_payments = true
-skip_logs = true
-order_limit = 100
-product_category = 42
-```
-
 **Usage:**
 ```bash
-mysqlimport --config magento-shop.dsl --var-file production.vars
+jibs import magento-shop.jibs \
+    --host deploy@prod-db \
+    --var-file local.vars.json \
+    --var base_domain=local.dev
 ```

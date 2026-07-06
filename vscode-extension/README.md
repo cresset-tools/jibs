@@ -81,4 +81,4 @@ after {
 
 ## License
 
-MIT
+EUPL-1.2 (see the LICENSE file in the repository root)

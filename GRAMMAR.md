@@ -1,6 +1,13 @@
-# MySQL Import DSL - Formal Grammar
+# Jibs DSL - Formal Grammar
 
-This document defines the formal grammar of the MySQL Import DSL using Extended Backus-Naur Form (EBNF).
+This document defines the formal grammar of the Jibs DSL using Extended
+Backus-Naur Form (EBNF). The reference implementation is the hand-written
+recursive descent parser in `crates/parser/src/parser.rs` (statements) and
+`crates/parser/src/lexer.rs` (tokens).
+
+Code examples marked as `jibs` are parsed by the test suite
+(`crates/parser/tests/corpus.rs`), so they cannot drift from the
+implementation.
 
 ## Notation
 
@@ -13,48 +20,49 @@ This document defines the formal grammar of the MySQL Import DSL using Extended 
 | `( )` | Grouping |
 | `" "` | Terminal string (literal) |
 | `' '` | Terminal string (literal, alternative) |
-| `/* */` | Comment |
-| `?` | Optional (suffix notation) |
-| `+` | One or more (suffix notation) |
-| `*` | Zero or more (suffix notation) |
+| `(* *)` | Comment |
 
 ## Grammar
 
 ### Top-Level Structure
 
 ```ebnf
-program = { statement } ;
+program = { attributed_statement } ;
+
+attributed_statement = [ attribute ] statement ;
+
+attribute = "#" "[" "when" "(" expression ")" "]" ;
 
 statement = import_stmt
           | var_decl
           | faker_decl
           | relation_decl
+          | ignore_relation_decl
           | anonymize_block
           | exclude_data_stmt
           | ignore_table_stmt
+          | full_stmt
           | aggregate_block
-          | include_stmt
+          | get_def
           | preserve_stmt
           | set_block
           | after_block
           ;
-
-/* Statements can be prefixed with a conditional attribute */
-attributed_statement = [ attribute ] statement ;
-
-attribute = "#[" "when" "(" expression ")" "]" ;
 ```
+
+The `#[when(...)]` attribute may prefix **any** statement kind.
 
 ### Import Statement
 
 ```ebnf
-import_stmt = "import" string_literal ;
+import_stmt = "import" raw_string ;
 ```
 
-**Examples:**
-```
-import "magento-base.dsl"
-import "common/anonymization.dsl"
+The path is a raw string: no interpolation or escape decoding is applied.
+
+```jibs
+import "magento-base.jibs"
+import "common/anonymization.jibs"
 ```
 
 ### Variable Declaration
@@ -62,37 +70,46 @@ import "common/anonymization.dsl"
 ```ebnf
 var_decl = "var" identifier ":" type [ "=" literal ] ;
 
-type = scalar_type | array_type ;
+type = scalar_type [ "[" "]" ] ;
 
 scalar_type = "string" | "int" | "float" | "bool" ;
 
-array_type = scalar_type "[]" ;
-
 literal = string_literal
-        | integer_literal
-        | float_literal
+        | signed_integer
+        | signed_float
         | bool_literal
+        | "null"
         | array_literal
         ;
 
+signed_integer = [ "-" ] integer_literal ;
+
+signed_float = [ "-" ] float_literal ;
+
 array_literal = "[" [ array_elements ] "]" ;
 
-array_elements = literal { "," literal } [ "," ] ;
+array_elements = array_element { "," array_element } [ "," ] ;
+
+array_element = string_literal | signed_integer | signed_float | bool_literal ;
 
 bool_literal = "true" | "false" ;
 ```
 
-**Examples:**
-```
+Array elements must all have the same type, determined by the first element.
+An empty array literal `[]` is a string array.
+
+```jibs
 var base_domain: string
 var admin_email: string = "admin@local.test"
 var order_limit: int = 100
 var tax_rate: float = 0.21
+var offset: int = -3
+var factor: float = -0.5
 var skip_payments: bool = true
 
 // Array types
 var emails: string[] = ["user1@test.com", "user2@test.com"]
-var ids: int[] = [1, 2, 3, 4, 5]
+var ids: int[] = [1, -2, 3, 4, 5]
 var prices: float[] = [9.99, 19.99, 29.99]
 var flags: bool[] = [true, false, true]
 ```
@@ -113,35 +130,31 @@ faker_value = string_literal | spread_expr ;
 spread_expr = "..." variable_ref ;
 ```
 
-**Examples:**
-```
+```jibs
 // Inline array of strings
 faker names ["John", "Jane", "Bob", "Alice"]
-faker emails ["user1@example.test", "user2@example.test"]
 
 // Using a string[] variable directly
 var base_emails: string[] = ["admin@test.com", "user@test.com"]
-faker emails $base_emails
+faker admin_emails $base_emails
 
 // Spread operator to combine values
 faker all_emails [...$base_emails, "extra@test.com"]
-
-// Multiple spreads
-faker combined [...$emails1, ...$emails2, "another@test.com"]
 ```
 
-### Relation Declaration
+### Relation Declarations
 
 ```ebnf
 relation_decl = "relation" column_ref "->" column_ref ;
 
+ignore_relation_decl = "ignore_relation" column_ref "->" column_ref ;
+
 column_ref = identifier "." identifier ;
 ```
 
-**Examples:**
-```
+```jibs
 relation customer_entity.group_id -> customer_group.customer_group_id
-relation sales_order.customer_id -> customer_entity.entity_id
+ignore_relation sales_order.store_id -> store.store_id
 ```
 
 ### Anonymize Block
@@ -152,66 +165,60 @@ anonymize_block = "anonymize" identifier "{" { anonymize_rule } "}" ;
 anonymize_rule = identifier "->" ( identifier | "null" ) ;
 ```
 
-**Examples:**
-```
+```jibs
 anonymize customer_entity {
     email     -> emails
     firstname -> names
-    lastname  -> names
     password  -> null
 }
 ```
 
-### Exclude Data Statement
+### Table Handling Statements
 
 ```ebnf
-exclude_data_stmt = "exclude_data" identifier ;
+exclude_data_stmt = "exclude_data" table_pattern ;
+
+ignore_table_stmt = "ignore_table" table_pattern ;
+
+full_stmt = "full" table_pattern { "," table_pattern } ;
+
+table_pattern = identifier | regex_literal ;
 ```
 
-**Examples:**
-```
+```jibs
 exclude_data sales_order_payment
-exclude_data customer_log
-```
+exclude_data /_log$/
 
-### Ignore Table Statement
-
-```ebnf
-ignore_table_stmt = "ignore_table" identifier ;
-```
-
-**Examples:**
-```
 ignore_table report_event
-ignore_table sales_bestsellers_aggregated_daily
+ignore_table /^cache/
+
+full customer_group, store, /^catalog_category/
 ```
 
 ### Aggregate Block
 
 ```ebnf
-aggregate_block = "aggregate" identifier "{" aggregate_body "}" ;
+aggregate_block = "aggregate" identifier "{" "root" identifier query_clauses "}" ;
 
-aggregate_body = root_clause
-                 [ where_clause ]
-                 [ order_by_clause ]
-                 [ limit_clause ]
-               ;
-
-root_clause = "root" identifier ;
+query_clauses = [ where_clause ]
+                [ order_by_clause ]
+                [ limit_clause ]
+                [ exclude_clause ]
+                [ "root_only" ]
+              ;
 
 where_clause = "where" string_literal ;
 
-order_by_clause = "order" "by" identifier [ sort_direction ] ;
-
-sort_direction = "asc" | "desc" ;
+order_by_clause = "order" "by" identifier [ "asc" | "desc" ] ;
 
 limit_clause = "limit" ( integer_literal | variable_ref ) ;
 
-variable_ref = "$" identifier ;
+exclude_clause = "exclude" table_pattern { "," table_pattern } ;
 ```
 
-**Examples:**
-```
+Clauses must appear in the order shown.
+
+```jibs
 aggregate orders {
     root sales_order
     where "created_at > DATE_SUB(NOW(), INTERVAL 90 DAY)"
@@ -222,19 +229,40 @@ aggregate orders {
 aggregate products {
     root catalog_product_entity
     where "entity_id IN (SELECT product_id FROM catalog_category_product WHERE category_id = 42)"
+    exclude /^url_rewrite/, catalog_product_flat_1
+    root_only
 }
 ```
 
-### Include Statement
+### Get Function Definition
 
 ```ebnf
-include_stmt = "include" identifier "where" string_literal ;
+get_def = "get" identifier "(" [ params ] ")"
+          "{" identifier query_clauses "}" ;
+
+params = param { "," param } [ "," ] ;
+
+param = identifier ":" type [ "=" literal ] ;
 ```
 
-**Examples:**
-```
-include products where "sku = 'HERO-PRODUCT'"
-include orders where "increment_id = '100000999'"
+The identifier at the start of the body names the aggregate to fetch; the
+query clauses use the same grammar (and ordering) as aggregate blocks.
+
+```jibs
+aggregate products {
+    root catalog_product_entity
+    where "FALSE"
+}
+
+get product_by_sku (sku: string) {
+    products where "sku = '{$sku}'"
+}
+
+get recent_products (days: int = 7, max: int = 100) {
+    products
+    where "updated_at > DATE_SUB(NOW(), INTERVAL {$days} DAY)"
+    limit $max
+}
 ```
 
 ### Preserve Statement
@@ -243,10 +271,8 @@ include orders where "increment_id = '100000999'"
 preserve_stmt = "preserve" identifier "where" string_literal ;
 ```
 
-**Examples:**
-```
+```jibs
 preserve core_config_data where "path LIKE 'dev/%'"
-preserve admin_user where "username = 'localadmin'"
 ```
 
 ### Set Block
@@ -254,30 +280,27 @@ preserve admin_user where "username = 'localadmin'"
 ```ebnf
 set_block = "set" identifier "{" match_clause { assignment } "}" ;
 
-match_clause = "match" assignment_list ;
-
-assignment_list = assignment { "," assignment } ;
+match_clause = "match" assignment { "," assignment } ;
 
 assignment = identifier "=" value ;
 
 value = string_literal
-      | integer_literal
-      | float_literal
+      | signed_integer
+      | signed_float
       | bool_literal
       | variable_ref
       ;
 ```
 
-**Examples:**
-```
+Note that the assignments after the match clause are *not* comma-separated;
+a comma continues the match clause instead.
+
+```jibs
+var base_domain: string = "local.test"
+
 set core_config_data {
     match path = "web/secure/base_url", scope = "default", scope_id = 0
     value = "https://{$base_domain}/"
-}
-
-set core_config_data {
-    match path = "dev/debug/enabled", scope = "default", scope_id = 0
-    value = "1"
 }
 ```
 
@@ -286,22 +309,19 @@ set core_config_data {
 ```ebnf
 after_block = "after" "{" { sql_string } "}" ;
 
-sql_string = multiline_string | string_literal ;
-
-multiline_string = '"""' < any characters except """ > '"""' ;
+sql_string = multiline_string | raw_string ;
 ```
 
-Both multiline strings (`"""..."""`) and regular strings (`"..."`) are accepted.
+SQL strings are raw: no interpolation or escape decoding is applied to
+either form.
 
-**Examples:**
-```
+```jibs
 after {
     """
     UPDATE sales_order
     SET created_at = DATE_ADD(created_at, INTERVAL 10 YEAR)
     """
 
-    "UPDATE customer_entity SET password_hash = NULL"
     "TRUNCATE TABLE sessions"
 }
 ```
@@ -309,6 +329,9 @@ after {
 ### Expressions
 
 Expressions are used in conditional attributes and string interpolation.
+Both contexts share one grammar and implementation, with two differences
+inside interpolations: statement keywords act as plain identifiers after `$`
+(so `{$limit}` works), and `unique()` is available.
 
 ```ebnf
 expression = or_expr ;
@@ -325,15 +348,23 @@ additive_expr = multiplicative_expr { ( "+" | "-" ) multiplicative_expr } ;
 
 multiplicative_expr = unary_expr { ( "*" | "/" | "%" ) unary_expr } ;
 
-unary_expr = [ "!" | "-" ] primary_expr ;
+unary_expr = ( "!" | "-" ) unary_expr | primary_expr ;
 
-primary_expr = literal
+primary_expr = integer_literal
+             | float_literal
+             | bool_literal
+             | string_literal
              | variable_ref
              | "(" expression ")"
+             | unique_call        (* interpolation contexts only *)
              ;
+
+unique_call = "unique" "(" ")" ;
+
+variable_ref = "$" identifier ;
 ```
 
-**Operator Precedence (highest to lowest):**
+**Operator precedence (highest to lowest):**
 
 | Precedence | Operators | Associativity |
 |------------|-----------|---------------|
@@ -345,279 +376,149 @@ primary_expr = literal
 | 6 | `&&` | Left |
 | 7 | `\|\|` | Left |
 
-**Examples:**
-```
+```jibs
+var skip_payments: bool = false
+var order_limit: int = 100
+var env: string = "staging"
+var debug_mode: bool = true
+
 #[when($skip_payments)]
-#[when($order_limit > 50)]
-#[when($env == "staging")]
-#[when(!$debug_mode)]
-#[when($debug_mode && $env != "production")]
+exclude_data sales_order_payment
+
+#[when($order_limit / 2 > 25)]
+ignore_table order_stats
+
 #[when(($env == "staging" || $env == "development") && $debug_mode)]
+exclude_data customer_log
 ```
 
 ### String Interpolation
 
+Inside regular (double-quoted) strings, `{...}` delimits an interpolated
+expression. Escape sequences are decoded in the same pass.
+
 ```ebnf
-interpolated_string = '"' { string_char | interpolation } '"' ;
-
-string_char = < any character except " \ { >
-            | escape_sequence
-            ;
-
-escape_sequence = "\\" | '\"' | "\n" | "\t" | "\{" ;
+string_content = { string_char | interpolation } ;
 
 interpolation = "{" expression "}" ;
+
+string_char = escape_sequence | (* any character except '"' or '\' *) ;
+
+escape_sequence = "\\" | '\"' | "\n" | "\t" | "\{"
+                | "\" (* any other character: both characters kept as-is *)
+                ;
 ```
 
-**Examples:**
-```
-"https://{$base_domain}/"
-"http://{$base_domain}:{$port}/"
-"http://localhost:{$base_port + $instance}/"
-"api-{$env}.example.com/v{$version}/"
-"Use \{$var} for interpolation"  /* Escaped brace */
+A `{` that does not begin a well-formed interpolation expression is a parse
+error; write `\{` for a literal brace. Unknown escapes such as `\%` keep the
+backslash, so SQL escape sequences pass through to MySQL unchanged.
+
+```jibs
+var base_domain: string = "example.com"
+var base_port: int = 8000
+var instance: int = 1
+
+set core_config_data {
+    match path = "web/unsecure/base_url", scope = "default", scope_id = 0
+    value = "http://{$base_domain}:{$base_port + $instance}/"
+}
+
+set docs {
+    match id = 1
+    value = "Use \{$var} syntax for interpolation"
+}
 ```
 
 ### Lexical Elements
 
 ```ebnf
-identifier = letter { letter | digit | "_" } ;
+identifier = ident_start { ident_start | digit }
+           | backtick_identifier
+           ;
 
-letter = "a" | "b" | ... | "z" | "A" | "B" | ... | "Z" ;
+ident_start = letter | "_" ;
 
-digit = "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" ;
+backtick_identifier = "`" (* one or more characters except '`' *) "`" ;
 
-integer_literal = [ "-" ] digit { digit } ;
+integer_literal = digit { digit } ;           (* unsigned; '-' is an operator *)
 
-float_literal = [ "-" ] digit { digit } "." digit { digit } ;
+float_literal = digit { digit } "." digit { digit } ;
 
-string_literal = '"' { string_char } '"' ;
+string_literal = '"' string_content '"' ;     (* interpolated + escapes decoded *)
 
-variable_ref = "$" identifier ;
+raw_string = '"' (* same syntax, content kept raw *) '"' ;
 
-spread_op = "..." ;
+multiline_string = '"""' (* any characters except '"""' *) '"""' ;
 
-comment = "//" { < any character except newline > } newline ;
+regex_literal = "/" (* one or more characters, no whitespace, no '/' *) "/" ;
 
-whitespace = " " | "\t" | "\n" | "\r" ;
+comment = "//" (* to end of line *) ;
 ```
+
+Notes:
+
+- Integer and float literals are unsigned at the lexer level; negative
+  numbers are expressed with the `-` operator, which literal positions
+  (`var` defaults, array elements, `set` values) and expressions both
+  accept. Integer literals outside the 64-bit signed range are an error.
+- Regex literal bodies may not contain whitespace (use `\s` or `[ ]` for a
+  literal space). This disambiguates them from the division operator:
+  `$a / 2` is division, `/^cache/` is a regex. Inside interpolations regex
+  literals do not exist at all — `/` is always division there.
+- Backtick identifiers allow table names that clash with keywords or contain
+  special characters: `` ignore_table `quote_2023-08-17` ``.
+- Multiline strings have no escape processing at all.
+- Strings may span multiple lines.
 
 ### Reserved Keywords
 
-The following identifiers are reserved keywords and cannot be used as user-defined names:
-
-```
-aggregate    after       anonymize       asc           bool
-by           desc        exclude_data    faker         false
-float        ignore_table import         include       int
-limit        match       null            order         preserve
-relation     root        set             string        true
-var          when        where
-```
-
-## Complete Grammar (Consolidated)
-
-```ebnf
-(* Program Structure *)
-program = { attributed_statement } ;
-
-attributed_statement = [ attribute ] statement ;
-
-attribute = "#[" "when" "(" expression ")" "]" ;
-
-statement = import_stmt
-          | var_decl
-          | faker_decl
-          | relation_decl
-          | anonymize_block
-          | exclude_data_stmt
-          | ignore_table_stmt
-          | aggregate_block
-          | include_stmt
-          | preserve_stmt
-          | set_block
-          | after_block
-          ;
-
-(* Statements *)
-import_stmt = "import" string_literal ;
-
-var_decl = "var" identifier ":" type [ "=" literal ] ;
-
-faker_decl = "faker" identifier faker_source ;
-
-faker_source = faker_array | variable_ref ;
-
-faker_array = "[" [ faker_values ] "]" ;
-
-faker_values = faker_value { "," faker_value } [ "," ] ;
-
-faker_value = string_literal | spread_expr ;
-
-spread_expr = "..." variable_ref ;
-
-relation_decl = "relation" column_ref "->" column_ref ;
-
-anonymize_block = "anonymize" identifier "{" { anonymize_rule } "}" ;
-
-exclude_data_stmt = "exclude_data" identifier ;
-
-ignore_table_stmt = "ignore_table" identifier ;
-
-aggregate_block = "aggregate" identifier "{" aggregate_body "}" ;
-
-include_stmt = "include" identifier "where" string_literal ;
-
-preserve_stmt = "preserve" identifier "where" string_literal ;
-
-set_block = "set" identifier "{" match_clause { assignment } "}" ;
-
-after_block = "after" "{" { sql_string } "}" ;
-
-sql_string = multiline_string | string_literal ;
-
-(* Aggregate Clauses *)
-aggregate_body = root_clause [ where_clause ] [ order_by_clause ] [ limit_clause ] ;
-
-root_clause = "root" identifier ;
-
-where_clause = "where" string_literal ;
-
-order_by_clause = "order" "by" identifier [ sort_direction ] ;
-
-sort_direction = "asc" | "desc" ;
-
-limit_clause = "limit" ( integer_literal | variable_ref ) ;
-
-(* Anonymize Rules *)
-anonymize_rule = identifier "->" ( identifier | "null" ) ;
-
-(* Set Block Components *)
-match_clause = "match" assignment_list ;
-
-assignment_list = assignment { "," assignment } ;
-
-assignment = identifier "=" value ;
-
-(* Types and Values *)
-type = scalar_type | array_type ;
-
-scalar_type = "string" | "int" | "float" | "bool" ;
-
-array_type = scalar_type "[]" ;
-
-literal = string_literal | integer_literal | float_literal | bool_literal | array_literal ;
-
-array_literal = "[" [ array_elements ] "]" ;
-
-array_elements = literal { "," literal } [ "," ] ;
-
-value = literal | variable_ref ;
-
-bool_literal = "true" | "false" ;
-
-(* References *)
-column_ref = identifier "." identifier ;
-
-variable_ref = "$" identifier ;
-
-spread_op = "..." ;
-
-(* Expressions *)
-expression = or_expr ;
-
-or_expr = and_expr { "||" and_expr } ;
-
-and_expr = equality_expr { "&&" equality_expr } ;
-
-equality_expr = comparison_expr { ( "==" | "!=" ) comparison_expr } ;
-
-comparison_expr = additive_expr { ( "<" | ">" | "<=" | ">=" ) additive_expr } ;
-
-additive_expr = multiplicative_expr { ( "+" | "-" ) multiplicative_expr } ;
-
-multiplicative_expr = unary_expr { ( "*" | "/" | "%" ) unary_expr } ;
-
-unary_expr = [ "!" | "-" ] primary_expr ;
-
-primary_expr = literal | variable_ref | "(" expression ")" ;
-
-(* String Interpolation *)
-interpolated_string = '"' { string_char | interpolation } '"' ;
-
-string_char = < any character except " \ { > | escape_sequence ;
-
-escape_sequence = "\\" | '\"' | "\n" | "\t" | "\{" ;
-
-interpolation = "{" expression "}" ;
-
-(* Lexical Elements *)
-identifier = letter { letter | digit | "_" } ;
-
-letter = "a" | ... | "z" | "A" | ... | "Z" ;
-
-digit = "0" | ... | "9" ;
-
-integer_literal = [ "-" ] digit { digit } ;
-
-float_literal = [ "-" ] digit { digit } "." digit { digit } ;
-
-string_literal = interpolated_string ;
-
-multiline_string = '"""' { < any character > } '"""' ;
-
-spread_op = "..." ;
-
-comment = "//" { < any character except newline > } ;
-
-whitespace = " " | "\t" | "\n" | "\r" ;
+The following words are keywords and cannot be used as bare identifiers
+(use backticks for table names, or `$name` inside interpolations where
+keywords are permitted as variable names):
+
+```text
+after        aggregate    anonymize    asc          bool
+by           desc         exclude      exclude_data faker
+false        float        full         get          ignore_relation
+ignore_table import       int          limit        match
+null         order        preserve     relation     root
+root_only    set          string       true         var
+when         where
 ```
 
 ## Semantic Notes
 
 ### Identifier Scope
 
-- **Variables** (`var`): Global scope, must be declared before use
-- **Faker names**: Global scope, must be declared before use in `anonymize`
-- **Aggregate names**: Global scope, must be declared before use in `include`
-- **Table names**: Not validated at parse time; validated at runtime against database schema
-
-### Type Coercion
-
-| Context | Allowed Types | Coercion |
-|---------|---------------|----------|
-| String interpolation | `string`, `int`, `float`, `bool` | All convert to string |
-| Arithmetic (`+`, `-`, `*`, `/`) | `int`, `float` | `int` promotes to `float` if mixed |
-| Comparison (`<`, `>`, etc.) | `int`, `float`, `string` | Numeric comparison or lexicographic |
-| Equality (`==`, `!=`) | All | Type must match |
-| Logical (`&&`, `\|\|`, `!`) | `bool` | No coercion |
-| `limit` clause | `int` | Must be positive integer |
-| `faker` source | `string[]` | Variable must be string array |
-| Spread operator (`...`) | `string[]` | Variable must be string array |
+- **Variables** (`var`): global scope; later declarations with the same name
+  override earlier ones (import order matters, see SPEC.md).
+- **Faker names**: global scope; referenced by `anonymize` rules.
+- **Aggregate names**: global scope; referenced by `get` function bodies.
+- **Table names**: not validated at parse time; validated at runtime against
+  the remote database schema.
 
 ### String Literal Contexts
 
-| Context | Interpolation | Multiline |
-|---------|---------------|-----------|
-| `import` path | Yes | No |
-| `faker` values | Yes | No |
-| `where` clause | Yes | No |
-| `set` values | Yes | No |
-| `match` values | Yes | No |
-| `after` SQL | Yes | Yes (`"""`) |
-| Variable defaults | Yes | No |
+| Context | Interpolation | Escapes decoded | Multiline |
+|---------|---------------|-----------------|-----------|
+| `import` path | No | No | No |
+| `faker` values | Yes | Yes | No |
+| `where` clauses | Yes | Yes | No |
+| `set` / `match` values | Yes | Yes | No |
+| Variable defaults | Yes | Yes | No |
+| Strings in `#[when(...)]` | Yes | Yes | No |
+| `after` SQL | No | No | Yes (`"""`) |
 
-### Order Independence
+### Error Recovery
 
-Statements can appear in any order in the file, with these exceptions:
-- `var` declarations should appear before their use in expressions
-- `faker` declarations should appear before their use in `anonymize`
-- `aggregate` declarations should appear before their use in `include`
-- `import` statements are typically at the top but can appear anywhere
+The parser reports **all** errors in a file, not just the first: after a
+statement fails to parse it re-synchronizes at the next statement keyword.
+Malformed interpolations inside strings are reported with the enclosing
+statement otherwise intact.
 
 ### Whitespace and Comments
 
-- Whitespace is ignored except as token separator
-- Comments start with `//` and extend to end of line
-- Comments can appear on their own line or after a statement
-- Comments inside strings are not treated as comments
+- Whitespace is ignored except as a token separator.
+- Comments start with `//` and extend to the end of the line; they can
+  appear anywhere between tokens.
+- `//` inside strings is not a comment.
