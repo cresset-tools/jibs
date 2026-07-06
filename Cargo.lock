@@ -771,7 +771,7 @@ checksum = "92ecc6618181def0457392ccd0ee51198e065e016d1d527a7ac1b6dc7c1f09d2"
 
 [[package]]
 name = "jibs"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "bincode",
@@ -796,14 +796,14 @@ dependencies = [
 
 [[package]]
 name = "jibs_parser"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "ariadne",
 ]
 
 [[package]]
 name = "jibs_protocol"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "bincode",
  "serde",
@@ -811,7 +811,7 @@ dependencies = [
 
 [[package]]
 name = "jibs_server"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "bincode",
  "hex",
