@@ -27,7 +27,9 @@ docker-compose ps
 
 ### Run E2E Tests
 ```bash
-# Clear cached server binary (required after rebuilding server)
+# Optional: clear cached server binaries to reclaim space. Not needed for
+# correctness — binaries are content-addressed (a rebuilt server uploads under
+# a new hash) and the protocol handshake rejects version mismatches loudly.
 ssh -p 2222 -i test/ssh-keys/id_ed25519 -o StrictHostKeyChecking=no testuser@localhost "rm -f /tmp/jibs-*"
 
 # Basic aggregate test (with parallel loading)

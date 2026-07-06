@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use jibs_protocol::{
     framing::read_message,
-    ClientMessage, CompressionMode, MessageWriter, ServerMessage,
+    handshake, ClientMessage, CompressionMode, MessageWriter, ServerMessage,
 };
 
 use crate::error::{Result, ServerError};
@@ -67,10 +67,42 @@ fn main() {
     }
 }
 
+/// Exchange protocol preambles with the client: send our greeting, then
+/// validate the client's magic + version. Runs before any framed message so
+/// a version mismatch is a clear error instead of bincode decode garbage.
+fn perform_handshake<R: io::Read, W: io::Write>(
+    reader: &mut R,
+    writer: &mut MessageWriter<W>,
+) -> Result<()> {
+    // Greet first: both sides write before reading, so there is no deadlock,
+    // and an old client at least sees a distinctive frame error.
+    writer.write_preencoded(&handshake::encode_preamble())?;
+    writer.flush()?;
+
+    let preamble = handshake::read_preamble(reader).map_err(|e| {
+        ServerError::Protocol(format!("failed to read client protocol preamble: {}", e))
+    })?;
+    if let Err(e) = handshake::validate_preamble(&preamble) {
+        // Best effort: also send a framed error in case the client can
+        // decode it; the authoritative message goes to stderr
+        let _ = writer.write_message(&ServerMessage::Error {
+            message: e.to_string(),
+            recoverable: false,
+        });
+        let _ = writer.flush();
+        return Err(ServerError::Protocol(e.to_string()));
+    }
+    Ok(())
+}
+
 /// Echo mode for testing: read Init message and print plan summary
 fn run_echo_mode() -> Result<()> {
     let stdin = io::stdin();
+    let stdout = io::stdout();
     let mut reader = BufReader::new(stdin.lock());
+    let mut writer = MessageWriter::with_capacity(64, stdout.lock());
+
+    perform_handshake(&mut reader, &mut writer)?;
 
     // Read initial message
     let init_msg: ClientMessage = read_message(&mut reader)?;
@@ -104,6 +136,9 @@ fn run() -> Result<()> {
 
     let mut reader = BufReader::new(stdin);
     let mut writer = MessageWriter::with_capacity(1024 * 1024, stdout.lock());
+
+    // Version handshake before any framed message
+    perform_handshake(&mut reader, &mut writer)?;
 
     // Read first message - could be Credentials or Init (backward compatibility)
     let first_msg: ClientMessage = read_message(&mut reader)?;
