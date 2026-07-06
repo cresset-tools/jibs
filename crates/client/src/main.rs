@@ -49,7 +49,7 @@ enum Commands {
 /// Common connection arguments shared between import and get
 #[derive(Args)]
 struct ConnectionArgs {
-    /// Remote host in format user@host[:port]
+    /// Remote host in format user@host (set the SSH port with --port)
     #[arg(long)]
     host: String,
 
