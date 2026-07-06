@@ -11,6 +11,22 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # CI never debugs interactively: skipping debuginfo roughly halves compile and
+  # link time and shrinks the rust-cache artifacts (applies to dev and test profiles).
+  CARGO_PROFILE_DEV_DEBUG: 0
+  # Incremental artifacts can't be reused across CI runs; they only add overhead
+  # (and sccache skips incremental compiles entirely).
+  CARGO_INCREMENTAL: 0
+  # rust-cache deliberately drops workspace-crate artifacts, so jibs_parser
+  # (~8 min of single-threaded chumsky monomorphization) would recompile every
+  # run. sccache caches individual rustc invocations content-addressed, making
+  # unchanged workspace crates near-instant cache hits.
+  RUSTC_WRAPPER: sccache
+  SCCACHE_GHA_ENABLED: "true"
+  # The default 600s idle timeout is NOT reset by in-flight compilations. When
+  # jibs_parser runs alone as the final ~10min compile, the server shuts down
+  # mid-compile, killing it and forcing a from-zero local restart.
+  SCCACHE_IDLE_TIMEOUT: 0
 
 jobs:
   test:
@@ -22,10 +38,15 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      - uses: mozilla/sccache-action@v0.0.10
+
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Keep compile work from failed runs; the next attempt reuses it.
+          cache-on-failure: true
 
       - name: Run unit tests
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
 
   e2e:
     name: E2E import tests
@@ -44,11 +65,26 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: Set up SSH keys
+        run: |
+          ./test/setup-ssh-keys.sh
+          chmod 600 test/ssh-keys/id_ed25519
+
+      # Start containers early (no --wait) so MySQL seeds while the build runs;
+      # the "Wait for test containers" step below gates on health.
+      - name: Start test containers
+        run: docker compose up -d
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-linux-musl
 
+      - uses: mozilla/sccache-action@v0.0.10
+
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Keep compile work from failed runs; the next attempt reuses it.
+          cache-on-failure: true
 
       - name: Install cargo-zigbuild
         run: pip install cargo-zigbuild
@@ -56,17 +92,12 @@ jobs:
       # The client embeds the musl server binary at compile time
       # (crates/client/build.rs), so the server must be built first.
       - name: Build server (x86_64 musl)
-        run: cargo zigbuild -p jibs_server --release --target x86_64-unknown-linux-musl
+        run: cargo zigbuild -p jibs_server --release --locked --target x86_64-unknown-linux-musl
 
       - name: Build client
-        run: cargo build -p jibs_client --features test-utils
+        run: cargo build -p jibs_client --features test-utils --locked
 
-      - name: Set up SSH keys
-        run: |
-          ./test/setup-ssh-keys.sh
-          chmod 600 test/ssh-keys/id_ed25519
-
-      - name: Start test containers
+      - name: Wait for test containers
         run: docker compose up -d --wait --wait-timeout 300
 
       - name: Aggregate import
@@ -90,8 +121,15 @@ jobs:
           exit $fail
 
       # Mirrors test/test-resume.sh: seed a local-only row that a preserve rule
-      # protects, crash right after the users table (table 4) so the backup
-      # table exists but the restore hasn't happened, then resume.
+      # protects, crash the import so the backup table exists but the restore
+      # hasn't happened, then resume.
+      #
+      # --fail-after-tables must equal the total checkpointed table count (the
+      # 9 seed tables minus ignored sessions = 8): with --parallel 4 the table
+      # completion order is a race, so any smaller threshold can fire before
+      # users was reached, leaving no _jibs_preserve_ backup. After the last
+      # checkpoint the crash is still before post-processing, so the backup
+      # deterministically exists and the restore has not run.
       - name: Resume test (seed preserved row)
         run: |
           docker exec jibs-local mysql -u root -plocal_root_pass -e "
@@ -112,8 +150,8 @@ jobs:
 
       - name: Resume test (simulated crash)
         run: |
-          if ./target/debug/jibs import test/import-resume-test.jibs $JIBS_CONN --fail-after-tables 4; then
-            echo "::error::Import was expected to fail after 4 tables but succeeded"
+          if ./target/debug/jibs import test/import-resume-test.jibs $JIBS_CONN --fail-after-tables 8; then
+            echo "::error::Import was expected to crash after 8 tables but succeeded (did the seed schema gain tables? Keep --fail-after-tables equal to the checkpointed table count)"
             exit 1
           fi
           backup=$(docker exec jibs-local mysql -N -u root -plocal_root_pass imported -e "SHOW TABLES LIKE '_jibs_preserve_%'")
