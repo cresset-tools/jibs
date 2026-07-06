@@ -95,7 +95,7 @@ jobs:
         run: cargo zigbuild -p jibs_server --release --locked --target x86_64-unknown-linux-musl
 
       - name: Build client
-        run: cargo build -p jibs_client --features test-utils --locked
+        run: cargo build -p jibs --features test-utils --locked
 
       - name: Wait for test containers
         run: docker compose up -d --wait --wait-timeout 300

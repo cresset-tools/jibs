@@ -33,7 +33,7 @@ docker-compose ps
 ssh -p 2222 -i test/ssh-keys/id_ed25519 -o StrictHostKeyChecking=no testuser@localhost "rm -f /tmp/jibs-*"
 
 # Basic aggregate test (with parallel loading)
-cargo run -p jibs_client -- import test/import-aggregate.jibs \
+cargo run -p jibs -- import test/import-aggregate.jibs \
   --host testuser@localhost --port 2222 \
   --remote-mysql 'mysql://root:remote_root_pass@mysql-remote:3306/production' \
   --local-mysql 'mysql://root:local_root_pass@127.0.0.1:3308/imported' \
@@ -42,7 +42,7 @@ cargo run -p jibs_client -- import test/import-aggregate.jibs \
   --clean
 
 # Full table import test
-cargo run -p jibs_client -- import test/import-all.jibs \
+cargo run -p jibs -- import test/import-all.jibs \
   --host testuser@localhost --port 2222 \
   --remote-mysql 'mysql://root:remote_root_pass@mysql-remote:3306/production' \
   --local-mysql 'mysql://root:local_root_pass@127.0.0.1:3308/imported' \
@@ -54,7 +54,7 @@ cargo run -p jibs_client -- import test/import-all.jibs \
 ### Test Resume Functionality
 ```bash
 # Run with --fail-after-tables to simulate crash (requires test-utils feature)
-cargo run -p jibs_client --features test-utils -- import test/import-resume-test.jibs \
+cargo run -p jibs --features test-utils -- import test/import-resume-test.jibs \
   --host testuser@localhost --port 2222 \
   --remote-mysql 'mysql://root:remote_root_pass@mysql-remote:3306/production' \
   --local-mysql 'mysql://root:local_root_pass@127.0.0.1:3308/imported' \
@@ -64,7 +64,7 @@ cargo run -p jibs_client --features test-utils -- import test/import-resume-test
   --fail-after-tables 2
 
 # Resume the failed import
-cargo run -p jibs_client -- import test/import-resume-test.jibs \
+cargo run -p jibs -- import test/import-resume-test.jibs \
   --host testuser@localhost --port 2222 \
   --remote-mysql 'mysql://root:remote_root_pass@mysql-remote:3306/production' \
   --local-mysql 'mysql://root:local_root_pass@127.0.0.1:3308/imported' \

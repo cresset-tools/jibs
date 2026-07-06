@@ -1,0 +1,37 @@
+# Steps injected by dist (github-build-setup in dist-workspace.toml) into
+# every build-local-artifacts job, BEFORE `dist build` compiles the client.
+#
+# The jibs client embeds cross-compiled Linux musl `jibs-server` binaries at
+# build time (crates/client/build.rs): the client uploads the matching server
+# to the remote host over SSH at import time. These steps produce those two
+# binaries on every runner OS — zig provides the cross C toolchain, so this
+# works from macOS runners too.
+#
+# JIBS_REQUIRE_EMBEDDED_SERVER=1 makes build.rs fail hard if either binary is
+# missing, so a release can never ship a client with empty embedded servers
+# (locally, a missing binary is only a build warning).
+
+- name: Install zig (cross C toolchain for the embedded server)
+  uses: mlugg/setup-zig@v2
+  with:
+    version: "0.14.1"
+
+- name: Install cargo-zigbuild
+  uses: taiki-e/install-action@v2
+  with:
+    tool: cargo-zigbuild
+
+- name: Add musl server targets
+  shell: bash
+  run: rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+
+- name: Cross-build embedded jibs-server binaries
+  shell: bash
+  run: |
+    cargo zigbuild -p jibs_server --release \
+      --target x86_64-unknown-linux-musl \
+      --target aarch64-unknown-linux-musl
+
+- name: Require embedded servers in the client build
+  shell: bash
+  run: echo "JIBS_REQUIRE_EMBEDDED_SERVER=1" >> "$GITHUB_ENV"
