@@ -12,8 +12,6 @@ repository = "https://github.com/jelle/jibs"
 description = "Jelle's Importer with Better Speed - A MySQL database import tool"
 
 [workspace.dependencies]
-# Parser dependencies
-chumsky = "1.0.0-alpha.8"
 ariadne = "0.4"
 
 # Protocol dependencies

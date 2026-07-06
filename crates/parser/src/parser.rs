@@ -1,827 +1,960 @@
-//! Parser for the MySQL Import DSL
-
-use chumsky::{input::ValueInput, prelude::*};
+//! Parser for the MySQL Import DSL (hand-written recursive descent)
+//!
+//! Statements are dispatched on their leading keyword; on a statement-level
+//! error the parser records it and re-synchronizes at the next statement
+//! keyword, so one bad statement doesn't hide errors in the rest of the file.
 
 use crate::ast::*;
 use crate::interpolation::parse_interpolated_string;
-use crate::lexer::Token;
-use crate::Span;
+use crate::lexer::{token_as_ident, Token};
+use crate::{ParseError, Span};
 
-/// Create the main parser for the DSL
-pub fn parser<'tokens, 'src: 'tokens, I>(
-) -> impl Parser<'tokens, I, Program<'src>, extra::Err<Rich<'tokens, Token<'src>, Span>>> + Clone
-where
-    I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
-{
-    statement_parser()
-        .repeated()
-        .collect()
-        .map(|statements| Program { statements })
+/// Parse a token stream into a Program. Always returns whatever statements
+/// parsed successfully, plus the list of errors encountered.
+pub fn parse_tokens<'src>(
+    tokens: &[Spanned<Token<'src>>],
+    eoi: Span,
+) -> (Program<'src>, Vec<ParseError>) {
+    let mut parser = Parser::new(tokens, eoi);
+    let program = parser.program();
+    (program, parser.errors)
 }
 
-/// Parse a single statement (with optional attribute)
-fn statement_parser<'tokens, 'src: 'tokens, I>(
-) -> impl Parser<'tokens, I, Spanned<Statement<'src>>, extra::Err<Rich<'tokens, Token<'src>, Span>>> + Clone
-where
-    I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
-{
-    let attribute = attribute_parser();
-
-    attribute
-        .or_not()
-        .then(statement_kind_parser())
-        .map_with(|(attribute, kind), e| {
-            (
-                Statement { attribute, kind },
-                e.span(),
-            )
-        })
+/// Parse a single expression from a token stream, requiring all tokens to be
+/// consumed. Used for interpolation expressions ({...} inside strings).
+pub(crate) fn parse_expr_tokens<'src>(
+    tokens: &[Spanned<Token<'src>>],
+    eoi: Span,
+) -> Result<Spanned<Expr<'src>>, ParseError> {
+    let mut parser = Parser::new(tokens, eoi);
+    parser.in_interpolation = true;
+    let expr = parser.expr()?;
+    if !parser.at_end() {
+        return Err(parser.err_here("expected end of expression"));
+    }
+    Ok(expr)
 }
 
-/// Parse #[when(expr)]
-fn attribute_parser<'tokens, 'src: 'tokens, I>(
-) -> impl Parser<'tokens, I, Spanned<Expr<'src>>, extra::Err<Rich<'tokens, Token<'src>, Span>>> + Clone
-where
-    I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
-{
-    just(Token::Hash)
-        .ignore_then(just(Token::LBracket))
-        .ignore_then(just(Token::When))
-        .ignore_then(just(Token::LParen))
-        .ignore_then(expr_parser())
-        .then_ignore(just(Token::RParen))
-        .then_ignore(just(Token::RBracket))
+struct Parser<'tokens, 'src> {
+    tokens: &'tokens [Spanned<Token<'src>>],
+    pos: usize,
+    eoi: Span,
+    errors: Vec<ParseError>,
+    /// Inside a string interpolation: keywords act as identifiers after `$`,
+    /// and `unique()` is a valid expression.
+    in_interpolation: bool,
 }
 
-/// Parse the different statement kinds
-fn statement_kind_parser<'tokens, 'src: 'tokens, I>(
-) -> impl Parser<'tokens, I, StatementKind<'src>, extra::Err<Rich<'tokens, Token<'src>, Span>>> + Clone
-where
-    I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
-{
-    // .boxed() erases the deeply nested combinator types per statement,
-    // keeping rustc's type checking of this crate tractable
-    choice((
-        import_parser().boxed(),
-        var_parser().boxed(),
-        faker_parser().boxed(),
-        relation_parser().boxed(),
-        ignore_relation_parser().boxed(),
-        anonymize_parser().boxed(),
-        exclude_parser().boxed(),
-        ignore_parser().boxed(),
-        full_parser().boxed(),
-        aggregate_parser().boxed(),
-        get_function_parser().boxed(),
-        preserve_parser().boxed(),
-        set_parser().boxed(),
-        after_parser().boxed(),
-    ))
+/// Tokens that can start a statement — used for error recovery
+fn starts_statement(token: &Token) -> bool {
+    matches!(
+        token,
+        Token::Hash
+            | Token::Import
+            | Token::Var
+            | Token::Faker
+            | Token::Relation
+            | Token::IgnoreRelation
+            | Token::Anonymize
+            | Token::ExcludeData
+            | Token::IgnoreTable
+            | Token::Full
+            | Token::Aggregate
+            | Token::Get
+            | Token::Preserve
+            | Token::Set
+            | Token::After
+    )
 }
 
-/// Parse: import "path"
-fn import_parser<'tokens, 'src: 'tokens, I>(
-) -> impl Parser<'tokens, I, StatementKind<'src>, extra::Err<Rich<'tokens, Token<'src>, Span>>> + Clone
-where
-    I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
-{
-    just(Token::Import)
-        .ignore_then(string_literal_raw())
-        .map(StatementKind::Import)
-}
+impl<'tokens, 'src> Parser<'tokens, 'src> {
+    fn new(tokens: &'tokens [Spanned<Token<'src>>], eoi: Span) -> Self {
+        Self { tokens, pos: 0, eoi, errors: Vec::new(), in_interpolation: false }
+    }
 
-/// Parse: var name: type = default
-fn var_parser<'tokens, 'src: 'tokens, I>(
-) -> impl Parser<'tokens, I, StatementKind<'src>, extra::Err<Rich<'tokens, Token<'src>, Span>>> + Clone
-where
-    I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
-{
-    just(Token::Var)
-        .ignore_then(ident())
-        .then_ignore(just(Token::Colon))
-        .then(var_type())
-        .then(
-            just(Token::Assign)
-                .ignore_then(literal())
-                .or_not()
-        )
-        .map(|((name, var_type), default)| {
-            StatementKind::Var(VarDecl {
-                name,
-                var_type,
-                default,
-            })
-        })
-}
+    // ------------------------------------------------------------------
+    // Cursor primitives
+    // ------------------------------------------------------------------
 
-/// Parse a type keyword
-fn var_type<'tokens, 'src: 'tokens, I>(
-) -> impl Parser<'tokens, I, Spanned<VarType>, extra::Err<Rich<'tokens, Token<'src>, Span>>> + Clone
-where
-    I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
-{
-    // Array types must come before scalar types
-    let array_suffix = just(Token::LBracket).then_ignore(just(Token::RBracket));
+    fn at_end(&self) -> bool {
+        self.pos >= self.tokens.len()
+    }
 
-    choice((
-        just(Token::TypeString)
-            .then_ignore(array_suffix.clone())
-            .to(VarType::StringArray),
-        just(Token::TypeString).to(VarType::String),
-        just(Token::TypeInt)
-            .then_ignore(array_suffix.clone())
-            .to(VarType::IntArray),
-        just(Token::TypeInt).to(VarType::Int),
-        just(Token::TypeFloat)
-            .then_ignore(array_suffix.clone())
-            .to(VarType::FloatArray),
-        just(Token::TypeFloat).to(VarType::Float),
-        just(Token::TypeBool)
-            .then_ignore(array_suffix)
-            .to(VarType::BoolArray),
-        just(Token::TypeBool).to(VarType::Bool),
-    ))
-    .map_with(|t, e| (t, e.span()))
-}
+    fn peek(&self) -> Option<&Token<'src>> {
+        self.tokens.get(self.pos).map(|(t, _)| t)
+    }
 
-/// Parse: faker name ["value1", "value2", ...$var] or faker name $variable
-fn faker_parser<'tokens, 'src: 'tokens, I>(
-) -> impl Parser<'tokens, I, StatementKind<'src>, extra::Err<Rich<'tokens, Token<'src>, Span>>> + Clone
-where
-    I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
-{
-    // A faker value is either a string literal or a spread variable
-    let spread_var = just(Token::Spread)
-        .ignore_then(just(Token::Dollar))
-        .ignore_then(ident_raw())
-        .map(FakerValue::Spread);
+    fn peek2(&self) -> Option<&Token<'src>> {
+        self.tokens.get(self.pos + 1).map(|(t, _)| t)
+    }
 
-    let string_val = string_literal()
-        .map(|(lit, _)| FakerValue::Literal(lit));
+    /// Span of the current token, or the end-of-input span
+    fn cur_span(&self) -> Span {
+        self.tokens.get(self.pos).map(|(_, s)| *s).unwrap_or(self.eoi)
+    }
 
-    let faker_value = spread_var.or(string_val)
-        .map_with(|v, e| (v, e.span()));
+    /// End offset of the last consumed token
+    fn prev_end(&self) -> usize {
+        if self.pos == 0 {
+            self.cur_span().start
+        } else {
+            self.tokens[self.pos - 1].1.end
+        }
+    }
 
-    // Array syntax: ["a", "b", ...$var]
-    let array_source = faker_value
-        .separated_by(just(Token::Comma))
-        .allow_trailing()
-        .collect()
-        .delimited_by(just(Token::LBracket), just(Token::RBracket))
-        .map(FakerSource::Array);
+    fn bump(&mut self) -> Option<Spanned<Token<'src>>> {
+        let tok = self.tokens.get(self.pos).cloned();
+        if tok.is_some() {
+            self.pos += 1;
+        }
+        tok
+    }
 
-    // Direct variable syntax: $variable
-    let var_source = just(Token::Dollar)
-        .ignore_then(ident_raw())
-        .map(FakerSource::Variable);
+    /// Consume the next token if it equals `token`
+    fn eat(&mut self, token: &Token<'src>) -> bool {
+        if self.peek() == Some(token) {
+            self.pos += 1;
+            true
+        } else {
+            false
+        }
+    }
 
-    just(Token::Faker)
-        .ignore_then(ident())
-        .then(array_source.or(var_source))
-        .map(|(name, source)| {
-            StatementKind::Faker(FakerDecl { name, source })
-        })
-}
+    fn found(&self) -> String {
+        match self.peek() {
+            Some(t) => format!("'{}'", t),
+            None => "end of input".to_string(),
+        }
+    }
 
-/// Parse: relation table.column -> table.column
-fn relation_parser<'tokens, 'src: 'tokens, I>(
-) -> impl Parser<'tokens, I, StatementKind<'src>, extra::Err<Rich<'tokens, Token<'src>, Span>>> + Clone
-where
-    I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
-{
-    just(Token::Relation)
-        .ignore_then(column_ref())
-        .then_ignore(just(Token::Arrow))
-        .then(column_ref())
-        .map(|(from, to)| {
-            StatementKind::Relation(RelationDecl { from, to })
-        })
-}
+    fn err_here(&self, expected: &str) -> ParseError {
+        ParseError {
+            span: self.cur_span().into_range(),
+            message: format!("found {}, expected {}", self.found(), expected),
+        }
+    }
 
-/// Parse: ignore_relation table.column -> table.column
-fn ignore_relation_parser<'tokens, 'src: 'tokens, I>(
-) -> impl Parser<'tokens, I, StatementKind<'src>, extra::Err<Rich<'tokens, Token<'src>, Span>>> + Clone
-where
-    I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
-{
-    just(Token::IgnoreRelation)
-        .ignore_then(column_ref())
-        .then_ignore(just(Token::Arrow))
-        .then(column_ref())
-        .map(|(from, to)| {
-            StatementKind::IgnoreRelation(RelationDecl { from, to })
-        })
-}
+    fn expect(&mut self, token: Token<'src>, expected: &str) -> Result<Span, ParseError> {
+        if self.peek() == Some(&token) {
+            let span = self.cur_span();
+            self.pos += 1;
+            Ok(span)
+        } else {
+            Err(self.err_here(expected))
+        }
+    }
 
-/// Parse: table.column
-fn column_ref<'tokens, 'src: 'tokens, I>(
-) -> impl Parser<'tokens, I, Spanned<ColumnRef<'src>>, extra::Err<Rich<'tokens, Token<'src>, Span>>> + Clone
-where
-    I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
-{
-    ident_raw()
-        .then_ignore(just(Token::Dot))
-        .then(ident_raw())
-        .map_with(|(table, column), e| {
-            (ColumnRef { table, column }, e.span())
-        })
-}
+    fn expect_ident(&mut self, what: &str) -> Result<Spanned<&'src str>, ParseError> {
+        match self.peek() {
+            Some(Token::Ident(s)) => {
+                let s = *s;
+                let span = self.cur_span();
+                self.pos += 1;
+                Ok((s, span))
+            }
+            _ => Err(self.err_here(what)),
+        }
+    }
 
-/// Parse: anonymize table { ... }
-fn anonymize_parser<'tokens, 'src: 'tokens, I>(
-) -> impl Parser<'tokens, I, StatementKind<'src>, extra::Err<Rich<'tokens, Token<'src>, Span>>> + Clone
-where
-    I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
-{
-    let rule = ident()
-        .then_ignore(just(Token::Arrow))
-        .then(
-            just(Token::Null).to(AnonymizeTarget::Null)
-                .or(ident().map(AnonymizeTarget::Faker))
-        )
-        .map_with(|(column, target), e| {
-            (AnonymizeRule { column, target }, e.span())
-        });
+    /// Skip tokens until something that can start a statement (for recovery).
+    /// Always makes progress.
+    fn synchronize(&mut self) {
+        self.bump();
+        while let Some(token) = self.peek() {
+            if starts_statement(token) {
+                break;
+            }
+            self.pos += 1;
+        }
+    }
 
-    just(Token::Anonymize)
-        .ignore_then(ident())
-        .then(
-            rule.repeated()
-                .collect()
-                .delimited_by(just(Token::LBrace), just(Token::RBrace))
-        )
-        .map(|(table, rules)| {
-            StatementKind::Anonymize(AnonymizeBlock { table, rules })
-        })
-}
+    // ------------------------------------------------------------------
+    // Program / statements
+    // ------------------------------------------------------------------
 
-/// Parse a table pattern: either an identifier (exact) or a regex literal
-fn table_pattern<'tokens, 'src: 'tokens, I>(
-) -> impl Parser<'tokens, I, TablePattern<'src>, extra::Err<Rich<'tokens, Token<'src>, Span>>> + Clone
-where
-    I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
-{
-    let exact = ident().map(TablePattern::Exact);
-    let regex = select! { Token::Regex(s) => s }
-        .map_with(|s, e| TablePattern::Regex((s, e.span())));
-    regex.or(exact)
-}
-
-/// Parse: exclude_data table_or_pattern
-fn exclude_parser<'tokens, 'src: 'tokens, I>(
-) -> impl Parser<'tokens, I, StatementKind<'src>, extra::Err<Rich<'tokens, Token<'src>, Span>>> + Clone
-where
-    I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
-{
-    just(Token::ExcludeData)
-        .ignore_then(table_pattern())
-        .map(StatementKind::Exclude)
-}
-
-/// Parse: ignore_table table_or_pattern
-fn ignore_parser<'tokens, 'src: 'tokens, I>(
-) -> impl Parser<'tokens, I, StatementKind<'src>, extra::Err<Rich<'tokens, Token<'src>, Span>>> + Clone
-where
-    I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
-{
-    just(Token::IgnoreTable)
-        .ignore_then(table_pattern())
-        .map(StatementKind::Ignore)
-}
-
-/// Parse: full table1, table2, /pattern/, ...
-fn full_parser<'tokens, 'src: 'tokens, I>(
-) -> impl Parser<'tokens, I, StatementKind<'src>, extra::Err<Rich<'tokens, Token<'src>, Span>>> + Clone
-where
-    I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
-{
-    just(Token::Full)
-        .ignore_then(
-            table_pattern()
-                .separated_by(just(Token::Comma))
-                .at_least(1)
-                .collect::<Vec<_>>()
-        )
-        .map(StatementKind::Full)
-}
-
-/// Parse: aggregate name { root, where, order by, limit }
-fn aggregate_parser<'tokens, 'src: 'tokens, I>(
-) -> impl Parser<'tokens, I, StatementKind<'src>, extra::Err<Rich<'tokens, Token<'src>, Span>>> + Clone
-where
-    I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
-{
-    let root_clause = just(Token::Root)
-        .ignore_then(ident());
-
-    let where_clause = just(Token::Where)
-        .ignore_then(string_literal());
-
-    let order_by_clause = just(Token::Order)
-        .ignore_then(just(Token::By))
-        .ignore_then(ident())
-        .then(
-            just(Token::Asc).to(SortDirection::Asc)
-                .or(just(Token::Desc).to(SortDirection::Desc))
-                .or_not()
-        )
-        .map(|(column, direction)| OrderByClause { column, direction });
-
-    let limit_clause = just(Token::Limit)
-        .ignore_then(
-            select! { Token::Int(n) => LimitValue::Literal(n) }
-                .or(
-                    just(Token::Dollar)
-                        .ignore_then(ident_raw())
-                        .map(LimitValue::Variable)
-                )
-        )
-        .map_with(|v, e| (v, e.span()));
-
-    let exclude_clause = just(Token::Exclude)
-        .ignore_then(
-            table_pattern()
-                .separated_by(just(Token::Comma))
-                .at_least(1)
-                .collect::<Vec<_>>()
-        );
-
-    let root_only_clause = just(Token::RootOnly).to(true);
-
-    // Combine all clauses inside the braces
-    let body = root_clause
-        .then(where_clause.or_not())
-        .then(order_by_clause.or_not())
-        .then(limit_clause.or_not())
-        .then(exclude_clause.or_not())
-        .then(root_only_clause.or_not())
-        .delimited_by(just(Token::LBrace), just(Token::RBrace));
-
-    just(Token::Aggregate)
-        .ignore_then(ident())
-        .then(body)
-        .map(|(name, clauses)| {
-            // Unpack nested tuples step by step for readability
-            let (rest, root_only) = clauses;
-            let (rest, exclude_tables) = rest;
-            let (rest, limit) = rest;
-            let (rest, order_by) = rest;
-            let (root, where_clause) = rest;
-
-            StatementKind::Aggregate(AggregateBlock {
-                name,
-                root,
-                where_clause,
-                order_by,
-                limit,
-                exclude_tables: exclude_tables.unwrap_or_default(),
-                root_only: root_only.unwrap_or(false),
-            })
-        })
-}
-
-/// Parse a parameter declaration: name: type [= default]
-fn param_decl<'tokens, 'src: 'tokens, I>(
-) -> impl Parser<'tokens, I, Spanned<VarDecl<'src>>, extra::Err<Rich<'tokens, Token<'src>, Span>>> + Clone
-where
-    I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
-{
-    ident()
-        .then_ignore(just(Token::Colon))
-        .then(var_type())
-        .then(
-            just(Token::Assign)
-                .ignore_then(literal())
-                .or_not()
-        )
-        .map_with(|((name, var_type), default), e| {
-            (VarDecl { name, var_type, default }, e.span())
-        })
-}
-
-/// Parse: get func_name(params...) { aggregate_name [where ...] [order by ...] [limit ...] [exclude ...] [root_only] }
-fn get_function_parser<'tokens, 'src: 'tokens, I>(
-) -> impl Parser<'tokens, I, StatementKind<'src>, extra::Err<Rich<'tokens, Token<'src>, Span>>> + Clone
-where
-    I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
-{
-    let params = param_decl()
-        .separated_by(just(Token::Comma))
-        .allow_trailing()
-        .collect::<Vec<_>>()
-        .delimited_by(just(Token::LParen), just(Token::RParen));
-
-    let where_clause = just(Token::Where)
-        .ignore_then(string_literal());
-
-    let order_by_clause = just(Token::Order)
-        .ignore_then(just(Token::By))
-        .ignore_then(ident())
-        .then(
-            just(Token::Asc).to(SortDirection::Asc)
-                .or(just(Token::Desc).to(SortDirection::Desc))
-                .or_not()
-        )
-        .map(|(column, direction)| OrderByClause { column, direction });
-
-    let limit_clause = just(Token::Limit)
-        .ignore_then(
-            select! { Token::Int(n) => LimitValue::Literal(n) }
-                .or(
-                    just(Token::Dollar)
-                        .ignore_then(ident_raw())
-                        .map(LimitValue::Variable)
-                )
-        )
-        .map_with(|v, e| (v, e.span()));
-
-    let exclude_clause = just(Token::Exclude)
-        .ignore_then(
-            table_pattern()
-                .separated_by(just(Token::Comma))
-                .at_least(1)
-                .collect::<Vec<_>>()
-        );
-
-    let root_only_clause = just(Token::RootOnly).to(true);
-
-    let body = ident()  // aggregate reference
-        .then(where_clause.or_not())
-        .then(order_by_clause.or_not())
-        .then(limit_clause.or_not())
-        .then(exclude_clause.or_not())
-        .then(root_only_clause.or_not())
-        .delimited_by(just(Token::LBrace), just(Token::RBrace));
-
-    just(Token::Get)
-        .ignore_then(ident())
-        .then(params)
-        .then(body)
-        .map(|((name, params), clauses)| {
-            let (rest, root_only) = clauses;
-            let (rest, exclude_tables) = rest;
-            let (rest, limit) = rest;
-            let (rest, order_by) = rest;
-            let (aggregate, where_clause) = rest;
-
-            StatementKind::Get(GetFunctionDef {
-                name,
-                params,
-                aggregate,
-                where_clause,
-                order_by,
-                limit,
-                exclude_tables: exclude_tables.unwrap_or_default(),
-                root_only: root_only.unwrap_or(false),
-            })
-        })
-}
-
-/// Parse: preserve table where "condition"
-fn preserve_parser<'tokens, 'src: 'tokens, I>(
-) -> impl Parser<'tokens, I, StatementKind<'src>, extra::Err<Rich<'tokens, Token<'src>, Span>>> + Clone
-where
-    I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
-{
-    just(Token::Preserve)
-        .ignore_then(ident())
-        .then_ignore(just(Token::Where))
-        .then(string_literal())
-        .map(|(table, where_clause)| {
-            StatementKind::Preserve(PreserveStmt {
-                table,
-                where_clause,
-            })
-        })
-}
-
-/// Parse: set table { match ..., col = val }
-fn set_parser<'tokens, 'src: 'tokens, I>(
-) -> impl Parser<'tokens, I, StatementKind<'src>, extra::Err<Rich<'tokens, Token<'src>, Span>>> + Clone
-where
-    I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
-{
-    let assignment = ident()
-        .then_ignore(just(Token::Assign))
-        .then(value_parser())
-        .map_with(|(column, value), e| {
-            (Assignment { column, value }, e.span())
-        });
-
-    let match_clause = just(Token::Match)
-        .ignore_then(
-            assignment.clone()
-                .separated_by(just(Token::Comma))
-                .at_least(1)
-                .collect()
-        );
-
-    just(Token::Set)
-        .ignore_then(ident())
-        .then(
-            match_clause
-                .then(assignment.repeated().collect())
-                .delimited_by(just(Token::LBrace), just(Token::RBrace))
-        )
-        .map(|(table, (match_clause, assignments))| {
-            StatementKind::Set(SetBlock {
-                table,
-                match_clause,
-                assignments,
-            })
-        })
-}
-
-/// Parse: after { """sql""" "sql" ... }
-/// Accepts both multiline strings (""") and regular strings ("")
-fn after_parser<'tokens, 'src: 'tokens, I>(
-) -> impl Parser<'tokens, I, StatementKind<'src>, extra::Err<Rich<'tokens, Token<'src>, Span>>> + Clone
-where
-    I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
-{
-    let sql_string = multiline_string().or(string_literal_raw());
-
-    just(Token::After)
-        .ignore_then(
-            sql_string
-                .repeated()
-                .collect()
-                .delimited_by(just(Token::LBrace), just(Token::RBrace))
-        )
-        .map(|statements| StatementKind::After(AfterBlock { statements }))
-}
-
-/// Parse a value (literal, variable, or string with interpolation)
-fn value_parser<'tokens, 'src: 'tokens, I>(
-) -> impl Parser<'tokens, I, Spanned<Value<'src>>, extra::Err<Rich<'tokens, Token<'src>, Span>>> + Clone
-where
-    I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
-{
-    choice((
-        just(Token::Dollar)
-            .ignore_then(ident_raw())
-            .map(Value::Variable),
-        // String with interpolation support
-        string_literal().map(|(lit, _)| Value::Literal(Literal::String(lit))),
-        signed_float().map(|n| Value::Literal(Literal::Float(n))),
-        signed_int().map(|n| Value::Literal(Literal::Int(n))),
-        select! { Token::Bool(b) => Value::Literal(Literal::Bool(b)) },
-    ))
-    .map_with(|v, e| (v, e.span()))
-    .boxed()
-}
-
-/// Parse expression (for conditionals and interpolation)
-fn expr_parser<'tokens, 'src: 'tokens, I>(
-) -> impl Parser<'tokens, I, Spanned<Expr<'src>>, extra::Err<Rich<'tokens, Token<'src>, Span>>> + Clone
-where
-    I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
-{
-    recursive(|expr| {
-        // Primary expressions
-        let primary = choice((
-            // Variable reference
-            just(Token::Dollar)
-                .ignore_then(ident_raw())
-                .map(Expr::Variable),
-            // Literals
-            select! {
-                Token::Int(n) => Expr::Literal(Literal::Int(n)),
-                Token::Float(n) => Expr::Literal(Literal::Float(n)),
-                Token::Bool(b) => Expr::Literal(Literal::Bool(b)),
-            },
-            // String literal (with escape decoding and interpolation)
-            string_literal().map(|(lit, _)| Expr::Literal(Literal::String(lit))),
-            // Parenthesized expression
-            expr.clone()
-                .delimited_by(just(Token::LParen), just(Token::RParen))
-                .map(|(e, _)| e),
-        ))
-        .map_with(|e, ctx| (e, ctx.span()));
-
-        // Unary operators
-        let unary = just(Token::Not).to(UnaryOp::Not)
-            .or(just(Token::Minus).to(UnaryOp::Neg))
-            .repeated()
-            .foldr_with(primary, |op, expr, e| {
-                (Expr::Unary(op, Box::new(expr)), e.span())
-            });
-
-        // Multiplicative
-        let op = just(Token::Star).to(BinaryOp::Mul)
-            .or(just(Token::Slash).to(BinaryOp::Div))
-            .or(just(Token::Percent).to(BinaryOp::Mod));
-        let multiplicative = unary.clone().foldl_with(
-            op.then(unary).repeated(),
-            |a, (op, b), e| (Expr::Binary(Box::new(a), op, Box::new(b)), e.span()),
-        );
-
-        // Additive
-        let op = just(Token::Plus).to(BinaryOp::Add)
-            .or(just(Token::Minus).to(BinaryOp::Sub));
-        let additive = multiplicative.clone().foldl_with(
-            op.then(multiplicative).repeated(),
-            |a, (op, b), e| (Expr::Binary(Box::new(a), op, Box::new(b)), e.span()),
-        );
-
-        // Comparison
-        let op = just(Token::Lt).to(BinaryOp::Lt)
-            .or(just(Token::Gt).to(BinaryOp::Gt))
-            .or(just(Token::LtEq).to(BinaryOp::LtEq))
-            .or(just(Token::GtEq).to(BinaryOp::GtEq));
-        let comparison = additive.clone().foldl_with(
-            op.then(additive).repeated(),
-            |a, (op, b), e| (Expr::Binary(Box::new(a), op, Box::new(b)), e.span()),
-        );
-
-        // Equality
-        let op = just(Token::Eq).to(BinaryOp::Eq)
-            .or(just(Token::NotEq).to(BinaryOp::NotEq));
-        let equality = comparison.clone().foldl_with(
-            op.then(comparison).repeated(),
-            |a, (op, b), e| (Expr::Binary(Box::new(a), op, Box::new(b)), e.span()),
-        );
-
-        // Logical AND
-        let and = equality.clone().foldl_with(
-            just(Token::And).ignore_then(equality).repeated(),
-            |a, b, e| (Expr::Binary(Box::new(a), BinaryOp::And, Box::new(b)), e.span()),
-        );
-
-        // Logical OR
-        and.clone().foldl_with(
-            just(Token::Or).ignore_then(and).repeated(),
-            |a, b, e| (Expr::Binary(Box::new(a), BinaryOp::Or, Box::new(b)), e.span()),
-        )
-    })
-    .boxed()
-}
-
-/// Parse an integer literal with optional leading minus.
-/// The lexer never folds a sign into number tokens (that broke binary
-/// minus), so literal positions accept `Minus Int` for negative values.
-fn signed_int<'tokens, 'src: 'tokens, I>(
-) -> impl Parser<'tokens, I, i64, extra::Err<Rich<'tokens, Token<'src>, Span>>> + Clone
-where
-    I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
-{
-    just(Token::Minus)
-        .or_not()
-        .then(select! { Token::Int(n) => n })
-        .map(|(minus, n)| if minus.is_some() { -n } else { n })
-}
-
-/// Parse a float literal with optional leading minus
-fn signed_float<'tokens, 'src: 'tokens, I>(
-) -> impl Parser<'tokens, I, f64, extra::Err<Rich<'tokens, Token<'src>, Span>>> + Clone
-where
-    I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
-{
-    just(Token::Minus)
-        .or_not()
-        .then(select! { Token::Float(n) => n })
-        .map(|(minus, n)| if minus.is_some() { -n } else { n })
-}
-
-/// Parse an identifier
-fn ident<'tokens, 'src: 'tokens, I>(
-) -> impl Parser<'tokens, I, Spanned<&'src str>, extra::Err<Rich<'tokens, Token<'src>, Span>>> + Clone
-where
-    I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
-{
-    select! { Token::Ident(s) => s }
-        .map_with(|s, e| (s, e.span()))
-}
-
-/// Parse an identifier (raw, without span)
-fn ident_raw<'tokens, 'src: 'tokens, I>(
-) -> impl Parser<'tokens, I, &'src str, extra::Err<Rich<'tokens, Token<'src>, Span>>> + Clone
-where
-    I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
-{
-    select! { Token::Ident(s) => s }
-}
-
-/// Parse a string literal with interpolation support.
-/// Malformed interpolations are reported as parse errors.
-fn string_literal<'tokens, 'src: 'tokens, I>(
-) -> impl Parser<'tokens, I, Spanned<StringLiteral<'src>>, extra::Err<Rich<'tokens, Token<'src>, Span>>> + Clone
-where
-    I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
-{
-    select! { Token::String(s) => s }
-        .validate(|s, e, emitter| {
-            let span: Span = e.span();
-            // Offset by 1 to account for the opening quote
-            match parse_interpolated_string(s, span.start + 1) {
-                Ok(str_literal) => (str_literal, span),
-                Err(errors) => {
-                    for err in errors {
-                        emitter.emit(Rich::custom(err.span, err.message));
-                    }
-                    (StringLiteral { parts: vec![] }, span)
+    fn program(&mut self) -> Program<'src> {
+        let mut statements = Vec::new();
+        while !self.at_end() {
+            let start = self.cur_span().start;
+            match self.statement() {
+                Ok(stmt) => {
+                    statements.push((stmt, Span::new(start, self.prev_end())));
+                }
+                Err(e) => {
+                    self.errors.push(e);
+                    self.synchronize();
                 }
             }
+        }
+        Program { statements }
+    }
+
+    fn statement(&mut self) -> Result<Statement<'src>, ParseError> {
+        let attribute = if self.peek() == Some(&Token::Hash) {
+            Some(self.attribute()?)
+        } else {
+            None
+        };
+        let kind = self.statement_kind()?;
+        Ok(Statement { attribute, kind })
+    }
+
+    /// #[when(expr)]
+    fn attribute(&mut self) -> Result<Spanned<Expr<'src>>, ParseError> {
+        self.expect(Token::Hash, "'#'")?;
+        self.expect(Token::LBracket, "'[' after '#'")?;
+        self.expect(Token::When, "'when'")?;
+        self.expect(Token::LParen, "'(' after 'when'")?;
+        let expr = self.expr()?;
+        self.expect(Token::RParen, "')' to close the when condition")?;
+        self.expect(Token::RBracket, "']' to close the attribute")?;
+        Ok(expr)
+    }
+
+    fn statement_kind(&mut self) -> Result<StatementKind<'src>, ParseError> {
+        match self.peek() {
+            Some(Token::Import) => self.import_stmt(),
+            Some(Token::Var) => self.var_stmt(),
+            Some(Token::Faker) => self.faker_stmt(),
+            Some(Token::Relation) => self.relation_stmt(false),
+            Some(Token::IgnoreRelation) => self.relation_stmt(true),
+            Some(Token::Anonymize) => self.anonymize_stmt(),
+            Some(Token::ExcludeData) => {
+                self.pos += 1;
+                Ok(StatementKind::Exclude(self.table_pattern()?))
+            }
+            Some(Token::IgnoreTable) => {
+                self.pos += 1;
+                Ok(StatementKind::Ignore(self.table_pattern()?))
+            }
+            Some(Token::Full) => {
+                self.pos += 1;
+                Ok(StatementKind::Full(self.table_pattern_list()?))
+            }
+            Some(Token::Aggregate) => self.aggregate_stmt(),
+            Some(Token::Get) => self.get_stmt(),
+            Some(Token::Preserve) => self.preserve_stmt(),
+            Some(Token::Set) => self.set_stmt(),
+            Some(Token::After) => self.after_stmt(),
+            _ => Err(self.err_here(
+                "a statement (import, var, faker, relation, ignore_relation, anonymize, \
+                 exclude_data, ignore_table, full, aggregate, get, preserve, set, or after)",
+            )),
+        }
+    }
+
+    /// import "path" — the path is a raw string (no interpolation)
+    fn import_stmt(&mut self) -> Result<StatementKind<'src>, ParseError> {
+        self.pos += 1;
+        let path = self.string_raw("a file path string after 'import'")?;
+        Ok(StatementKind::Import(path))
+    }
+
+    /// var name: type [= default]
+    fn var_stmt(&mut self) -> Result<StatementKind<'src>, ParseError> {
+        self.pos += 1;
+        let decl = self.var_decl()?;
+        Ok(StatementKind::Var(decl))
+    }
+
+    /// name: type [= default] — shared by `var` and get-function parameters
+    fn var_decl(&mut self) -> Result<VarDecl<'src>, ParseError> {
+        let name = self.expect_ident("a variable name")?;
+        self.expect(Token::Colon, "':' after the variable name")?;
+        let var_type = self.var_type()?;
+        let default = if self.eat(&Token::Assign) {
+            Some(self.literal()?)
+        } else {
+            None
+        };
+        Ok(VarDecl { name, var_type, default })
+    }
+
+    fn var_type(&mut self) -> Result<Spanned<VarType>, ParseError> {
+        let start = self.cur_span();
+        let scalar = match self.peek() {
+            Some(Token::TypeString) => VarType::String,
+            Some(Token::TypeInt) => VarType::Int,
+            Some(Token::TypeFloat) => VarType::Float,
+            Some(Token::TypeBool) => VarType::Bool,
+            _ => return Err(self.err_here("a type (string, int, float, or bool)")),
+        };
+        self.pos += 1;
+        let var_type = if self.eat(&Token::LBracket) {
+            self.expect(Token::RBracket, "']' to close the array type")?;
+            match scalar {
+                VarType::String => VarType::StringArray,
+                VarType::Int => VarType::IntArray,
+                VarType::Float => VarType::FloatArray,
+                VarType::Bool => VarType::BoolArray,
+                _ => unreachable!(),
+            }
+        } else {
+            scalar
+        };
+        Ok((var_type, Span::new(start.start, self.prev_end())))
+    }
+
+    /// faker name ["a", "b", ...$var] or faker name $variable
+    fn faker_stmt(&mut self) -> Result<StatementKind<'src>, ParseError> {
+        self.pos += 1;
+        let name = self.expect_ident("a faker pool name")?;
+
+        let source = if self.eat(&Token::Dollar) {
+            let var = self.expect_ident("a variable name after '$'")?;
+            FakerSource::Variable(var.0)
+        } else if self.peek() == Some(&Token::LBracket) {
+            self.pos += 1;
+            let mut values = Vec::new();
+            if self.peek() != Some(&Token::RBracket) {
+                loop {
+                    let start = self.cur_span();
+                    let value = if self.eat(&Token::Spread) {
+                        self.expect(Token::Dollar, "'$' after '...'")?;
+                        let var = self.expect_ident("a variable name after '...$'")?;
+                        FakerValue::Spread(var.0)
+                    } else {
+                        let (lit, _) = self.string_literal("a string value or ...$variable")?;
+                        FakerValue::Literal(lit)
+                    };
+                    values.push((value, Span::new(start.start, self.prev_end())));
+                    if !self.eat(&Token::Comma) {
+                        break;
+                    }
+                    // Trailing comma allowed
+                    if self.peek() == Some(&Token::RBracket) {
+                        break;
+                    }
+                }
+            }
+            self.expect(Token::RBracket, "']' to close the faker value list")?;
+            FakerSource::Array(values)
+        } else {
+            return Err(self.err_here("'[' or '$' after the faker name"));
+        };
+
+        Ok(StatementKind::Faker(FakerDecl { name, source }))
+    }
+
+    /// relation table.column -> table.column (also ignore_relation)
+    fn relation_stmt(&mut self, ignore: bool) -> Result<StatementKind<'src>, ParseError> {
+        self.pos += 1;
+        let from = self.column_ref()?;
+        self.expect(Token::Arrow, "'->' between the relation columns")?;
+        let to = self.column_ref()?;
+        let decl = RelationDecl { from, to };
+        Ok(if ignore {
+            StatementKind::IgnoreRelation(decl)
+        } else {
+            StatementKind::Relation(decl)
         })
-        .boxed()
+    }
+
+    fn column_ref(&mut self) -> Result<Spanned<ColumnRef<'src>>, ParseError> {
+        let start = self.cur_span();
+        let table = self.expect_ident("a table name")?;
+        self.expect(Token::Dot, "'.' between table and column")?;
+        let column = self.expect_ident("a column name")?;
+        Ok((
+            ColumnRef { table: table.0, column: column.0 },
+            Span::new(start.start, self.prev_end()),
+        ))
+    }
+
+    /// anonymize table { column -> null|faker ... }
+    fn anonymize_stmt(&mut self) -> Result<StatementKind<'src>, ParseError> {
+        self.pos += 1;
+        let table = self.expect_ident("a table name after 'anonymize'")?;
+        self.expect(Token::LBrace, "'{' to open the anonymize block")?;
+
+        let mut rules = Vec::new();
+        while let Some(Token::Ident(_)) = self.peek() {
+            let start = self.cur_span();
+            let column = self.expect_ident("a column name")?;
+            self.expect(Token::Arrow, "'->' after the column name")?;
+            let target = match self.peek() {
+                Some(Token::Null) => {
+                    self.pos += 1;
+                    AnonymizeTarget::Null
+                }
+                Some(Token::Ident(_)) => AnonymizeTarget::Faker(self.expect_ident("a faker name")?),
+                _ => return Err(self.err_here("'null' or a faker name after '->'")),
+            };
+            rules.push((
+                AnonymizeRule { column, target },
+                Span::new(start.start, self.prev_end()),
+            ));
+        }
+
+        self.expect(Token::RBrace, "'}' to close the anonymize block")?;
+        Ok(StatementKind::Anonymize(AnonymizeBlock { table, rules }))
+    }
+
+    /// A table name or /regex/ pattern
+    fn table_pattern(&mut self) -> Result<TablePattern<'src>, ParseError> {
+        match self.peek() {
+            Some(Token::Regex(s)) => {
+                let pattern = TablePattern::Regex((s, self.cur_span()));
+                self.pos += 1;
+                Ok(pattern)
+            }
+            Some(Token::Ident(_)) => Ok(TablePattern::Exact(self.expect_ident("a table name")?)),
+            _ => Err(self.err_here("a table name or /regex/ pattern")),
+        }
+    }
+
+    /// pattern, pattern, ... (at least one, no trailing comma)
+    fn table_pattern_list(&mut self) -> Result<Vec<TablePattern<'src>>, ParseError> {
+        let mut patterns = vec![self.table_pattern()?];
+        while self.eat(&Token::Comma) {
+            patterns.push(self.table_pattern()?);
+        }
+        Ok(patterns)
+    }
+
+    /// aggregate name { root table [where] [order by] [limit] [exclude] [root_only] }
+    fn aggregate_stmt(&mut self) -> Result<StatementKind<'src>, ParseError> {
+        self.pos += 1;
+        let name = self.expect_ident("an aggregate name")?;
+        self.expect(Token::LBrace, "'{' to open the aggregate block")?;
+        self.expect(Token::Root, "'root' as the first clause of an aggregate")?;
+        let root = self.expect_ident("the root table name")?;
+
+        let (where_clause, order_by, limit, exclude_tables, root_only) = self.query_clauses()?;
+
+        self.expect(Token::RBrace, "'}' to close the aggregate block")?;
+        Ok(StatementKind::Aggregate(AggregateBlock {
+            name,
+            root,
+            where_clause,
+            order_by,
+            limit,
+            exclude_tables,
+            root_only,
+        }))
+    }
+
+    /// get name(params) { aggregate [where] [order by] [limit] [exclude] [root_only] }
+    fn get_stmt(&mut self) -> Result<StatementKind<'src>, ParseError> {
+        self.pos += 1;
+        let name = self.expect_ident("a get function name")?;
+
+        self.expect(Token::LParen, "'(' after the get function name")?;
+        let mut params = Vec::new();
+        if self.peek() != Some(&Token::RParen) {
+            loop {
+                let start = self.cur_span();
+                let decl = self.var_decl()?;
+                params.push((decl, Span::new(start.start, self.prev_end())));
+                if !self.eat(&Token::Comma) {
+                    break;
+                }
+                // Trailing comma allowed
+                if self.peek() == Some(&Token::RParen) {
+                    break;
+                }
+            }
+        }
+        self.expect(Token::RParen, "')' to close the parameter list")?;
+
+        self.expect(Token::LBrace, "'{' to open the get function body")?;
+        let aggregate = self.expect_ident("the aggregate name to fetch")?;
+
+        let (where_clause, order_by, limit, exclude_tables, root_only) = self.query_clauses()?;
+
+        self.expect(Token::RBrace, "'}' to close the get function body")?;
+        Ok(StatementKind::Get(GetFunctionDef {
+            name,
+            params,
+            aggregate,
+            where_clause,
+            order_by,
+            limit,
+            exclude_tables,
+            root_only,
+        }))
+    }
+
+    /// The shared optional clause sequence of aggregate and get bodies:
+    /// [where "..."] [order by col [asc|desc]] [limit N|$var] [exclude ...] [root_only]
+    #[allow(clippy::type_complexity)]
+    fn query_clauses(
+        &mut self,
+    ) -> Result<
+        (
+            Option<Spanned<StringLiteral<'src>>>,
+            Option<OrderByClause<'src>>,
+            Option<Spanned<LimitValue<'src>>>,
+            Vec<TablePattern<'src>>,
+            bool,
+        ),
+        ParseError,
+    > {
+        let where_clause = if self.eat(&Token::Where) {
+            Some(self.string_literal("a condition string after 'where'")?)
+        } else {
+            None
+        };
+
+        let order_by = if self.eat(&Token::Order) {
+            self.expect(Token::By, "'by' after 'order'")?;
+            let column = self.expect_ident("a column name after 'order by'")?;
+            let direction = match self.peek() {
+                Some(Token::Asc) => {
+                    self.pos += 1;
+                    Some(SortDirection::Asc)
+                }
+                Some(Token::Desc) => {
+                    self.pos += 1;
+                    Some(SortDirection::Desc)
+                }
+                _ => None,
+            };
+            Some(OrderByClause { column, direction })
+        } else {
+            None
+        };
+
+        let limit = if self.eat(&Token::Limit) {
+            let start = self.cur_span();
+            let value = match self.peek() {
+                Some(Token::Int(n)) => {
+                    let n = *n;
+                    self.pos += 1;
+                    LimitValue::Literal(n)
+                }
+                Some(Token::Dollar) => {
+                    self.pos += 1;
+                    let var = self.expect_ident("a variable name after '$'")?;
+                    LimitValue::Variable(var.0)
+                }
+                _ => return Err(self.err_here("a number or $variable after 'limit'")),
+            };
+            Some((value, Span::new(start.start, self.prev_end())))
+        } else {
+            None
+        };
+
+        let exclude_tables = if self.eat(&Token::Exclude) {
+            self.table_pattern_list()?
+        } else {
+            Vec::new()
+        };
+
+        let root_only = self.eat(&Token::RootOnly);
+
+        Ok((where_clause, order_by, limit, exclude_tables, root_only))
+    }
+
+    /// preserve table where "condition"
+    fn preserve_stmt(&mut self) -> Result<StatementKind<'src>, ParseError> {
+        self.pos += 1;
+        let table = self.expect_ident("a table name after 'preserve'")?;
+        self.expect(Token::Where, "'where' after the table name")?;
+        let where_clause = self.string_literal("a condition string after 'where'")?;
+        Ok(StatementKind::Preserve(PreserveStmt { table, where_clause }))
+    }
+
+    /// set table { match col = val, ...  col = val ... }
+    fn set_stmt(&mut self) -> Result<StatementKind<'src>, ParseError> {
+        self.pos += 1;
+        let table = self.expect_ident("a table name after 'set'")?;
+        self.expect(Token::LBrace, "'{' to open the set block")?;
+
+        self.expect(Token::Match, "'match' as the first clause of a set block")?;
+        let mut match_clause = vec![self.assignment()?];
+        while self.eat(&Token::Comma) {
+            match_clause.push(self.assignment()?);
+        }
+
+        let mut assignments = Vec::new();
+        while matches!(self.peek(), Some(Token::Ident(_))) {
+            assignments.push(self.assignment()?);
+        }
+
+        self.expect(Token::RBrace, "'}' to close the set block")?;
+        Ok(StatementKind::Set(SetBlock { table, match_clause, assignments }))
+    }
+
+    /// column = value
+    fn assignment(&mut self) -> Result<Spanned<Assignment<'src>>, ParseError> {
+        let start = self.cur_span();
+        let column = self.expect_ident("a column name")?;
+        self.expect(Token::Assign, "'=' after the column name")?;
+        let value = self.value()?;
+        Ok((
+            Assignment { column, value },
+            Span::new(start.start, self.prev_end()),
+        ))
+    }
+
+    /// after { """sql""" "sql" ... } — SQL strings are kept raw
+    fn after_stmt(&mut self) -> Result<StatementKind<'src>, ParseError> {
+        self.pos += 1;
+        self.expect(Token::LBrace, "'{' to open the after block")?;
+        let mut statements = Vec::new();
+        loop {
+            match self.peek() {
+                Some(Token::MultilineString(s)) | Some(Token::String(s)) => {
+                    statements.push((*s, self.cur_span()));
+                    self.pos += 1;
+                }
+                _ => break,
+            }
+        }
+        self.expect(Token::RBrace, "'}' to close the after block")?;
+        Ok(StatementKind::After(AfterBlock { statements }))
+    }
+
+    // ------------------------------------------------------------------
+    // Values and literals
+    // ------------------------------------------------------------------
+
+    /// A value in an assignment: $var, string, number, or bool
+    fn value(&mut self) -> Result<Spanned<Value<'src>>, ParseError> {
+        let start = self.cur_span();
+        let value = match self.peek() {
+            Some(Token::Dollar) => {
+                self.pos += 1;
+                let var = self.expect_ident("a variable name after '$'")?;
+                Value::Variable(var.0)
+            }
+            Some(Token::String(_)) => {
+                let (lit, _) = self.string_literal("a string")?;
+                Value::Literal(Literal::String(lit))
+            }
+            Some(Token::Bool(b)) => {
+                let b = *b;
+                self.pos += 1;
+                Value::Literal(Literal::Bool(b))
+            }
+            Some(Token::Int(_)) | Some(Token::Float(_)) | Some(Token::Minus) => {
+                Value::Literal(self.signed_number()?)
+            }
+            _ => return Err(self.err_here("a value ($variable, string, number, or bool)")),
+        };
+        Ok((value, Span::new(start.start, self.prev_end())))
+    }
+
+    /// A literal: string (with interpolation), number, bool, null, or an array
+    fn literal(&mut self) -> Result<Spanned<Literal<'src>>, ParseError> {
+        let start = self.cur_span();
+        let literal = match self.peek() {
+            Some(Token::LBracket) => self.array_literal()?,
+            Some(Token::String(_)) => {
+                let (lit, _) = self.string_literal("a string")?;
+                Literal::String(lit)
+            }
+            Some(Token::Bool(b)) => {
+                let b = *b;
+                self.pos += 1;
+                Literal::Bool(b)
+            }
+            Some(Token::Null) => {
+                self.pos += 1;
+                Literal::Null
+            }
+            Some(Token::Int(_)) | Some(Token::Float(_)) | Some(Token::Minus) => {
+                self.signed_number()?
+            }
+            _ => return Err(self.err_here("a literal value")),
+        };
+        Ok((literal, Span::new(start.start, self.prev_end())))
+    }
+
+    /// A number with optional leading minus (the lexer never folds the sign
+    /// into the literal — that broke binary minus without spaces)
+    fn signed_number(&mut self) -> Result<Literal<'src>, ParseError> {
+        let negative = self.eat(&Token::Minus);
+        match self.peek() {
+            Some(Token::Int(n)) => {
+                let n = *n;
+                self.pos += 1;
+                Ok(Literal::Int(if negative { -n } else { n }))
+            }
+            Some(Token::Float(n)) => {
+                let n = *n;
+                self.pos += 1;
+                Ok(Literal::Float(if negative { -n } else { n }))
+            }
+            _ => Err(self.err_here("a number")),
+        }
+    }
+
+    /// [a, b, c] — element type decided by the first element; trailing comma
+    /// allowed; empty arrays are string arrays
+    fn array_literal(&mut self) -> Result<Literal<'src>, ParseError> {
+        self.expect(Token::LBracket, "'['")?;
+
+        if self.eat(&Token::RBracket) {
+            return Ok(Literal::StringArray(Vec::new()));
+        }
+
+        enum Kind {
+            Str,
+            Int,
+            Float,
+            Bool,
+        }
+        let kind = match (self.peek(), self.peek2()) {
+            (Some(Token::String(_)), _) => Kind::Str,
+            (Some(Token::Bool(_)), _) => Kind::Bool,
+            (Some(Token::Int(_)), _) | (Some(Token::Minus), Some(Token::Int(_))) => Kind::Int,
+            (Some(Token::Float(_)), _) | (Some(Token::Minus), Some(Token::Float(_))) => Kind::Float,
+            _ => return Err(self.err_here("an array element (string, number, or bool)")),
+        };
+
+        macro_rules! parse_elements {
+            ($parse_one:expr) => {{
+                let mut items = Vec::new();
+                loop {
+                    items.push($parse_one(self)?);
+                    if !self.eat(&Token::Comma) {
+                        break;
+                    }
+                    if self.peek() == Some(&Token::RBracket) {
+                        break;
+                    }
+                }
+                items
+            }};
+        }
+
+        let literal = match kind {
+            Kind::Str => Literal::StringArray(parse_elements!(|p: &mut Self| p
+                .string_literal("a string array element"))),
+            Kind::Bool => Literal::BoolArray(parse_elements!(|p: &mut Self| {
+                match p.peek() {
+                    Some(Token::Bool(b)) => {
+                        let b = *b;
+                        p.pos += 1;
+                        Ok(b)
+                    }
+                    _ => Err(p.err_here("a bool array element")),
+                }
+            })),
+            Kind::Int => Literal::IntArray(parse_elements!(|p: &mut Self| {
+                match p.signed_number()? {
+                    Literal::Int(n) => Ok(n),
+                    _ => Err(p.err_here("an int array element")),
+                }
+            })),
+            Kind::Float => Literal::FloatArray(parse_elements!(|p: &mut Self| {
+                match p.signed_number()? {
+                    Literal::Float(n) => Ok(n),
+                    _ => Err(p.err_here("a float array element")),
+                }
+            })),
+        };
+
+        self.expect(Token::RBracket, "']' to close the array")?;
+        Ok(literal)
+    }
+
+    /// A string literal with interpolation and escape decoding. Malformed
+    /// interpolations are recorded as errors but parsing continues with an
+    /// empty literal, so one bad string doesn't hide later errors.
+    fn string_literal(
+        &mut self,
+        what: &str,
+    ) -> Result<Spanned<StringLiteral<'src>>, ParseError> {
+        match self.peek() {
+            Some(Token::String(s)) => {
+                let s = *s;
+                let span = self.cur_span();
+                self.pos += 1;
+                // Offset by 1 to account for the opening quote
+                match parse_interpolated_string(s, span.start + 1) {
+                    Ok(lit) => Ok((lit, span)),
+                    Err(errors) => {
+                        for err in errors {
+                            self.errors.push(ParseError {
+                                span: err.span.into_range(),
+                                message: err.message,
+                            });
+                        }
+                        Ok((StringLiteral { parts: vec![] }, span))
+                    }
+                }
+            }
+            _ => Err(self.err_here(what)),
+        }
+    }
+
+    /// A raw string literal (no interpolation, no escape decoding)
+    fn string_raw(&mut self, what: &str) -> Result<Spanned<&'src str>, ParseError> {
+        match self.peek() {
+            Some(Token::String(s)) => {
+                let s = *s;
+                let span = self.cur_span();
+                self.pos += 1;
+                Ok((s, span))
+            }
+            _ => Err(self.err_here(what)),
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Expressions (precedence climbing)
+    // ------------------------------------------------------------------
+
+    fn expr(&mut self) -> Result<Spanned<Expr<'src>>, ParseError> {
+        self.or_expr()
+    }
+
+    fn binary_level(
+        &mut self,
+        next: fn(&mut Self) -> Result<Spanned<Expr<'src>>, ParseError>,
+        op_of: fn(&Token<'src>) -> Option<BinaryOp>,
+    ) -> Result<Spanned<Expr<'src>>, ParseError> {
+        let mut lhs = next(self)?;
+        while let Some(op) = self.peek().and_then(op_of) {
+            self.pos += 1;
+            let rhs = next(self)?;
+            let span = Span::new(lhs.1.start, rhs.1.end);
+            lhs = (Expr::Binary(Box::new(lhs), op, Box::new(rhs)), span);
+        }
+        Ok(lhs)
+    }
+
+    fn or_expr(&mut self) -> Result<Spanned<Expr<'src>>, ParseError> {
+        self.binary_level(Self::and_expr, |t| match t {
+            Token::Or => Some(BinaryOp::Or),
+            _ => None,
+        })
+    }
+
+    fn and_expr(&mut self) -> Result<Spanned<Expr<'src>>, ParseError> {
+        self.binary_level(Self::equality_expr, |t| match t {
+            Token::And => Some(BinaryOp::And),
+            _ => None,
+        })
+    }
+
+    fn equality_expr(&mut self) -> Result<Spanned<Expr<'src>>, ParseError> {
+        self.binary_level(Self::comparison_expr, |t| match t {
+            Token::Eq => Some(BinaryOp::Eq),
+            Token::NotEq => Some(BinaryOp::NotEq),
+            _ => None,
+        })
+    }
+
+    fn comparison_expr(&mut self) -> Result<Spanned<Expr<'src>>, ParseError> {
+        self.binary_level(Self::additive_expr, |t| match t {
+            Token::Lt => Some(BinaryOp::Lt),
+            Token::Gt => Some(BinaryOp::Gt),
+            Token::LtEq => Some(BinaryOp::LtEq),
+            Token::GtEq => Some(BinaryOp::GtEq),
+            _ => None,
+        })
+    }
+
+    fn additive_expr(&mut self) -> Result<Spanned<Expr<'src>>, ParseError> {
+        self.binary_level(Self::multiplicative_expr, |t| match t {
+            Token::Plus => Some(BinaryOp::Add),
+            Token::Minus => Some(BinaryOp::Sub),
+            _ => None,
+        })
+    }
+
+    fn multiplicative_expr(&mut self) -> Result<Spanned<Expr<'src>>, ParseError> {
+        self.binary_level(Self::unary_expr, |t| match t {
+            Token::Star => Some(BinaryOp::Mul),
+            Token::Slash => Some(BinaryOp::Div),
+            Token::Percent => Some(BinaryOp::Mod),
+            _ => None,
+        })
+    }
+
+    fn unary_expr(&mut self) -> Result<Spanned<Expr<'src>>, ParseError> {
+        let op = match self.peek() {
+            Some(Token::Not) => Some(UnaryOp::Not),
+            Some(Token::Minus) => Some(UnaryOp::Neg),
+            _ => None,
+        };
+        if let Some(op) = op {
+            let start = self.cur_span().start;
+            self.pos += 1;
+            let inner = self.unary_expr()?;
+            let span = Span::new(start, inner.1.end);
+            return Ok((Expr::Unary(op, Box::new(inner)), span));
+        }
+        self.primary_expr()
+    }
+
+    fn primary_expr(&mut self) -> Result<Spanned<Expr<'src>>, ParseError> {
+        let span = self.cur_span();
+        match self.peek() {
+            Some(Token::Dollar) => {
+                self.pos += 1;
+                let name = if self.in_interpolation {
+                    // Inside interpolations keywords are valid variable names
+                    // ({$limit} etc.)
+                    match self.peek().and_then(token_as_ident) {
+                        Some(name) => {
+                            self.pos += 1;
+                            name
+                        }
+                        None => return Err(self.err_here("a variable name after '$'")),
+                    }
+                } else {
+                    self.expect_ident("a variable name after '$'")?.0
+                };
+                Ok((Expr::Variable(name), Span::new(span.start, self.prev_end())))
+            }
+            Some(Token::Ident("unique"))
+                if self.in_interpolation && self.peek2() == Some(&Token::LParen) =>
+            {
+                self.pos += 2;
+                self.expect(Token::RParen, "')' to close unique()")?;
+                Ok((Expr::Unique, Span::new(span.start, self.prev_end())))
+            }
+            Some(Token::Int(n)) => {
+                let n = *n;
+                self.pos += 1;
+                Ok((Expr::Literal(Literal::Int(n)), span))
+            }
+            Some(Token::Float(n)) => {
+                let n = *n;
+                self.pos += 1;
+                Ok((Expr::Literal(Literal::Float(n)), span))
+            }
+            Some(Token::Bool(b)) => {
+                let b = *b;
+                self.pos += 1;
+                Ok((Expr::Literal(Literal::Bool(b)), span))
+            }
+            Some(Token::String(_)) => {
+                if self.in_interpolation {
+                    // Nested strings inside interpolations are plain text
+                    let (s, span) = self.string_raw("a string")?;
+                    Ok((
+                        Expr::Literal(Literal::String(StringLiteral {
+                            parts: vec![StringPart::Text(std::borrow::Cow::Borrowed(s))],
+                        })),
+                        span,
+                    ))
+                } else {
+                    let (lit, span) = self.string_literal("a string")?;
+                    Ok((Expr::Literal(Literal::String(lit)), span))
+                }
+            }
+            Some(Token::LParen) => {
+                self.pos += 1;
+                let (inner, _) = self.expr()?;
+                self.expect(Token::RParen, "')' to close the expression")?;
+                Ok((inner, Span::new(span.start, self.prev_end())))
+            }
+            _ => Err(self.err_here("an expression ($variable, literal, or parentheses)")),
+        }
+    }
 }
-
-/// Parse a string literal (raw, with span on the raw string)
-fn string_literal_raw<'tokens, 'src: 'tokens, I>(
-) -> impl Parser<'tokens, I, Spanned<&'src str>, extra::Err<Rich<'tokens, Token<'src>, Span>>> + Clone
-where
-    I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
-{
-    select! { Token::String(s) => s }
-        .map_with(|s, e| (s, e.span()))
-}
-
-/// Parse a literal value
-fn literal<'tokens, 'src: 'tokens, I>(
-) -> impl Parser<'tokens, I, Spanned<Literal<'src>>, extra::Err<Rich<'tokens, Token<'src>, Span>>> + Clone
-where
-    I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
-{
-    // String array literal: ["a", "b", "c"]
-    let string_array = string_literal()
-        .separated_by(just(Token::Comma))
-        .allow_trailing()
-        .collect()
-        .delimited_by(just(Token::LBracket), just(Token::RBracket))
-        .map(Literal::StringArray);
-
-    // Int array literal: [1, -2, 3]
-    let int_array = signed_int()
-        .separated_by(just(Token::Comma))
-        .allow_trailing()
-        .collect()
-        .delimited_by(just(Token::LBracket), just(Token::RBracket))
-        .map(Literal::IntArray);
-
-    // Float array literal: [1.0, -2.5, 3.14]
-    let float_array = signed_float()
-        .separated_by(just(Token::Comma))
-        .allow_trailing()
-        .collect()
-        .delimited_by(just(Token::LBracket), just(Token::RBracket))
-        .map(Literal::FloatArray);
-
-    // Bool array literal: [true, false, true]
-    let bool_array = select! { Token::Bool(b) => b }
-        .separated_by(just(Token::Comma))
-        .allow_trailing()
-        .collect()
-        .delimited_by(just(Token::LBracket), just(Token::RBracket))
-        .map(Literal::BoolArray);
-
-    choice((
-        string_array,
-        int_array,
-        float_array,
-        bool_array,
-        // Scalar strings interpolate like everywhere else (string arrays
-        // above already did; scalars previously kept braces as literal text)
-        string_literal().map(|(lit, _)| Literal::String(lit)),
-        signed_float().map(Literal::Float),
-        signed_int().map(Literal::Int),
-        select! { Token::Bool(b) => Literal::Bool(b) },
-        just(Token::Null).to(Literal::Null),
-    ))
-    .map_with(|l, e| (l, e.span()))
-    .boxed()
-}
-
-/// Parse a multiline string
-fn multiline_string<'tokens, 'src: 'tokens, I>(
-) -> impl Parser<'tokens, I, Spanned<&'src str>, extra::Err<Rich<'tokens, Token<'src>, Span>>> + Clone
-where
-    I: ValueInput<'tokens, Token = Token<'src>, Span = Span>,
-{
-    select! { Token::MultilineString(s) => s }
-        .map_with(|s, e| (s, e.span()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lexer::lexer;
 
     fn parse(input: &str) -> Program<'_> {
-        let (tokens, lex_errors) = lexer().parse(input).into_output_errors();
-        if !lex_errors.is_empty() {
-            panic!("Lexer errors: {:?}", lex_errors);
-        }
-        let tokens = tokens.unwrap();
-
-        let len = input.len();
-        let (ast, parse_errors) = parser()
-            .parse(tokens.as_slice().map((len..len).into(), |(t, s)| (t, s)))
-            .into_output_errors();
-
-        if !parse_errors.is_empty() {
-            panic!("Parser errors: {:?}", parse_errors);
-        }
-        ast.unwrap()
+        crate::parse(input).unwrap_or_else(|errors| panic!("Parse errors: {:?}", errors))
     }
 
     #[test]
