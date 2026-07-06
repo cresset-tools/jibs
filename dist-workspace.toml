@@ -82,7 +82,7 @@ simple-download-url = "https://releases.bougie.tools/github/jibs/releases/downlo
 
 # Extra steps injected into every build-local-artifacts job BEFORE the dist
 # build: cross-compile the musl server binaries the client embeds.
-github-build-setup = "build-setup.yml"
+github-build-setup = "../build-setup.yml"
 
 # Run publish-mirror after the release is announced to fan the dist artifacts
 # out to the origin server, and composer-branch to publish the Packagist tag —
