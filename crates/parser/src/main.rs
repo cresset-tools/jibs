@@ -1,6 +1,6 @@
 //! Jibs DSL Parser CLI
 
-use ariadne::{Color, Label, Report, ReportKind, Source};
+use std::io::IsTerminal;
 use std::{env, fs};
 
 fn main() {
@@ -32,18 +32,8 @@ fn main() {
             }
         }
         Err(errors) => {
-            for error in errors {
-                Report::build(ReportKind::Error, &filename, error.span.start)
-                    .with_message(&error.message)
-                    .with_label(
-                        Label::new((&filename, error.span.clone()))
-                            .with_message(&error.message)
-                            .with_color(Color::Red),
-                    )
-                    .finish()
-                    .print((&filename, Source::from(&source)))
-                    .unwrap();
-            }
+            let color = std::io::stderr().is_terminal();
+            eprint!("{}", jibs_parser::render_errors(&filename, &source, &errors, color));
             std::process::exit(1);
         }
     }
