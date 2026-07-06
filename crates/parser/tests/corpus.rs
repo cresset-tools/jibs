@@ -60,7 +60,7 @@ fn all_doc_examples_parse() {
     let mut failures = Vec::new();
     let mut total = 0;
 
-    for doc in ["SPEC.md", "GRAMMAR.md"] {
+    for doc in ["README.md", "SPEC.md", "GRAMMAR.md"] {
         let path = root.join(doc);
         let content = std::fs::read_to_string(&path).expect("read doc");
         for (line, block) in extract_jibs_blocks(&content) {
