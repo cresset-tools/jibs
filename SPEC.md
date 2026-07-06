@@ -871,8 +871,14 @@ jibs plan <CONFIG> [--var ...]        Print the resolved execution plan (JSON)
 
 | Option | Description |
 |--------|-------------|
+| `--dry-run` | Report what would be imported without touching the local database |
 | `--resume` | Resume a previously interrupted import |
 | `--clean` | Discard state from a previous interrupted import and start fresh |
+
+`--dry-run` connects to the remote host, classifies every table the way the
+import would (aggregate / full / excluded), and counts how many root rows
+currently match each aggregate's where clause — without connecting to the
+local database at all.
 
 An interrupted import leaves a checkpoint table and possibly preserve-backup
 tables in the local database; the next import must choose `--resume` or

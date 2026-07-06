@@ -45,6 +45,7 @@ fn client_init_wire_format_is_stable() {
         compression: CompressionMode::Zstd,
         parallel: 4,
         collect_metrics: false,
+        dry_run: false,
     };
 
     let mut buffer = Vec::new();
@@ -52,7 +53,7 @@ fn client_init_wire_format_is_stable() {
 
     assert_eq!(
         hex(&buffer),
-        "53000000010001066f726465727307757365725f6964057573657273026964010b757365725f6f7264657273066f7264657273010b757365725f6964203d2031000001c800000000000000000000000000000000010400",
+        "54000000010001066f726465727307757365725f6964057573657273026964010b757365725f6f7264657273066f7264657273010b757365725f6964203d2031000001c80000000000000000000000000000000001040000",
         "ClientMessage::Init wire format changed — bump PROTOCOL_VERSION and update this snapshot"
     );
 }

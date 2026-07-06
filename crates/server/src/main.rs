@@ -108,11 +108,12 @@ fn run_echo_mode() -> Result<()> {
     let init_msg: ClientMessage = read_message(&mut reader)?;
 
     match init_msg {
-        ClientMessage::Init { plan, compression, parallel, collect_metrics } => {
+        ClientMessage::Init { plan, compression, parallel, collect_metrics, dry_run } => {
             eprintln!("Received Init message:");
             eprintln!("  Compression: {:?}", compression);
             eprintln!("  Parallel: {}", parallel);
             eprintln!("  Collect metrics: {}", collect_metrics);
+            eprintln!("  Dry run: {}", dry_run);
             eprintln!("  Variables: {}", plan.variables.len());
             eprintln!("  Relations: {}", plan.relations.len());
             eprintln!("  Aggregates: {}", plan.aggregates.len());
@@ -162,8 +163,10 @@ fn run() -> Result<()> {
         }
     };
 
-    let (mut plan, client_compression, parallel, collect_metrics) = match init_msg {
-        ClientMessage::Init { plan, compression, parallel, collect_metrics } => (plan, compression, parallel, collect_metrics),
+    let (mut plan, client_compression, parallel, collect_metrics, dry_run) = match init_msg {
+        ClientMessage::Init { plan, compression, parallel, collect_metrics, dry_run } => {
+            (plan, compression, parallel, collect_metrics, dry_run)
+        }
         _ => {
             return Err(ServerError::Protocol(
                 "Expected Init message".to_string(),
@@ -241,6 +244,17 @@ fn run() -> Result<()> {
         compression,
     };
     writer.write_message(&ready_msg)?;
+
+    // Dry run: report what would happen instead of streaming, then exit
+    if dry_run {
+        let (table_dispositions, root_counts) =
+            traversal::compute_dry_run_report(&mut conn, &plan, &table_name_to_id)?;
+        writer.write_message(&ServerMessage::DryRunReport {
+            table_dispositions,
+            root_counts,
+        })?;
+        return Ok(());
+    }
 
     // Wait for client to start
     let msg: ClientMessage = read_message(&mut reader)?;
