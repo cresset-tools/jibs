@@ -90,11 +90,11 @@ github-build-setup = "build-setup.yml"
 # attached to the release. (release.yml is hand-edited, so these also exist as
 # explicit `custom-publish-mirror`/`custom-composer-branch` jobs there; keep
 # them in sync.)
-post-announce-jobs = ["./publish-mirror", "./composer-branch"]
+post-announce-jobs = ["./sign-release", "./publish-mirror", "./composer-branch"]
 
 # publish-mirror only needs to read the uploaded artifacts; composer-branch
 # pushes the composer branch + v* tag.
-github-custom-job-permissions = { "publish-mirror" = { contents = "read" }, "composer-branch" = { contents = "write" } }
+github-custom-job-permissions = { "sign-release" = { contents = "write", id-token = "write" }, "publish-mirror" = { contents = "read" }, "composer-branch" = { contents = "write" } }
 
 # What the installer prints after a successful install.
 install-success-msg = """

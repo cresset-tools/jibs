@@ -82,8 +82,7 @@ jobs:
           for f in \
             artifacts/*.tar.gz \
             artifacts/*.tar.gz.sha256 \
-            artifacts/*.zip \
-            artifacts/*.zip.sha256 \
+            artifacts/*.sig \
             artifacts/sha256.sum \
             artifacts/*.sh \
             artifacts/*.ps1 \

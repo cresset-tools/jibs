@@ -3,10 +3,22 @@
     "description": "Selective, anonymized MySQL database imports from production to local dev over SSH. Follows foreign keys from a handful of rows instead of dumping everything. Fetches a prebuilt Rust binary on demand.",
     "type": "library",
     "license": "EUPL-1.2",
-    "keywords": ["mysql", "database", "import", "anonymization", "magento", "magento2", "cli", "developer-tools"],
+    "keywords": [
+        "mysql",
+        "database",
+        "import",
+        "anonymization",
+        "magento",
+        "magento2",
+        "cli",
+        "developer-tools"
+    ],
     "homepage": "https://github.com/cresset-tools/jibs",
     "authors": [
-        { "name": "Jelle Besseling", "email": "jelle@pingiun.com" }
+        {
+            "name": "Jelle Besseling",
+            "email": "jelle@pingiun.com"
+        }
     ],
     "require": {
         "php": ">=8.1"
@@ -14,5 +26,28 @@
     "suggest": {
         "ext-curl": "Faster, more reliable binary downloads"
     },
-    "bin": ["bin/jibs"]
+    "bin": [
+        "bin/jibs"
+    ],
+    "extra": {
+        "bougie": {
+            "native-binary": {
+                "spec": 1,
+                "name": "jibs",
+                "tag-prefix": "jibs-v",
+                "base-urls": [
+                    "https://releases.bougie.tools/github/jibs/releases/download",
+                    "https://github.com/cresset-tools/jibs/releases/download"
+                ],
+                "targets": [
+                    "x86_64-unknown-linux-gnu",
+                    "x86_64-unknown-linux-musl",
+                    "aarch64-apple-darwin"
+                ],
+                "sigstore": {
+                    "repository": "cresset-tools/jibs"
+                }
+            }
+        }
+    }
 }

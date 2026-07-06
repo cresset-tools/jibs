@@ -1,2 +1,5 @@
 /target
 .claude/
+
+# bougie PHP runtime state (created by bougie run in this directory)
+/vendor/bougie/
