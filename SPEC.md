@@ -840,11 +840,18 @@ a local MySQL server.
 ```text
 jibs import [CONFIG] [options]        Import data from a remote database
 jibs get <CONFIG> [options] -- ...    Fetch specific aggregates (get functions)
-jibs check <CONFIG>                   Parse and validate a config file
+jibs check <CONFIG> [--var ...]       Parse, resolve, and validate a config file
 jibs plan <CONFIG> [--var ...]        Print the resolved execution plan (JSON)
 ```
 
 `jibs import` without a config file imports all tables.
+
+`jibs check` fully resolves the configuration: it validates imports, variable
+types, faker references in anonymize rules, get-function aggregate
+references, and regex table patterns. Declared variables without a value are
+checked with placeholder values and listed (they must be provided at import
+time). The same validation runs at the start of every import, before
+anything connects.
 
 ### Connection Options (import and get)
 

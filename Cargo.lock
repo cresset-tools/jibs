@@ -783,6 +783,7 @@ dependencies = [
  "jibs_parser",
  "jibs_protocol",
  "mysql",
+ "regex",
  "serde",
  "serde_json",
  "sha2",
