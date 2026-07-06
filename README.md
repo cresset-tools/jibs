@@ -24,6 +24,14 @@ temporary state. Interrupted imports resume where they left off.
 $ curl -LsSf https://bougie.tools/jibs.sh | sh
 ```
 
+For PHP/Magento projects, there is also a Composer package that fetches the same binary
+on first use:
+
+```console
+$ composer require --dev cresset/jibs
+$ vendor/bin/jibs check shop.jibs
+```
+
 Prebuilt client binaries (Linux gnu/musl x86_64, macOS arm64) are attached to every
 [GitHub Release](https://github.com/cresset-tools/jibs/releases) and mirrored to cresset
 infrastructure. The remote side needs nothing preinstalled — the embedded helper covers
