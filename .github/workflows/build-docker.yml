@@ -1,0 +1,295 @@
+name: build-docker
+
+# Builds and publishes jibs's container images, following bougie's docker
+# pattern (scratch binary-only base + runnable OS variants on GHCR).
+#
+# Two entry points:
+#
+#   * workflow_call (release): release.yml invokes this as a post-announce
+#     job once release-please has published the `jibs-v<version>` GitHub
+#     Release. Wired via `post-announce-jobs` in dist-workspace.toml, same
+#     mechanism as publish-mirror.yml. Pushes versioned + rolling tags.
+#
+#   * pull_request: a push-free smoke build of the base image (amd64 only)
+#     whenever the Dockerfiles or this workflow change, so a broken image
+#     build is caught on the PR rather than at release time.
+#
+# Images (GHCR only — matches the mirror-first release philosophy):
+#
+#   ghcr.io/cresset-tools/jibs                  scratch, binary-only:
+#       COPY --from=ghcr.io/cresset-tools/jibs:latest /jibs /usr/local/bin/
+#   ghcr.io/cresset-tools/jibs:<v>-alpine       runnable, alpine:3.22 + openssh-client
+#   ghcr.io/cresset-tools/jibs:<v>-debian-slim  runnable, debian:trixie-slim + openssh-client
+#
+# Multi-arch: unlike bougie this repo has no Depot project, so the Rust
+# compile runs natively on per-arch GitHub runners (ubuntu-latest +
+# ubuntu-24.04-arm — free for public repos, no QEMU-emulated compiles). Each
+# leg pushes its image by digest and a merge job stitches them into one
+# manifest with `docker buildx imagetools create`. The variant overlays'
+# only RUN is a package install, so their arm64 leg tolerates QEMU and they
+# build multi-arch in a single job.
+
+on:
+  workflow_call:
+    inputs:
+      plan:
+        description: "dist plan JSON; its presence selects the release path."
+        required: false
+        default: ""
+        type: string
+  pull_request:
+    paths:
+      # Dependency-shape changes (a new path dep, a vendored crate, a context
+      # exclusion) can break the image build even when regular CI compiles
+      # fine, so those trigger the smoke build too. Pure crates/** source
+      # changes can't — CI already builds the same code — and are left out.
+      - "docker/**"
+      - ".dockerignore"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "vendor/**"
+      - ".github/workflows/build-docker.yml"
+
+permissions: {}
+
+env:
+  # github.repository is already lowercase for this repo; GHCR requires it.
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  # PR smoke test: prove the base image still builds. amd64 only (the arm64
+  # leg is the same native build, just on an arm64 runner) and never pushed.
+  pr-smoke:
+    if: ${{ github.event_name == 'pull_request' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/amd64
+          push: false
+          cache-from: type=gha,scope=base-amd64
+          cache-to: type=gha,mode=max,scope=base-amd64
+
+  # Release: build the base image natively on each arch, pushing by digest
+  # (no tags yet — the merge job owns those).
+  base:
+    if: ${{ inputs.plan != '' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # BuildKit provenance/sbom are disabled on the per-arch legs so the
+      # digests are plain image manifests the merge below can stitch; the
+      # GitHub-native provenance attestation covers the merged manifest.
+      - name: Build and push by digest (${{ matrix.arch }})
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/${{ matrix.arch }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          provenance: false
+          sbom: false
+          cache-from: type=gha,scope=base-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=base-${{ matrix.arch }}
+
+      - name: Export digest
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/digests
+          digest='${{ steps.build.outputs.digest }}'
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: docker-digest-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # Release: merge the per-arch digests into one multi-arch manifest carrying
+  # the version tags, and attest it.
+  merge:
+    needs: base
+    if: ${{ inputs.plan != '' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write # attestations
+      attestations: write
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+      major_minor: ${{ steps.ver.outputs.major_minor }}
+      is_prerelease: ${{ steps.ver.outputs.is_prerelease }}
+      digest: ${{ steps.digest.outputs.digest }}
+    steps:
+      - name: Derive version from dist plan
+        id: ver
+        # announcement_tag is `jibs-v<version>`; strip the namespace to get
+        # the bare semver used for image tags. major.minor + latest are only
+        # meaningful for stable releases, so gate them on the prerelease flag.
+        run: |
+          set -euo pipefail
+          tag='${{ fromJson(inputs.plan).announcement_tag }}'
+          version="${tag#jibs-v}"
+          prerelease='${{ fromJson(inputs.plan).announcement_is_prerelease }}'
+          {
+            echo "version=${version}"
+            echo "major_minor=${version%.*}"
+            echo "is_prerelease=${prerelease}"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: docker-digest-*
+          path: /tmp/digests
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Tags + labels
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.IMAGE }}
+          flavor: latest=false
+          tags: |
+            type=raw,value=${{ steps.ver.outputs.version }}
+            type=raw,value=${{ steps.ver.outputs.major_minor }},enable=${{ steps.ver.outputs.is_prerelease == 'false' }}
+            type=raw,value=latest,enable=${{ steps.ver.outputs.is_prerelease == 'false' }}
+
+      - name: Create multi-arch manifest
+        working-directory: /tmp/digests
+        run: |
+          set -euo pipefail
+          # Filenames in this dir are the bare per-arch digests.
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf "$IMAGE@sha256:%s " *)
+
+      - name: Resolve manifest digest
+        id: digest
+        run: |
+          set -euo pipefail
+          digest="$(docker buildx imagetools inspect \
+            "$IMAGE:${{ steps.ver.outputs.version }}" --format '{{json .Manifest }}' | jq -r .digest)"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Attest base image provenance
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.digest.outputs.digest }}
+          push-to-registry: true
+
+  # Release: overlay the just-pushed base binary onto runnable OS bases with
+  # openssh-client installed. Pinned to the base image by digest so a variant
+  # always matches its base.
+  extra:
+    needs: merge
+    if: ${{ inputs.plan != '' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write # attestations
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - suffix: alpine
+            base_image: alpine:3.22
+            ssh_install: "apk add --no-cache openssh-client"
+          - suffix: debian-slim
+            base_image: debian:trixie-slim
+            ssh_install: "apt-get update && apt-get install -y --no-install-recommends openssh-client && rm -rf /var/lib/apt/lists/*"
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      # The variant Dockerfile's only RUN is the openssh install; a
+      # QEMU-emulated arm64 package install costs seconds, so no arm runner
+      # or digest merge is needed here.
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Tags + labels
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.IMAGE }}
+          flavor: latest=false
+          tags: |
+            type=raw,value=${{ needs.merge.outputs.version }}-${{ matrix.suffix }}
+            type=raw,value=${{ needs.merge.outputs.major_minor }}-${{ matrix.suffix }},enable=${{ needs.merge.outputs.is_prerelease == 'false' }}
+            type=raw,value=${{ matrix.suffix }},enable=${{ needs.merge.outputs.is_prerelease == 'false' }}
+
+      - name: Build and push ${{ matrix.suffix }} variant
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.extra
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: |
+            BASE_IMAGE=${{ matrix.base_image }}
+            JIBS_IMAGE=${{ env.IMAGE }}@${{ needs.merge.outputs.digest }}
+            SSH_INSTALL=${{ matrix.ssh_install }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          annotations: ${{ steps.meta.outputs.annotations }}
+          provenance: mode=max
+          sbom: true
+
+      - name: Attest ${{ matrix.suffix }} variant provenance
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true

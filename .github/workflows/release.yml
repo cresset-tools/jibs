@@ -361,3 +361,20 @@ jobs:
     secrets: inherit
     permissions:
       "contents": "write"
+
+  # Build + push the GHCR container images. Independent of the tarball
+  # signing chain (the images are compiled from the tagged source, not cut
+  # from the release archives), so it only needs the announce barrier.
+  custom-build-docker:
+    needs:
+      - plan
+      - announce
+    uses: ./.github/workflows/build-docker.yml
+    with:
+      plan: ${{ needs.plan.outputs.val }}
+    secrets: inherit
+    permissions:
+      "contents": "read"
+      "packages": "write"
+      "id-token": "write"
+      "attestations": "write"

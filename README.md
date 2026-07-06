@@ -47,6 +47,15 @@ $ rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
 $ ./scripts/build.sh    # builds the helpers, then the client with them embedded
 ```
 
+Container images are published to GHCR on every release — including an aarch64 Linux
+client the tarballs don't ship. The runnable variants bundle the `openssh-client` the
+client drives; see [docker/README.md](docker/README.md) for usage:
+
+```console
+$ docker run --rm -it --network host -v ~/.ssh:/root/.ssh:ro -v "$PWD":/work -w /work \
+    ghcr.io/cresset-tools/jibs:alpine import shop.jibs --host user@prod ...
+```
+
 ## Configuration
 
 Imports are described in a `.jibs` file. The core concept is the **aggregate**: a root
