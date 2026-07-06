@@ -45,3 +45,9 @@ indicatif = "0.17"
 [patch.crates-io]
 mysql = { path = "vendor/mysql" }
 mysql_common = { path = "vendor/mysql_common" }
+
+# cargo-dist builds release artifacts with `--profile dist`. Inherit release;
+# dist expects this profile to exist (normally added by `dist init`).
+[profile.dist]
+inherits = "release"
+lto = "thin"
