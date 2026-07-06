@@ -169,6 +169,15 @@ struct GetArgs {
 struct CheckArgs {
     /// Path to the configuration file (.jibs or .json)
     config: PathBuf,
+
+    /// Variable assignments (can be repeated); variables without a value or
+    /// default are reported and checked with placeholder values
+    #[arg(long = "var", value_parser = parse_var)]
+    vars: Vec<(String, String)>,
+
+    /// Path to JSON file with variable values
+    #[arg(long = "var-file")]
+    var_file: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -353,7 +362,29 @@ fn parse_get_invocations(args: &[String]) -> Result<Vec<import::GetInvocation>> 
     Ok(invocations)
 }
 
+/// Merge --var flags with a --var-file (flags win)
+fn collect_vars(
+    vars: Vec<(String, String)>,
+    var_file: Option<&PathBuf>,
+) -> Result<std::collections::HashMap<String, String>> {
+    let mut merged: std::collections::HashMap<String, String> = vars.into_iter().collect();
+    if let Some(var_file) = var_file {
+        let content = std::fs::read_to_string(var_file)?;
+        let file_vars: std::collections::HashMap<String, serde_json::Value> =
+            serde_json::from_str(&content)?;
+        for (k, v) in file_vars {
+            merged.entry(k).or_insert_with(|| match v {
+                serde_json::Value::String(s) => s,
+                other => other.to_string(),
+            });
+        }
+    }
+    Ok(merged)
+}
+
 fn run_check(args: CheckArgs) -> Result<()> {
+    let vars = collect_vars(args.vars, args.var_file.as_ref())?;
+
     let extension = args
         .config
         .extension()
@@ -361,34 +392,76 @@ fn run_check(args: CheckArgs) -> Result<()> {
         .unwrap_or("");
 
     if extension == "json" {
-        // Validate JSON config
-        let content = std::fs::read_to_string(&args.config)?;
-        let _: serde_json::Value = serde_json::from_str(&content)?;
-        println!("Valid JSON config file");
-        Ok(())
-    } else {
-        // Validate .jibs DSL
-        let source = std::fs::read_to_string(&args.config)?;
+        // Fully parse and validate the JSON config (previously this only
+        // checked that the file was syntactically valid JSON)
+        let plan = json_config::parse_json_config(&args.config, &vars)
+            .map_err(|e| anyhow::anyhow!("JSON config error: {}", e))?;
+        resolver::validate_plan(&plan, &[])?;
+        println!(
+            "OK: {} aggregate(s), {} relation(s), {} anonymized table(s)",
+            plan.aggregates.len(),
+            plan.relations.len(),
+            plan.anonymization.len()
+        );
+        return Ok(());
+    }
 
-        match jibs_parser::parse(&source) {
-            Ok(program) => {
-                println!(
-                    "Parsed {} statements successfully",
-                    program.statements.len()
-                );
-                Ok(())
-            }
-            Err(errors) => {
-                eprint!("{}", render_parse_errors(&args.config, &source, &errors));
-                anyhow::bail!(
-                    "{} parse error{} in {}",
-                    errors.len(),
-                    if errors.len() == 1 { "" } else { "s" },
-                    args.config.display()
-                );
-            }
+    // Validate .jibs DSL: parse, then fully resolve. Declared variables
+    // without a value get placeholders and are reported below.
+    let source = std::fs::read_to_string(&args.config)?;
+
+    let program = match jibs_parser::parse(&source) {
+        Ok(program) => program,
+        Err(errors) => {
+            eprint!("{}", render_parse_errors(&args.config, &source, &errors));
+            anyhow::bail!(
+                "{} parse error{} in {}",
+                errors.len(),
+                if errors.len() == 1 { "" } else { "s" },
+                args.config.display()
+            );
+        }
+    };
+    println!("parsed:   {} statement(s)", program.statements.len());
+
+    let resolved = resolver::resolve_lenient(&args.config, &program, &vars)?;
+
+    println!(
+        "resolved: {} aggregate(s), {} get function(s), {} relation(s), \
+         {} anonymized table(s), {} faker pool(s)",
+        resolved.plan.aggregates.len(),
+        resolved.get_functions.len(),
+        resolved.plan.relations.len(),
+        resolved.plan.anonymization.len(),
+        resolved.plan.fakers.len(),
+    );
+    println!(
+        "post:     {} preserve rule(s), {} set block(s), {} after statement(s)",
+        resolved.plan.preserves.len(),
+        resolved.plan.sets.len(),
+        resolved.plan.after_statements.len(),
+    );
+
+    if !resolved.missing_vars.is_empty() {
+        println!();
+        println!("variables that must be provided at import time (--var/--var-file):");
+        let mut missing = resolved.missing_vars.clone();
+        missing.sort_by(|a, b| a.0.cmp(&b.0));
+        for (name, var_type) in &missing {
+            println!("  {}: {:?}", name, var_type);
+        }
+        let has_bool = missing.iter().any(|(_, t)| matches!(t, jibs_parser::ast::VarType::Bool));
+        if has_bool {
+            println!(
+                "  note: missing bool variables are checked as false, so statements\n  \
+                 gated on them with #[when(...)] were not validated"
+            );
         }
     }
+
+    println!();
+    println!("OK");
+    Ok(())
 }
 
 /// Render parse errors with source snippets (colored when stderr is a tty)
@@ -407,19 +480,7 @@ fn render_parse_errors(
 }
 
 fn run_plan(args: PlanArgs) -> Result<()> {
-    // Load variables from file if specified
-    let mut vars: std::collections::HashMap<String, String> = args.vars.into_iter().collect();
-    if let Some(var_file) = &args.var_file {
-        let content = std::fs::read_to_string(var_file)?;
-        let file_vars: std::collections::HashMap<String, serde_json::Value> =
-            serde_json::from_str(&content)?;
-        for (k, v) in file_vars {
-            vars.entry(k).or_insert_with(|| match v {
-                serde_json::Value::String(s) => s,
-                other => other.to_string(),
-            });
-        }
-    }
+    let vars = collect_vars(args.vars, args.var_file.as_ref())?;
 
     // Detect file type by extension
     let extension = args

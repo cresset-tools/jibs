@@ -32,3 +32,4 @@ bincode.workspace = true
 hex.workspace = true
 indicatif.workspace = true
 crossbeam-channel.workspace = true
+regex = "1"

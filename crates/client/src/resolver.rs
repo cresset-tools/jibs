@@ -17,9 +17,13 @@ use jibs_protocol::{
 use crate::error::{ClientError, Result};
 
 /// Result of resolving a DSL program
+#[derive(Debug)]
 pub struct ResolvedConfig {
     pub plan: ExecutionPlan,
     pub get_functions: Vec<ResolvedGetFunction>,
+    /// Declared variables that had neither a value nor a default (only
+    /// populated by [`resolve_lenient`]; strict resolution errors instead)
+    pub missing_vars: Vec<(String, VarType)>,
 }
 
 /// A resolved get function definition (ready for CLI invocation)
@@ -64,7 +68,83 @@ pub fn resolve(
     cli_vars: &HashMap<String, String>,
 ) -> Result<ResolvedConfig> {
     let mut resolver = Resolver::new(base_path, cli_vars.clone());
-    resolver.resolve_program(program)
+    let config = resolver.resolve_program(program)?;
+    validate_plan(&config.plan, &config.get_functions)?;
+    Ok(config)
+}
+
+/// Resolve for validation (`jibs check`): declared variables without a value
+/// get a type-appropriate placeholder instead of failing, and are reported in
+/// [`ResolvedConfig::missing_vars`]. Everything else is validated exactly
+/// like a real resolution.
+///
+/// Caveat: a missing bool variable placeholders to `false`, so statements
+/// gated on `#[when($flag)]` are skipped during validation.
+pub fn resolve_lenient(
+    base_path: &Path,
+    program: &Program<'_>,
+    cli_vars: &HashMap<String, String>,
+) -> Result<ResolvedConfig> {
+    let mut resolver = Resolver::new(base_path, cli_vars.clone());
+    resolver.lenient_missing_vars = true;
+    let config = resolver.resolve_program(program)?;
+    validate_plan(&config.plan, &config.get_functions)?;
+    Ok(config)
+}
+
+/// Cross-reference checks on a fully resolved plan. Runs for both import and
+/// check, so configuration mistakes fail before any SSH connection:
+/// - anonymize rules must reference defined fakers (a typo here would
+///   otherwise silently NULL the column at import time)
+/// - regex table patterns must compile (the server would reject them, but
+///   only after connecting)
+pub(crate) fn validate_plan(
+    plan: &ExecutionPlan,
+    get_functions: &[ResolvedGetFunction],
+) -> Result<()> {
+    for (table, rules) in &plan.anonymization {
+        for rule in rules {
+            if let AnonymizeTarget::Faker(faker) = &rule.target {
+                if !plan.fakers.contains_key(faker) {
+                    return Err(ClientError::Resolution(format!(
+                        "anonymize rule for {}.{} references undefined faker '{}'",
+                        table, rule.column, faker
+                    )));
+                }
+            }
+        }
+    }
+
+    // (get function -> aggregate references are validated during resolution
+    // itself, with a message that lists the available aggregates)
+
+    let pattern_sources = plan
+        .excluded_patterns
+        .iter()
+        .map(|p| ("exclude_data", p))
+        .chain(plan.ignored_patterns.iter().map(|p| ("ignore_table", p)))
+        .chain(plan.full_patterns.iter().map(|p| ("full", p)))
+        .chain(
+            plan
+                .aggregates
+                .iter()
+                .flat_map(|a| a.exclude_patterns.iter().map(|p| ("aggregate exclude", p))),
+        )
+        .chain(
+            get_functions
+                .iter()
+                .flat_map(|f| f.exclude_patterns.iter().map(|p| ("get exclude", p))),
+        );
+    for (context, pattern) in pattern_sources {
+        if let Err(e) = regex::Regex::new(pattern) {
+            return Err(ClientError::Resolution(format!(
+                "invalid regex /{}/ in {}: {}",
+                pattern, context, e
+            )));
+        }
+    }
+
+    Ok(())
 }
 
 /// State for the resolver
@@ -81,6 +161,10 @@ struct Resolver {
     plan: ExecutionPlan,
     /// Resolved get function definitions
     get_functions: Vec<ResolvedGetFunction>,
+    /// Check mode: placeholder missing variables instead of erroring
+    lenient_missing_vars: bool,
+    /// Variables that were placeholdered in lenient mode
+    missing_vars: Vec<(String, VarType)>,
 }
 
 impl Resolver {
@@ -104,6 +188,8 @@ impl Resolver {
             pending_vars: HashMap::new(),
             plan: ExecutionPlan::new(),
             get_functions: Vec::new(),
+            lenient_missing_vars: false,
+            missing_vars: Vec::new(),
         }
     }
 
@@ -139,6 +225,7 @@ impl Resolver {
         Ok(ResolvedConfig {
             plan: std::mem::take(&mut self.plan),
             get_functions: std::mem::take(&mut self.get_functions),
+            missing_vars: std::mem::take(&mut self.missing_vars),
         })
     }
 
@@ -248,6 +335,13 @@ impl Resolver {
                 // Use default value
                 self.variables.insert(name.clone(), default.clone());
                 self.plan.variables.insert(name.clone(), default.clone());
+            } else if self.lenient_missing_vars {
+                // Check mode: substitute a type-appropriate placeholder so
+                // the rest of the config still resolves, and report it
+                let placeholder = placeholder_value(*var_type);
+                self.variables.insert(name.clone(), placeholder.clone());
+                self.plan.variables.insert(name.clone(), placeholder);
+                self.missing_vars.push((name.clone(), *var_type));
             } else {
                 return Err(ClientError::UndefinedVariable(name.clone()));
             }
@@ -930,5 +1024,145 @@ impl Resolver {
         };
 
         Ok(Assignment { column, value })
+    }
+}
+
+/// Type-appropriate placeholder for a missing variable in check mode
+fn placeholder_value(var_type: VarType) -> Value {
+    match var_type {
+        VarType::String => Value::String(String::new()),
+        VarType::Int => Value::Int(0),
+        VarType::Float => Value::Float(0.0),
+        VarType::Bool => Value::Bool(false),
+        VarType::StringArray => Value::StringArray(Vec::new()),
+        VarType::IntArray => Value::IntArray(Vec::new()),
+        VarType::FloatArray => Value::FloatArray(Vec::new()),
+        VarType::BoolArray => Value::BoolArray(Vec::new()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn resolve_str(source: &str) -> Result<ResolvedConfig> {
+        let program = jibs_parser::parse(source).expect("test source must parse");
+        resolve(Path::new("test.jibs"), &program, &HashMap::new())
+    }
+
+    fn resolve_lenient_str(source: &str) -> Result<ResolvedConfig> {
+        let program = jibs_parser::parse(source).expect("test source must parse");
+        resolve_lenient(Path::new("test.jibs"), &program, &HashMap::new())
+    }
+
+    #[test]
+    fn undefined_faker_is_a_resolution_error() {
+        // A typo'd faker name would silently NULL the column at import time
+        let err = resolve_str(
+            r#"
+            anonymize users {
+                email -> emals
+            }
+            "#,
+        )
+        .expect_err("undefined faker must fail");
+        assert!(
+            err.to_string().contains("undefined faker 'emals'"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn defined_faker_passes() {
+        let config = resolve_str(
+            r#"
+            faker emails ["a@test", "b@test"]
+            anonymize users {
+                email -> emails
+            }
+            "#,
+        )
+        .expect("valid config");
+        assert_eq!(config.plan.anonymization.len(), 1);
+    }
+
+    #[test]
+    fn get_function_with_unknown_aggregate_is_an_error() {
+        let err = resolve_str(
+            r#"
+            get order_by_id (id: int) {
+                orders where "id = {$id}"
+            }
+            "#,
+        )
+        .expect_err("unknown aggregate must fail");
+        assert!(
+            err.to_string().contains("unknown aggregate 'orders'"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn invalid_regex_pattern_is_an_error() {
+        let err = resolve_str("ignore_table /[unclosed/")
+            .expect_err("invalid regex must fail");
+        assert!(err.to_string().contains("invalid regex"), "got: {}", err);
+    }
+
+    #[test]
+    fn strict_resolve_errors_on_missing_variable() {
+        let err = resolve_str(
+            r#"
+            var base_url: string
+            "#,
+        )
+        .expect_err("missing variable must fail strict resolution");
+        assert!(matches!(err, ClientError::UndefinedVariable(_)));
+    }
+
+    #[test]
+    fn lenient_resolve_placeholders_and_reports_missing_variables() {
+        let config = resolve_lenient_str(
+            r#"
+            var base_url: string
+            var order_limit: int
+
+            aggregate orders {
+                root sales_order
+                where "url = '{$base_url}'"
+                limit $order_limit
+            }
+            "#,
+        )
+        .expect("lenient resolution must succeed");
+
+        let mut names: Vec<&str> = config.missing_vars.iter().map(|(n, _)| n.as_str()).collect();
+        names.sort();
+        assert_eq!(names, vec!["base_url", "order_limit"]);
+
+        // The aggregate still resolved, with placeholder values substituted
+        assert_eq!(config.plan.aggregates.len(), 1);
+        assert_eq!(
+            config.plan.aggregates[0].where_clause.as_deref(),
+            Some("url = ''")
+        );
+    }
+
+    #[test]
+    fn lenient_resolve_still_errors_on_undeclared_variable() {
+        // Only declared-but-unset variables are placeholdered; a reference
+        // to a variable that is never declared is a real config bug
+        let err = resolve_lenient_str(
+            r#"
+            aggregate orders {
+                root sales_order
+                where "id = {$never_declared}"
+            }
+            "#,
+        )
+        .expect_err("undeclared variable must fail even in lenient mode");
+        assert!(matches!(err, ClientError::UndefinedVariable(_)));
     }
 }
