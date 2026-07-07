@@ -10,9 +10,12 @@
 
 mod checkpoint;
 mod dry_run;
+mod dump;
 mod error;
+mod export;
 mod foreign_keys;
 mod import;
+mod load;
 mod loader;
 mod protocol;
 mod report;
@@ -51,6 +54,8 @@ enum Commands {
     Check(CheckArgs),
     /// Show resolved execution plan (for debugging)
     Plan(PlanArgs),
+    /// Load a .jibsdump file into a local database (parallel)
+    Load(LoadArgs),
 }
 
 /// Common connection arguments shared between import and get
@@ -141,6 +146,11 @@ struct ImportArgs {
     #[arg(long, conflicts_with = "resume")]
     clean: bool,
 
+    /// Write the import to a .jibsdump file instead of loading into a local
+    /// database (ignores --local-mysql). Load it later with `jibs load`.
+    #[arg(long, conflicts_with_all = ["resume", "clean", "dry_run"])]
+    dump_to: Option<PathBuf>,
+
     /// [TEST] Simulate crash after N tables imported (for testing resume)
     /// Only available with --features test-utils
     #[cfg(feature = "test-utils")]
@@ -178,6 +188,34 @@ struct CheckArgs {
     /// Path to JSON file with variable values
     #[arg(long = "var-file")]
     var_file: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct LoadArgs {
+    /// Path to the .jibsdump file to load
+    dump: PathBuf,
+
+    /// Local MySQL connection URL
+    #[arg(long, default_value = "mysql://root@localhost:3306")]
+    local_mysql: String,
+
+    /// Number of parallel loader workers
+    #[arg(long, default_value = "4")]
+    parallel: usize,
+
+    /// Number of parallel local MySQL loader workers (defaults to --parallel)
+    #[arg(long)]
+    client_parallel: Option<usize>,
+
+    /// Maximum size of a single dump record in bytes (default: 100MB). Raise it
+    /// to match a dump exported with a larger --max-message-size.
+    #[arg(long, default_value_t = crate::dump::DEFAULT_MAX_RECORD_SIZE)]
+    max_message_size: usize,
+
+    /// Discard leftover state (backup tables, checkpoint) from a previous
+    /// interrupted import before loading
+    #[arg(long)]
+    clean: bool,
 }
 
 #[derive(Args)]
@@ -230,6 +268,7 @@ async fn main() -> Result<()> {
         Commands::Get(args) => run_get(args).await,
         Commands::Check(args) => run_check(args),
         Commands::Plan(args) => run_plan(args),
+        Commands::Load(args) => run_load(args),
     }
 }
 
@@ -254,6 +293,7 @@ async fn run_import(args: ImportArgs) -> Result<()> {
         resume: args.resume,
         clean: args.clean,
         dry_run: args.dry_run,
+        dump_to: args.dump_to,
         parallel: args.connection.parallel,
         client_parallel: args.connection.client_parallel,
         compression,
@@ -295,6 +335,7 @@ async fn run_get(args: GetArgs) -> Result<()> {
         resume: false,
         clean: args.clean,
         dry_run: false,
+        dump_to: None,
         parallel: args.connection.parallel,
         client_parallel: args.connection.client_parallel,
         compression,
@@ -310,6 +351,18 @@ async fn run_get(args: GetArgs) -> Result<()> {
     };
 
     import::run_import(config).await
+}
+
+/// Load a previously exported .jibsdump file into a local database.
+fn run_load(args: LoadArgs) -> Result<()> {
+    load::run_load(load::LoadConfig {
+        dump_path: args.dump,
+        local_mysql: args.local_mysql,
+        parallel: args.parallel,
+        client_parallel: args.client_parallel,
+        max_message_size: args.max_message_size,
+        clean: args.clean,
+    })
 }
 
 /// Parse get function invocations from command line args.
