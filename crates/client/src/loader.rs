@@ -1,13 +1,14 @@
 //! Loader pool - parallel MySQL connections for LOAD DATA, plus the
 //! TSV-loading and decompression helpers shared with the sequential path
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Result;
 use mysql::prelude::*;
 use mysql::{Conn, LocalInfileHandler, Opts};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use jibs_protocol::{ColumnDef, CompressionMode, IndexDef, TableOptions};
 
@@ -40,6 +41,9 @@ enum LoadWork {
         columns: Arc<Vec<ColumnDef>>,
         data: Vec<u8>,
         compression: CompressionMode,
+        /// Rows the server put in this chunk. Compared against the rows actually
+        /// inserted to detect silently-dropped rows (see [`LoadResult::dropped`]).
+        expected_rows: u64,
         result_tx: crossbeam_channel::Sender<Result<LoadResult>>,
     },
 }
@@ -153,6 +157,7 @@ impl LoaderPool {
                             columns,
                             data,
                             compression,
+                            expected_rows,
                             result_tx,
                         } => {
                             let result = (|| -> Result<LoadResult> {
@@ -170,8 +175,19 @@ impl LoaderPool {
                                 )?;
                                 let load_ns = load_start.elapsed().as_nanos() as u64;
 
+                                // Fewer rows inserted than sent → MySQL skipped
+                                // some (almost always a duplicate unique/PK key).
+                                let dropped = expected_rows.saturating_sub(rows);
+                                if dropped > 0 {
+                                    debug!(
+                                        "table {}: LOAD DATA inserted {} of {} rows ({} dropped — likely duplicate key)",
+                                        table, rows, expected_rows, dropped
+                                    );
+                                }
+
                                 Ok(LoadResult {
                                     rows,
+                                    dropped,
                                     decompress_ns,
                                     load_ns,
                                 })
@@ -282,6 +298,7 @@ impl LoaderPool {
         columns: Arc<Vec<ColumnDef>>,
         data: Vec<u8>,
         compression: CompressionMode,
+        expected_rows: u64,
     ) -> Result<crossbeam_channel::Receiver<Result<LoadResult>>> {
         let (result_tx, result_rx) = crossbeam_channel::unbounded();
 
@@ -291,6 +308,7 @@ impl LoaderPool {
                 columns,
                 data,
                 compression,
+                expected_rows,
                 result_tx,
             })
             .map_err(|_| anyhow::anyhow!("Loader pool shut down"))?;
@@ -373,8 +391,49 @@ pub(crate) fn load_tsv_data(
     Ok(affected)
 }
 
+/// Emit one aggregated warning when `LOAD DATA` inserted fewer rows than were
+/// sent — rows MySQL silently skipped, which almost always means a duplicate
+/// value on a UNIQUE or PRIMARY key. The usual cause is anonymizing a
+/// uniquely-indexed column (e.g. `email`) with a non-unique faker; the fix is a
+/// unique-generating rule like `{unique()}`. Per-table chunk detail is logged at
+/// debug level as it happens; this is the loud, once-per-load summary.
+pub(crate) fn warn_dropped_rows(dropped_by_table: &HashMap<String, u64>) {
+    let Some((total, detail)) = summarize_dropped_rows(dropped_by_table) else {
+        return;
+    };
+    warn!(
+        "{} row(s) were silently dropped during load: MySQL inserted fewer rows \
+         than were sent, which almost always means a duplicate value on a UNIQUE \
+         or PRIMARY key. If you anonymize a uniquely-indexed column (e.g. email), \
+         use a unique-generating faker such as `{{unique()}}`. \
+         Rows dropped per table: {}",
+        total, detail
+    );
+}
+
+/// Total dropped rows and a `table (n), …` breakdown (worst offenders first,
+/// ties broken alphabetically). `None` when nothing was dropped.
+fn summarize_dropped_rows(dropped_by_table: &HashMap<String, u64>) -> Option<(u64, String)> {
+    if dropped_by_table.is_empty() {
+        return None;
+    }
+    let total: u64 = dropped_by_table.values().sum();
+    let mut tables: Vec<(&String, &u64)> = dropped_by_table.iter().collect();
+    tables.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+    let detail = tables
+        .iter()
+        .map(|(t, n)| format!("{} ({})", t, n))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some((total, detail))
+}
+
 pub(crate) struct LoadResult {
     pub(crate) rows: u64,
+    /// Rows the server sent for this chunk that MySQL did not insert — silently
+    /// skipped, almost always a duplicate on a UNIQUE/PRIMARY key. Surfaced by
+    /// [`warn_dropped_rows`] so this isn't lost.
+    pub(crate) dropped: u64,
     pub(crate) decompress_ns: u64,
     pub(crate) load_ns: u64,
 }
@@ -453,5 +512,21 @@ mod tests {
             build_load_data_sql("files", &columns),
             r"LOAD DATA LOCAL INFILE 'data.tsv' INTO TABLE `files` FIELDS TERMINATED BY '\t' ESCAPED BY '\\' LINES TERMINATED BY '\n' (`id`, @jibs_hex_1, @jibs_hex_2) SET `data` = UNHEX(@jibs_hex_1), `tag` = UNHEX(@jibs_hex_2)"
         );
+    }
+
+    #[test]
+    fn summarize_dropped_none_when_empty() {
+        assert!(summarize_dropped_rows(&HashMap::new()).is_none());
+    }
+
+    #[test]
+    fn summarize_dropped_orders_worst_first_then_alpha() {
+        let mut m = HashMap::new();
+        m.insert("customer_entity".to_string(), 3u64);
+        m.insert("users".to_string(), 1u64);
+        m.insert("orders".to_string(), 3u64); // ties with customer_entity → alpha
+        let (total, detail) = summarize_dropped_rows(&m).unwrap();
+        assert_eq!(total, 7);
+        assert_eq!(detail, "customer_entity (3), orders (3), users (1)");
     }
 }

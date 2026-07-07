@@ -20,7 +20,8 @@ use crate::checkpoint::{
     BACKUP_TABLE_PREFIX,
 };
 use crate::loader::{
-    load_tsv_data, maybe_decompress, wait_for_load, DdlResult, LoadResult, LoaderPool, PendingLoad,
+    load_tsv_data, maybe_decompress, warn_dropped_rows, wait_for_load, DdlResult, LoadResult,
+    LoaderPool, PendingLoad,
 };
 use crate::metrics::ClientMetrics;
 use crate::progress::ImportProgress;
@@ -44,6 +45,8 @@ pub(crate) struct ProtocolConfig {
 struct LoadAccum {
     decompress_ns: u64,
     load_ns: u64,
+    /// Rows sent but not inserted (silent duplicate-key skips), summed per table.
+    dropped_by_table: HashMap<String, u64>,
 }
 
 impl LoadAccum {
@@ -51,12 +54,22 @@ impl LoadAccum {
         Self {
             decompress_ns: 0,
             load_ns: 0,
+            dropped_by_table: HashMap::new(),
         }
     }
 
-    fn add(&mut self, result: &LoadResult) {
+    fn add(&mut self, table: &str, result: &LoadResult) {
         self.decompress_ns += result.decompress_ns;
         self.load_ns += result.load_ns;
+        self.record_dropped(table, result.dropped);
+    }
+
+    /// Accumulate silently-dropped rows for `table` (no-op when none dropped).
+    /// Also used by the sequential path, which has no [`LoadResult`].
+    fn record_dropped(&mut self, table: &str, dropped: u64) {
+        if dropped > 0 {
+            *self.dropped_by_table.entry(table.to_string()).or_default() += dropped;
+        }
     }
 }
 
@@ -82,7 +95,7 @@ fn drain_completed_loads(
         match rx.try_recv() {
             Ok(Ok(result)) => {
                 stats.rows_imported += result.rows;
-                load_accum.add(&result);
+                load_accum.add(&table, &result);
             }
             Ok(Err(e)) => return Err(anyhow::anyhow!("Loader error for {}: {}", table, e)),
             Err(crossbeam_channel::TryRecvError::Empty) => still_pending.push((table, rx)),
@@ -177,7 +190,7 @@ fn wait_for_all_loads(
     for (table, rx) in pending_loads {
         let result = wait_for_load(&table, &rx)?;
         stats.rows_imported += result.rows;
-        load_accum.add(&result);
+        load_accum.add(&table, &result);
     }
 
     // Finalize all remaining deferred tables (no loads left)
@@ -529,7 +542,13 @@ async fn run_protocol_inner(
                     }
 
                     // Submit compressed data to loader pool — workers decompress + load
-                    let result_rx = pool.submit(table.clone(), schema, tsv_data, negotiated_compression)?;
+                    let result_rx = pool.submit(
+                        table.clone(),
+                        schema,
+                        tsv_data,
+                        negotiated_compression,
+                        u64::from(row_count),
+                    )?;
                     pending_loads.push((table.clone(), result_rx));
 
                     // If we have too many pending chunks, drain some to bound memory
@@ -551,7 +570,7 @@ async fn run_protocol_inner(
                             if let Some((tbl, rx)) = pending_loads.first() {
                                 let result = wait_for_load(tbl, rx)?;
                                 stats.rows_imported += result.rows;
-                                load_accum.add(&result);
+                                load_accum.add(tbl, &result);
                             }
                             pending_loads.remove(0);
                         }
@@ -574,6 +593,8 @@ async fn run_protocol_inner(
                         client_metrics.add_rows_loaded(loaded);
                     }
                     stats.rows_imported += loaded;
+                    // Rows MySQL skipped (duplicate unique/PK key) — surfaced at Done.
+                    load_accum.record_dropped(table, u64::from(row_count).saturating_sub(loaded));
                 }
 
                 // Update progress (use compressed size for byte tracking)
@@ -686,6 +707,11 @@ async fn run_protocol_inner(
                 stats.table_durations = progress.table_durations();
 
                 progress.finish();
+
+                // Loudly surface any rows MySQL silently skipped (duplicate
+                // unique/PK keys) from both the pool and sequential paths. Emitted
+                // only after the progress bar is finished, else it swallows the log.
+                warn_dropped_rows(&load_accum.dropped_by_table);
 
                 // Log table report: show all server tables with their import disposition
                 {
