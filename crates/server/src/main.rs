@@ -281,6 +281,14 @@ fn run() -> Result<()> {
                 }
             });
 
+            // Capture the source schema's foreign keys up front (schema is stable
+            // during the read) so the terminal Done can carry them. A load into a
+            // fresh database uses these to rebuild constraints the target never had.
+            let foreign_keys = conn.capture_foreign_keys().unwrap_or_else(|e| {
+                eprintln!("Warning: could not capture foreign keys: {}", e);
+                Vec::new()
+            });
+
             let mut traverser = DependencyTraverser::new(&mut conn, &plan, collect_metrics, Arc::clone(&table_name_to_id))?;
 
             let table_dispositions = match traverser.stream_all_tables(compression, &mut writer, parallel, &mysql_url, &interrupt) {
@@ -292,6 +300,8 @@ fn run() -> Result<()> {
                         let _ = writer.write_message(&ServerMessage::Done {
                             table_dispositions: Vec::new(),
                             metrics,
+                            // Partial run — don't assert an FK set to reconstruct.
+                            foreign_keys: Vec::new(),
                         });
                         let _ = listener_handle.join();
                         return Ok(());
@@ -309,7 +319,11 @@ fn run() -> Result<()> {
             let metrics = traverser.get_metrics();
 
             // Send completion message
-            writer.write_message(&ServerMessage::Done { table_dispositions, metrics })?;
+            writer.write_message(&ServerMessage::Done {
+                table_dispositions,
+                metrics,
+                foreign_keys,
+            })?;
 
             // Wait for listener thread (will get Shutdown from client)
             let _ = listener_handle.join();

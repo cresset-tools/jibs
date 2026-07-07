@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use tracing::{info, warn};
 
-use jibs_protocol::{ClientMessage, ExecutionPlan, MessageWriter, ServerMessage};
+use jibs_protocol::{ClientMessage, ExecutionPlan, ForeignKeyDef, MessageWriter, ServerMessage};
 
 use crate::dump::DumpWriter;
 use crate::import::ImportConfig;
@@ -145,12 +145,19 @@ async fn stream_to_dump(
     let mut tables_written = 0usize;
     let mut rows_written = 0u64;
 
-    loop {
+    // The loop only breaks on the terminal `Done`, yielding the source-schema
+    // FKs it carries; every other message either continues or returns an error.
+    let foreign_keys: Vec<ForeignKeyDef> = loop {
         match recv_message(server, config.max_message_size).await? {
-            ServerMessage::Schema { table_id, columns } => {
+            ServerMessage::Schema {
+                table_id,
+                columns,
+                indexes,
+                options,
+            } => {
                 let table = lookup(&id_to_name, table_id, "Schema")?;
                 let anon = plan.anonymization.get(table).map(Vec::as_slice);
-                dump.write_table(table, &columns, anon)?;
+                dump.write_table(table, &columns, &indexes, &options, anon)?;
             }
             ServerMessage::Data {
                 table_id,
@@ -168,7 +175,9 @@ async fn stream_to_dump(
                 tables_written += 1;
                 rows_written += row_count;
             }
-            ServerMessage::Done { .. } => break,
+            ServerMessage::Done { foreign_keys, .. } => {
+                break foreign_keys;
+            }
             ServerMessage::Error {
                 message,
                 recoverable,
@@ -190,11 +199,15 @@ async fn stream_to_dump(
                 return Err(anyhow::anyhow!("Unexpected DryRunReport (dry_run not requested)"))
             }
         }
-    }
+    };
 
     // Capture plan-level post-processing so a later `load` reproduces exactly
     // what a live import would have produced (set/upsert blocks + after SQL).
     dump.write_post_process(&plan.sets, &plan.after_statements)?;
+
+    // Carry the source schema's foreign keys so `load` can reconstruct them into
+    // a fresh database (jibs otherwise only preserves the target's own FKs).
+    dump.write_foreign_keys(&foreign_keys)?;
 
     Ok((tables_written, rows_written))
 }

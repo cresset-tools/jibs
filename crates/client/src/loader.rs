@@ -9,7 +9,7 @@ use mysql::prelude::*;
 use mysql::{Conn, LocalInfileHandler, Opts};
 use tracing::{debug, info};
 
-use jibs_protocol::{ColumnDef, CompressionMode};
+use jibs_protocol::{ColumnDef, CompressionMode, IndexDef, TableOptions};
 
 use crate::import::redact_mysql_url;
 use crate::sql::create_table;
@@ -29,6 +29,8 @@ enum LoadWork {
     CreateTable {
         table: String,
         columns: Arc<Vec<ColumnDef>>,
+        indexes: Vec<IndexDef>,
+        options: TableOptions,
         anon_rules: Option<Vec<jibs_protocol::AnonymizeRule>>,
         result_tx: crossbeam_channel::Sender<Result<DdlResult>>,
     },
@@ -125,6 +127,8 @@ impl LoaderPool {
                         LoadWork::CreateTable {
                             table,
                             columns,
+                            indexes,
+                            options,
                             anon_rules,
                             result_tx,
                         } => {
@@ -134,6 +138,8 @@ impl LoaderPool {
                                     &mut conn,
                                     &table,
                                     &columns,
+                                    &indexes,
+                                    &options,
                                     anon_rules.as_ref(),
                                 )?;
                                 Ok(DdlResult {
@@ -248,6 +254,8 @@ impl LoaderPool {
         &self,
         table: String,
         columns: Arc<Vec<ColumnDef>>,
+        indexes: Vec<IndexDef>,
+        options: TableOptions,
         anon_rules: Option<Vec<jibs_protocol::AnonymizeRule>>,
     ) -> Result<crossbeam_channel::Receiver<Result<DdlResult>>> {
         let (result_tx, result_rx) = crossbeam_channel::unbounded();
@@ -256,6 +264,8 @@ impl LoaderPool {
             .send(LoadWork::CreateTable {
                 table,
                 columns,
+                indexes,
+                options,
                 anon_rules,
                 result_tx,
             })

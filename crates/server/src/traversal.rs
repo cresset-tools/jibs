@@ -420,6 +420,8 @@ fn run_aggregate_bfs(
             .cloned()
             .unwrap_or_default();
         let columns = conn.get_column_defs(root_table)?;
+        let indexes = conn.get_indexes(root_table)?;
+        let options = conn.get_table_options(root_table)?;
         let anonymization = plan
             .anonymization
             .get(root_table.as_str())
@@ -490,6 +492,8 @@ fn run_aggregate_bfs(
                     tx.send(ChannelMessage::Control(ServerMessage::Schema {
                         table_id: table_ids[root_table],
                         columns: columns.clone(),
+                        indexes: indexes.clone(),
+                        options: options.clone(),
                     }))
                     .map_err(|_| ServerError::Protocol("Channel closed".to_string()))?;
                 }
@@ -650,6 +654,8 @@ fn run_aggregate_bfs(
                     .cloned()
                     .unwrap_or_default();
                 let columns = conn.get_column_defs(&table)?;
+                let indexes = conn.get_indexes(&table)?;
+                let options = conn.get_table_options(&table)?;
                 let anonymization = plan
                     .anonymization
                     .get(&table)
@@ -784,6 +790,8 @@ fn run_aggregate_bfs(
                                 tx.send(ChannelMessage::Control(ServerMessage::Schema {
                                     table_id: table_ids[&table],
                                     columns: columns.clone(),
+                                    indexes: indexes.clone(),
+                                    options: options.clone(),
                                 }))
                                 .map_err(|_| {
                                     ServerError::Protocol("Channel closed".to_string())
@@ -1009,11 +1017,15 @@ impl<'a> DependencyTraverser<'a> {
             if self.plan.excluded_tables.contains(table) {
                 let tid = self.table_ids[table];
                 let columns = self.conn.get_column_defs(table)?;
+                let indexes = self.conn.get_indexes(table)?;
+                let options = self.conn.get_table_options(table)?;
                 let write_start = Instant::now();
                 writer.write_message_noflush(
                     &ServerMessage::Schema {
                         table_id: tid,
                         columns,
+                        indexes,
+                        options,
                     },
                 )?;
                 writer.write_message_noflush(
@@ -1468,6 +1480,8 @@ fn stream_full_table_to_channel(
     tx: &mpsc::SyncSender<ChannelMessage>,
     metrics: &Arc<MetricsCollector>,
 ) -> Result<()> {
+    let indexes = conn.get_indexes(table)?;
+    let options = conn.get_table_options(table)?;
     let mut tsv_writer = TsvWriter::new(columns, anonymization, fakers.clone());
     let mut total_rows: u64 = 0;
     let mut chunk_row_count: u16 = 0;
@@ -1476,6 +1490,8 @@ fn stream_full_table_to_channel(
     tx.send(ChannelMessage::Control(ServerMessage::Schema {
         table_id,
         columns: columns.to_vec(),
+        indexes,
+        options,
     }))
     .map_err(|_| crate::error::ServerError::Protocol("Channel closed".to_string()))?;
 

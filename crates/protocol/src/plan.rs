@@ -336,3 +336,89 @@ pub struct ColumnFlags {
     pub binary: bool,
     pub auto_increment: bool,
 }
+
+/// A foreign key constraint captured from the *source* database so a load or
+/// import into a **fresh** database can reconstruct it. jibs otherwise only
+/// preserves the *target's* pre-existing FKs across a reload, so a load into an
+/// empty schema would end up with none.
+///
+/// The referenced table is resolved in the current (target) schema — no schema
+/// qualifier is carried, so the source's database name never leaks into the
+/// recreated constraint.
+#[derive(Debug, Clone, Default, Encode, Decode)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct ForeignKeyDef {
+    /// Table the constraint lives on.
+    pub table: String,
+    /// Constraint name.
+    pub constraint: String,
+    /// Referencing columns, ordered by `ORDINAL_POSITION` (composite FKs keep
+    /// their column order).
+    pub columns: Vec<String>,
+    /// Referenced table (resolved in the target schema).
+    pub ref_table: String,
+    /// Referenced columns, aligned with `columns`.
+    pub ref_columns: Vec<String>,
+    /// `ON UPDATE` action (`RESTRICT` / `CASCADE` / `SET NULL` / `NO ACTION`).
+    pub update_rule: String,
+    /// `ON DELETE` action.
+    pub delete_rule: String,
+}
+
+/// A secondary index on a table. The PRIMARY KEY is never represented here — it
+/// is emitted from [`ColumnDef::is_primary_key`]; this covers every other index
+/// (unique and non-unique), which the loader would otherwise drop.
+#[derive(Debug, Clone, Encode, Decode)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct IndexDef {
+    /// Index name (`Key_name` from `SHOW INDEX`).
+    pub name: String,
+    /// Key parts, ordered by `Seq_in_index`.
+    pub columns: Vec<IndexColumn>,
+    /// True when `Non_unique = 0`.
+    pub unique: bool,
+    /// Index method / kind.
+    pub kind: IndexKind,
+}
+
+/// One key part of an [`IndexDef`].
+#[derive(Debug, Clone, Encode, Decode)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct IndexColumn {
+    /// Column name (ignored when `expression` is set).
+    pub name: String,
+    /// Prefix length (`Sub_part`), e.g. `col`(255) — `None` for a full-column key.
+    pub prefix_len: Option<u32>,
+    /// Descending key part (`Collation = 'D'`).
+    pub descending: bool,
+    /// Functional/expression key part; when `Some`, emitted as `((expr))` and
+    /// `name` is ignored.
+    pub expression: Option<String>,
+}
+
+/// Index method. Non-BTree kinds need an explicit keyword in the DDL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Encode, Decode)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum IndexKind {
+    #[default]
+    BTree,
+    Fulltext,
+    Spatial,
+    Hash,
+}
+
+/// Table-level options needed to reproduce a `CREATE TABLE` faithfully. Without
+/// these the recreated table silently inherits the server/database defaults
+/// (notably a different collation).
+#[derive(Debug, Clone, Default, Encode, Decode)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct TableOptions {
+    /// Storage engine (e.g. `InnoDB`).
+    pub engine: Option<String>,
+    /// Default character set (e.g. `utf8mb4`).
+    pub charset: Option<String>,
+    /// Default collation (e.g. `utf8mb4_general_ci`).
+    pub collation: Option<String>,
+    /// Row format, when the table pins one (e.g. `DYNAMIC`).
+    pub row_format: Option<String>,
+}

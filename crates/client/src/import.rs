@@ -14,7 +14,10 @@ use jibs_protocol::{
 
 use crate::checkpoint::{find_backup_tables, Checkpoint};
 use crate::dry_run::run_dry_run;
-use crate::foreign_keys::{preserve_and_drop_foreign_keys, restore_foreign_keys};
+use crate::foreign_keys::{
+    apply_foreign_keys, discard_preserved_foreign_keys, preserve_and_drop_foreign_keys,
+    restore_foreign_keys,
+};
 use crate::loader::LoaderPool;
 use crate::protocol::{perform_handshake, run_protocol, send_message, ProtocolConfig};
 use crate::report::display_report;
@@ -282,11 +285,21 @@ pub async fn run_import(config: ImportConfig) -> Result<()> {
         display_report(&outcome.stats.table_durations);
     }
 
-    // Restore FK constraints on success (while FOREIGN_KEY_CHECKS is still 0).
-    // On failure the persisted definitions are kept so a later successful run
-    // (e.g. after --resume) restores them.
+    // Reconstruct FK constraints on success (while FOREIGN_KEY_CHECKS is still 0).
+    // Prefer the authoritative source-schema FKs the server reported — they
+    // rebuild constraints even when the local database started empty, which the
+    // target-preserve path cannot. Fall back to the target's own captured FKs
+    // when the server reported none (e.g. an interrupted run yields an empty set,
+    // but that path also leaves result Err, so this only applies on a clean run
+    // against an older server). On failure the persisted definitions are kept so
+    // a later successful run (e.g. after --resume) restores them.
     if outcome.result.is_ok() {
-        restore_foreign_keys(&mut local_conn)?;
+        if outcome.stats.source_foreign_keys.is_empty() {
+            restore_foreign_keys(&mut local_conn)?;
+        } else {
+            apply_foreign_keys(&mut local_conn, &outcome.stats.source_foreign_keys)?;
+            discard_preserved_foreign_keys(&mut local_conn)?;
+        }
     }
 
     // Re-enable checks

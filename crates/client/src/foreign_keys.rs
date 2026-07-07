@@ -8,6 +8,11 @@ use mysql::prelude::*;
 use mysql::Conn;
 use tracing::{info, warn};
 
+// The source-schema FK type carried in dumps / the wire (distinct from the
+// local `ForeignKeyDef` below, which captures the *target's* FKs and keeps a
+// schema qualifier).
+use jibs_protocol::ForeignKeyDef as SourceForeignKey;
+
 // ============================================================================
 // Foreign key preservation - captures FK constraints before the import drops
 // them, and restores them once the import completes
@@ -222,6 +227,79 @@ pub(crate) fn restore_foreign_keys(conn: &mut Conn) -> Result<()> {
     Ok(())
 }
 
+// ============================================================================
+// Source-schema FK reconstruction — used when a dump/import carries the source
+// database's foreign keys (so a load into a *fresh* target rebuilds them, which
+// the target-preserve path above cannot: an empty target has no FKs to capture)
+// ============================================================================
+
+/// Build the `ALTER TABLE ... ADD CONSTRAINT` for a source FK. The referenced
+/// table is left unqualified so it resolves in the current (target) schema — the
+/// source database name is intentionally not reproduced.
+fn build_source_fk_ddl(fk: &SourceForeignKey) -> String {
+    let quote_list = |cols: &[String]| {
+        cols.iter()
+            .map(|c| format!("`{}`", escape_ident(c)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    format!(
+        "ALTER TABLE `{}` ADD CONSTRAINT `{}` FOREIGN KEY ({}) \
+         REFERENCES `{}` ({}) ON UPDATE {} ON DELETE {}",
+        escape_ident(&fk.table),
+        escape_ident(&fk.constraint),
+        quote_list(&fk.columns),
+        escape_ident(&fk.ref_table),
+        quote_list(&fk.ref_columns),
+        fk.update_rule,
+        fk.delete_rule
+    )
+}
+
+/// Reconstruct the source schema's foreign keys on the target. Must run with
+/// `FOREIGN_KEY_CHECKS = 0` (aggregate loads intentionally hold partial data, so
+/// existing rows must not be validated). Individual failures — e.g. an FK that
+/// references a table excluded from the import — warn and are skipped rather
+/// than aborting the whole load.
+pub(crate) fn apply_foreign_keys(conn: &mut Conn, foreign_keys: &[SourceForeignKey]) -> Result<()> {
+    if foreign_keys.is_empty() {
+        return Ok(());
+    }
+    let mut applied = 0usize;
+    let mut failed = 0usize;
+    for fk in foreign_keys {
+        let ddl = build_source_fk_ddl(fk);
+        match conn.query_drop(&ddl) {
+            Ok(()) => applied += 1,
+            Err(e) => {
+                failed += 1;
+                warn!(
+                    "Could not create foreign key `{}` on `{}`: {}\n  To create it manually: {}",
+                    fk.constraint, fk.table, e, ddl
+                );
+            }
+        }
+    }
+    info!(
+        "Reconstructed {} foreign key constraints from the source schema",
+        applied
+    );
+    if failed > 0 {
+        warn!(
+            "{} foreign key constraints could not be created (statements printed above)",
+            failed
+        );
+    }
+    Ok(())
+}
+
+/// Drop the persisted FK store without restoring the target's old constraints.
+/// Used when authoritative source FKs are applied instead (the target's own FKs
+/// were dropped by [`preserve_and_drop_foreign_keys`] and are now superseded).
+pub(crate) fn discard_preserved_foreign_keys(conn: &mut Conn) -> Result<()> {
+    ForeignKeyStore::cleanup(conn)
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -261,6 +339,45 @@ mod tests {
             build_fk_ddl(&fk),
             "ALTER TABLE `weird``table` ADD CONSTRAINT `fk_multi` FOREIGN KEY (`a`, `b`) \
              REFERENCES `db`.`parent` (`x`, `y`) ON UPDATE NO ACTION ON DELETE RESTRICT"
+        );
+    }
+
+    #[test]
+    fn source_fk_ddl_is_unqualified() {
+        // The source ref table must resolve in the target schema — no source
+        // database name, even when the source lived in a differently-named DB.
+        let fk = SourceForeignKey {
+            table: "sales_order".to_string(),
+            constraint: "SALES_ORDER_STORE_ID".to_string(),
+            columns: vec!["store_id".to_string()],
+            ref_table: "store".to_string(),
+            ref_columns: vec!["store_id".to_string()],
+            update_rule: "CASCADE".to_string(),
+            delete_rule: "SET NULL".to_string(),
+        };
+        assert_eq!(
+            build_source_fk_ddl(&fk),
+            "ALTER TABLE `sales_order` ADD CONSTRAINT `SALES_ORDER_STORE_ID` \
+             FOREIGN KEY (`store_id`) REFERENCES `store` (`store_id`) \
+             ON UPDATE CASCADE ON DELETE SET NULL"
+        );
+    }
+
+    #[test]
+    fn source_fk_ddl_composite() {
+        let fk = SourceForeignKey {
+            table: "child".to_string(),
+            constraint: "fk_c".to_string(),
+            columns: vec!["a".to_string(), "b".to_string()],
+            ref_table: "parent".to_string(),
+            ref_columns: vec!["x".to_string(), "y".to_string()],
+            update_rule: "NO ACTION".to_string(),
+            delete_rule: "RESTRICT".to_string(),
+        };
+        assert_eq!(
+            build_source_fk_ddl(&fk),
+            "ALTER TABLE `child` ADD CONSTRAINT `fk_c` FOREIGN KEY (`a`, `b`) \
+             REFERENCES `parent` (`x`, `y`) ON UPDATE NO ACTION ON DELETE RESTRICT"
         );
     }
 }

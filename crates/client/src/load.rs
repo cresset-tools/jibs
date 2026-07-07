@@ -19,14 +19,17 @@ use mysql::prelude::*;
 use mysql::{Conn, Opts};
 use tracing::info;
 
-use jibs_protocol::{ColumnDef, PreserveRule, SetRule};
+use jibs_protocol::{ColumnDef, ForeignKeyDef, PreserveRule, SetRule};
 
 use crate::checkpoint::{
     backup_preserved_rows, find_backup_tables, restore_preserved_rows, Checkpoint,
     BACKUP_TABLE_PREFIX,
 };
 use crate::dump::{DumpReader, DumpRecord};
-use crate::foreign_keys::{preserve_and_drop_foreign_keys, restore_foreign_keys};
+use crate::foreign_keys::{
+    apply_foreign_keys, discard_preserved_foreign_keys, preserve_and_drop_foreign_keys,
+    restore_foreign_keys,
+};
 use crate::import::redact_mysql_url;
 use crate::loader::{wait_for_load, DdlResult, LoaderPool, PendingLoad};
 use crate::sql::execute_set_block;
@@ -87,9 +90,18 @@ pub(crate) fn run_load(config: LoadConfig) -> Result<()> {
     pool.shutdown();
 
     match outcome {
-        Ok((tables, rows)) => {
-            // Re-add FK constraints (still with FK checks disabled), then re-enable.
-            restore_foreign_keys(&mut conn)?;
+        Ok((tables, rows, source_fks)) => {
+            // Prefer the authoritative source-schema FKs carried by the dump —
+            // they rebuild constraints even in a fresh target the preserve path
+            // could never capture. Fall back to the target's own captured FKs
+            // only for a dump that carries none. Still FK-checks-off here.
+            match source_fks {
+                Some(fks) => {
+                    apply_foreign_keys(&mut conn, &fks)?;
+                    discard_preserved_foreign_keys(&mut conn)?;
+                }
+                None => restore_foreign_keys(&mut conn)?,
+            }
             let _ = conn.query_drop("SET FOREIGN_KEY_CHECKS = 1");
             let _ = conn.query_drop("SET UNIQUE_CHECKS = 1");
             info!("Load complete: {} tables, {} rows", tables, rows);
@@ -149,7 +161,7 @@ fn load_and_finalize<R: Read>(
     reader: &mut DumpReader<R>,
     pool: &LoaderPool,
     conn: &mut Conn,
-) -> Result<(usize, u64)> {
+) -> Result<(usize, u64, Option<Vec<ForeignKeyDef>>)> {
     let loaded = load_records(reader, pool, conn)?;
 
     // Restore preserved rows before post-processing (import order). Backups were
@@ -177,7 +189,7 @@ fn load_and_finalize<R: Read>(
         conn.query_drop(statement)?;
     }
 
-    Ok((loaded.tables, loaded.rows))
+    Ok((loaded.tables, loaded.rows, loaded.foreign_keys))
 }
 
 /// Result of consuming a dump stream.
@@ -186,6 +198,10 @@ struct Loaded {
     rows: u64,
     sets: Vec<SetRule>,
     after_statements: Vec<String>,
+    /// Source-schema FKs to reconstruct after load. `None` when the dump carried
+    /// no `ForeignKeys` record (older/foreign producers); `Some` (possibly
+    /// empty) when it did, in which case it is authoritative.
+    foreign_keys: Option<Vec<ForeignKeyDef>>,
 }
 
 /// Drive the dump records through the loader pool.
@@ -200,6 +216,7 @@ fn load_records<R: Read>(
     let mut pending_loads: Vec<PendingLoad> = Vec::new();
     let mut sets: Vec<SetRule> = Vec::new();
     let mut after_statements: Vec<String> = Vec::new();
+    let mut foreign_keys: Option<Vec<ForeignKeyDef>> = None;
     let mut tables_loaded = 0usize;
     let mut rows_loaded = 0u64;
     let mut saw_end = false;
@@ -212,6 +229,8 @@ fn load_records<R: Read>(
             DumpRecord::Table {
                 name,
                 columns,
+                indexes,
+                options,
                 anon_rules,
             } => {
                 // Back up preserved rows on the main connection BEFORE the pool
@@ -224,7 +243,7 @@ fn load_records<R: Read>(
 
                 let cols = Arc::new(columns);
                 schemas.insert(name.clone(), Arc::clone(&cols));
-                let ddl_rx = pool.submit_ddl(name.clone(), cols, anon_rules)?;
+                let ddl_rx = pool.submit_ddl(name.clone(), cols, indexes, options, anon_rules)?;
                 pending_ddls.insert(name, ddl_rx);
             }
             DumpRecord::Chunk {
@@ -273,6 +292,9 @@ fn load_records<R: Read>(
                 sets = s;
                 after_statements = a;
             }
+            DumpRecord::ForeignKeys { foreign_keys: fks } => {
+                foreign_keys = Some(fks);
+            }
             DumpRecord::End => {
                 saw_end = true;
                 break;
@@ -301,6 +323,7 @@ fn load_records<R: Read>(
         rows: rows_loaded,
         sets,
         after_statements,
+        foreign_keys,
     })
 }
 
