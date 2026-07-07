@@ -31,7 +31,7 @@ use crate::foreign_keys::{
     restore_foreign_keys,
 };
 use crate::import::redact_mysql_url;
-use crate::loader::{wait_for_load, DdlResult, LoaderPool, PendingLoad};
+use crate::loader::{warn_dropped_rows, wait_for_load, DdlResult, LoaderPool, PendingLoad};
 use crate::sql::execute_set_block;
 
 /// Maximum number of in-flight load chunks before we drain completed ones.
@@ -219,6 +219,8 @@ fn load_records<R: Read>(
     let mut foreign_keys: Option<Vec<ForeignKeyDef>> = None;
     let mut tables_loaded = 0usize;
     let mut rows_loaded = 0u64;
+    // Rows sent but not inserted (silent duplicate-key skips), summed per table.
+    let mut dropped_by_table: HashMap<String, u64> = HashMap::new();
     let mut saw_end = false;
 
     while let Some(rec) = reader.next_record()? {
@@ -249,7 +251,7 @@ fn load_records<R: Read>(
             DumpRecord::Chunk {
                 table,
                 compression,
-                row_count: _,
+                row_count,
                 data,
             } => {
                 let schema = schemas.get(&table).cloned().with_context(|| {
@@ -261,15 +263,20 @@ fn load_records<R: Read>(
                     wait_ddl(&table, ddl_rx)?;
                 }
 
-                let rx = pool.submit(table.clone(), schema, data, compression)?;
+                let rx = pool.submit(table.clone(), schema, data, compression, u64::from(row_count))?;
                 pending_loads.push((table, rx));
 
                 if pending_loads.len() > MAX_PENDING_CHUNKS {
-                    pending_loads = drain_completed(pending_loads, &mut rows_loaded)?;
+                    pending_loads =
+                        drain_completed(pending_loads, &mut rows_loaded, &mut dropped_by_table)?;
                     // If draining freed nothing, block on the oldest to make room.
                     if pending_loads.len() > MAX_PENDING_CHUNKS {
                         let (tbl, rx) = pending_loads.remove(0);
-                        rows_loaded += wait_for_load(&tbl, &rx)?.rows;
+                        let result = wait_for_load(&tbl, &rx)?;
+                        rows_loaded += result.rows;
+                        if result.dropped > 0 {
+                            *dropped_by_table.entry(tbl).or_default() += result.dropped;
+                        }
                     }
                 }
             }
@@ -315,8 +322,15 @@ fn load_records<R: Read>(
     }
     // Wait for all remaining loads.
     for (tbl, rx) in pending_loads {
-        rows_loaded += wait_for_load(&tbl, &rx)?.rows;
+        let result = wait_for_load(&tbl, &rx)?;
+        rows_loaded += result.rows;
+        if result.dropped > 0 {
+            *dropped_by_table.entry(tbl).or_default() += result.dropped;
+        }
     }
+
+    // Loudly surface any rows MySQL silently skipped (duplicate unique/PK keys).
+    warn_dropped_rows(&dropped_by_table);
 
     Ok(Loaded {
         tables: tables_loaded,
@@ -336,11 +350,20 @@ fn wait_ddl(table: &str, rx: Receiver<Result<DdlResult>>) -> Result<()> {
 }
 
 /// Non-blocking sweep of completed loads; returns the still-pending ones.
-fn drain_completed(pending: Vec<PendingLoad>, rows_loaded: &mut u64) -> Result<Vec<PendingLoad>> {
+fn drain_completed(
+    pending: Vec<PendingLoad>,
+    rows_loaded: &mut u64,
+    dropped_by_table: &mut HashMap<String, u64>,
+) -> Result<Vec<PendingLoad>> {
     let mut still = Vec::new();
     for (table, rx) in pending {
         match rx.try_recv() {
-            Ok(Ok(result)) => *rows_loaded += result.rows,
+            Ok(Ok(result)) => {
+                *rows_loaded += result.rows;
+                if result.dropped > 0 {
+                    *dropped_by_table.entry(table).or_default() += result.dropped;
+                }
+            }
             Ok(Err(e)) => return Err(anyhow::anyhow!("Loader error for {}: {}", table, e)),
             Err(crossbeam_channel::TryRecvError::Empty) => still.push((table, rx)),
             Err(crossbeam_channel::TryRecvError::Disconnected) => {
