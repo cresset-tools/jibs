@@ -73,6 +73,32 @@ cargo run -p jibs -- import test/import-resume-test.jibs \
   --resume
 ```
 
+### Test Dump Export / Load
+`import --dump-to <file>` writes the (already anonymized, aggregate-resolved)
+stream to a versioned, zstd-compressed `.jibsdump` file instead of a local DB.
+`jibs load <file>` replays it into a local DB using the parallel loader pool
+(`--parallel` defaults to 4), reproducing a live import: `preserve` backups,
+`set` upserts and `after` statements all run. No SSH is needed to load. Loading
+is atomic-ish: an incomplete/truncated dump (missing its `End` terminator)
+fails loudly instead of loading partial data. `--clean` discards leftover state
+from a previous interrupted import; `--max-message-size` matches a dump exported
+with a raised wire cap.
+
+```bash
+# Export to a .jibsdump file (connects to the remote like a normal import)
+cargo run -p jibs -- import test/import-all.jibs \
+  --host testuser@localhost --port 2222 \
+  --remote-mysql 'mysql://root:remote_root_pass@mysql-remote:3306/production' \
+  --identity test/ssh-keys/id_ed25519 \
+  --parallel 4 \
+  --dump-to /tmp/all.jibsdump
+
+# Load the dump into local MySQL (parallelized)
+cargo run -p jibs -- load /tmp/all.jibsdump \
+  --local-mysql 'mysql://root:local_root_pass@127.0.0.1:3308/imported' \
+  --parallel 4
+```
+
 ### Available Test Files
 - `test/import-aggregate.jibs` - Tests aggregate with relations (orders for user)
 - `test/import-all.jibs` - Full table import (no aggregates)

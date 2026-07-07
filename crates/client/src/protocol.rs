@@ -19,7 +19,9 @@ use crate::checkpoint::{
     backup_preserved_rows, find_backup_tables, restore_preserved_rows, Checkpoint,
     BACKUP_TABLE_PREFIX,
 };
-use crate::loader::{load_tsv_data, maybe_decompress, DdlResult, LoadResult, LoaderPool};
+use crate::loader::{
+    load_tsv_data, maybe_decompress, wait_for_load, DdlResult, LoadResult, LoaderPool, PendingLoad,
+};
 use crate::metrics::ClientMetrics;
 use crate::progress::ImportProgress;
 use crate::sql::{create_table, execute_set_block};
@@ -57,8 +59,6 @@ impl LoadAccum {
         self.load_ns += result.load_ns;
     }
 }
-
-type PendingLoad = (String, crossbeam_channel::Receiver<Result<LoadResult>>);
 
 /// Info needed to finalize a table after all its loads complete
 struct DeferredTableDone {
@@ -160,18 +160,6 @@ fn finalize_completed_tables(
     }
 
     Ok(())
-}
-
-/// Wait for a specific load to complete (blocking)
-fn wait_for_load(
-    table: &str,
-    rx: &crossbeam_channel::Receiver<Result<LoadResult>>,
-) -> Result<LoadResult> {
-    match rx.recv() {
-        Ok(Ok(result)) => Ok(result),
-        Ok(Err(e)) => Err(anyhow::anyhow!("Loader error for {}: {}", table, e)),
-        Err(_) => Err(anyhow::anyhow!("Loader worker died for {}", table)),
-    }
 }
 
 /// Wait for all remaining pending loads to complete (blocking),
@@ -442,8 +430,9 @@ async fn run_protocol_inner(
                 let estimated_rows = table_info.get(table).copied().unwrap_or(0);
                 progress.start_table(table, estimated_rows);
 
-                // Store schema for this table
-                table_schemas.insert(table.clone(), Arc::new(columns.clone()));
+                // Store schema for this table (shared with the loader pool via Arc)
+                let columns = Arc::new(columns);
+                table_schemas.insert(table.clone(), Arc::clone(&columns));
 
                 // Backup preserved rows BEFORE dropping the table
                 let table_preserves: Vec<&PreserveRule> = plan
@@ -465,7 +454,7 @@ async fn run_protocol_inner(
                 if let Some(pool) = loader_pool {
                     let ddl_rx = pool.submit_ddl(
                         table.clone(),
-                        columns,
+                        Arc::clone(&columns),
                         anon_rules,
                     )?;
                     pending_ddls.insert(table.clone(), ddl_rx);

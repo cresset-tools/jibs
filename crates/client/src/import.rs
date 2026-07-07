@@ -38,6 +38,9 @@ pub struct ImportConfig {
     pub clean: bool,
     /// Report what would be imported without touching the local database
     pub dry_run: bool,
+    /// Write the stream to a `.jibsdump` file instead of loading into a local
+    /// database. When set, the local MySQL connection is never opened.
+    pub dump_to: Option<PathBuf>,
     pub parallel: usize,
     /// Number of client-side loader pool workers (None = use `parallel` value)
     pub client_parallel: Option<usize>,
@@ -149,6 +152,11 @@ pub async fn run_import(config: ImportConfig) -> Result<()> {
     // Dry run: ask the server what would happen; never touch the local DB
     if config.dry_run {
         return run_dry_run(&config, &session, &server_path, plan).await;
+    }
+
+    // Export mode: stream to a .jibsdump file instead of a local database.
+    if let Some(dump_path) = &config.dump_to {
+        return crate::export::run_export(&session, &server_path, plan, &config, dump_path).await;
     }
 
     // Connect to local MySQL

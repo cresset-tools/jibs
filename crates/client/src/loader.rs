@@ -28,7 +28,7 @@ enum LoadWork {
     /// Create (or recreate) a table — must complete before any LoadData for the same table
     CreateTable {
         table: String,
-        columns: Vec<ColumnDef>,
+        columns: Arc<Vec<ColumnDef>>,
         anon_rules: Option<Vec<jibs_protocol::AnonymizeRule>>,
         result_tx: crossbeam_channel::Sender<Result<DdlResult>>,
     },
@@ -247,7 +247,7 @@ impl LoaderPool {
     pub(crate) fn submit_ddl(
         &self,
         table: String,
-        columns: Vec<ColumnDef>,
+        columns: Arc<Vec<ColumnDef>>,
         anon_rules: Option<Vec<jibs_protocol::AnonymizeRule>>,
     ) -> Result<crossbeam_channel::Receiver<Result<DdlResult>>> {
         let (result_tx, result_rx) = crossbeam_channel::unbounded();
@@ -367,6 +367,23 @@ pub(crate) struct LoadResult {
     pub(crate) rows: u64,
     pub(crate) decompress_ns: u64,
     pub(crate) load_ns: u64,
+}
+
+/// An in-flight load: the table it belongs to and the channel its worker will
+/// report completion on. Shared by the import protocol and the dump loader.
+pub(crate) type PendingLoad = (String, crossbeam_channel::Receiver<Result<LoadResult>>);
+
+/// Block until a specific load finishes, mapping channel/worker failures to a
+/// descriptive error.
+pub(crate) fn wait_for_load(
+    table: &str,
+    rx: &crossbeam_channel::Receiver<Result<LoadResult>>,
+) -> Result<LoadResult> {
+    match rx.recv() {
+        Ok(Ok(result)) => Ok(result),
+        Ok(Err(e)) => Err(anyhow::anyhow!("Loader error for {}: {}", table, e)),
+        Err(_) => Err(anyhow::anyhow!("Loader worker died for {}", table)),
+    }
 }
 
 
