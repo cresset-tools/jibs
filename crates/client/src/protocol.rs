@@ -11,8 +11,8 @@ use mysql::Conn;
 use tracing::{debug, info, warn};
 
 use jibs_protocol::{
-    ClientMessage, ColumnDef, CompressionMode, ExecutionPlan, MessageWriter, PreserveRule,
-    ServerMessage, ServerMetrics,
+    ClientMessage, ColumnDef, CompressionMode, ExecutionPlan, ForeignKeyDef, MessageWriter,
+    PreserveRule, ServerMessage, ServerMetrics,
 };
 
 use crate::checkpoint::{
@@ -203,6 +203,10 @@ pub(crate) struct ImportStats {
     pub(crate) server_metrics: Option<ServerMetrics>,
     /// Per-table durations: (name, rows, duration)
     pub(crate) table_durations: Vec<(String, u64, Duration)>,
+    /// Source-schema foreign keys reported on `Done`, reconstructed after the
+    /// import so a fresh target ends up with the source's FKs. Empty on
+    /// interruption.
+    pub(crate) source_foreign_keys: Vec<ForeignKeyDef>,
 }
 
 /// Apply get function invocations for the `get` command
@@ -231,6 +235,7 @@ pub(crate) async fn run_protocol(
         rows_imported: 0,
         server_metrics: None,
         table_durations: Vec::new(),
+        source_foreign_keys: Vec::new(),
     };
 
     let mut client_metrics = ClientMetrics::new();
@@ -415,7 +420,12 @@ async fn run_protocol_inner(
         }
 
         match msg {
-            ServerMessage::Schema { table_id, columns } => {
+            ServerMessage::Schema {
+                table_id,
+                columns,
+                indexes,
+                options,
+            } => {
                 let table = id_to_name.get(&table_id)
                     .ok_or_else(|| anyhow::anyhow!("Unknown table_id {} in Schema", table_id))?;
 
@@ -455,12 +465,14 @@ async fn run_protocol_inner(
                     let ddl_rx = pool.submit_ddl(
                         table.clone(),
                         Arc::clone(&columns),
+                        indexes,
+                        options,
                         anon_rules,
                     )?;
                     pending_ddls.insert(table.clone(), ddl_rx);
                 } else {
                     let ddl_start = Instant::now();
-                    create_table(local_conn, table, &columns, anon_rules.as_ref())?;
+                    create_table(local_conn, table, &columns, &indexes, &options, anon_rules.as_ref())?;
                     if config.collect_metrics {
                         client_metrics.add_ddl_time(ddl_start.elapsed());
                     }
@@ -618,7 +630,11 @@ async fn run_protocol_inner(
                 }
             }
 
-            ServerMessage::Done { table_dispositions, metrics: server_metrics } => {
+            ServerMessage::Done { table_dispositions, metrics: server_metrics, foreign_keys } => {
+                // Source-schema FKs to reconstruct once loading finishes (applied
+                // by the caller, after the loader pool has drained).
+                stats.source_foreign_keys = foreign_keys;
+
                 // Drain any remaining pending DDLs
                 for (tbl, ddl_rx) in pending_ddls.drain() {
                     let ddl_result = ddl_rx

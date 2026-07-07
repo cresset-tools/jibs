@@ -5,7 +5,10 @@ use std::collections::HashMap;
 use mysql::prelude::*;
 use mysql::{Conn, Opts, Row, Value as MySqlValue};
 
-use jibs_protocol::{ColumnDef, ColumnFlags, ExecutionPlan, Relation, TableInfo};
+use jibs_protocol::{
+    ColumnDef, ColumnFlags, ExecutionPlan, ForeignKeyDef, IndexColumn, IndexDef, IndexKind,
+    Relation, TableInfo, TableOptions,
+};
 
 use crate::error::{Result, ServerError};
 
@@ -27,6 +30,10 @@ pub struct MySqlConnection {
     schemas: HashMap<String, Vec<ColumnDef>>,
     /// Cached primary keys
     primary_keys: HashMap<String, Vec<String>>,
+    /// Cached secondary indexes
+    indexes: HashMap<String, Vec<IndexDef>>,
+    /// Cached table-level options
+    table_options: HashMap<String, TableOptions>,
 }
 
 impl MySqlConnection {
@@ -41,6 +48,8 @@ impl MySqlConnection {
             conn,
             schemas: HashMap::new(),
             primary_keys: HashMap::new(),
+            indexes: HashMap::new(),
+            table_options: HashMap::new(),
         })
     }
 
@@ -214,6 +223,123 @@ impl MySqlConnection {
         Ok(columns)
     }
 
+    /// Get secondary indexes for a table — every index except PRIMARY (which is
+    /// emitted from the column definitions). Without this the loader recreates
+    /// tables with only their primary key, dropping unique and secondary indexes.
+    pub fn get_indexes(&mut self, table: &str) -> Result<Vec<IndexDef>> {
+        if let Some(idx) = self.indexes.get(table) {
+            return Ok(idx.clone());
+        }
+
+        // SHOW INDEX doesn't support prepared statements; escape the identifier.
+        let escaped_table = escape_identifier(table);
+        let query = format!("SHOW INDEX FROM `{}`", escaped_table);
+        let rows: Vec<Row> = self.conn.query(&query)?;
+
+        // Group key parts by index name, preserving first-seen order.
+        let mut order: Vec<String> = Vec::new();
+        let mut defs: HashMap<String, IndexDef> = HashMap::new();
+        let mut parts: HashMap<String, Vec<(u32, IndexColumn)>> = HashMap::new();
+
+        for row in rows {
+            let key_name: String = row
+                .get_opt("Key_name")
+                .and_then(|r| r.ok())
+                .unwrap_or_default();
+            // PRIMARY is reconstructed from ColumnDef::is_primary_key.
+            if key_name == "PRIMARY" {
+                continue;
+            }
+
+            let non_unique: i64 = row.get_opt("Non_unique").and_then(|r| r.ok()).unwrap_or(1);
+            let seq: u32 = row.get_opt("Seq_in_index").and_then(|r| r.ok()).unwrap_or(0);
+            let column: Option<String> = row.get_opt("Column_name").and_then(|r| r.ok());
+            let sub_part: Option<u32> = row.get_opt("Sub_part").and_then(|r| r.ok());
+            let collation: Option<String> = row.get_opt("Collation").and_then(|r| r.ok());
+            let index_type: String = row
+                .get_opt("Index_type")
+                .and_then(|r| r.ok())
+                .unwrap_or_default();
+            // `Expression` exists only on servers with functional indexes
+            // (MySQL 8.0.13+/MariaDB 10.2+); absent → None.
+            let expression: Option<String> = row.get_opt("Expression").and_then(|r| r.ok());
+
+            let kind = match index_type.to_uppercase().as_str() {
+                "FULLTEXT" => IndexKind::Fulltext,
+                "SPATIAL" | "RTREE" => IndexKind::Spatial,
+                "HASH" => IndexKind::Hash,
+                _ => IndexKind::BTree,
+            };
+
+            if !defs.contains_key(&key_name) {
+                order.push(key_name.clone());
+                defs.insert(
+                    key_name.clone(),
+                    IndexDef {
+                        name: key_name.clone(),
+                        columns: Vec::new(),
+                        unique: non_unique == 0,
+                        kind,
+                    },
+                );
+            }
+
+            let part = IndexColumn {
+                name: column.unwrap_or_default(),
+                prefix_len: sub_part,
+                descending: collation.as_deref() == Some("D"),
+                expression,
+            };
+            parts.entry(key_name).or_default().push((seq, part));
+        }
+
+        let mut result = Vec::with_capacity(order.len());
+        for name in order {
+            let mut ps = parts.remove(&name).unwrap_or_default();
+            ps.sort_by_key(|(seq, _)| *seq);
+            let mut def = defs.remove(&name).expect("def present for ordered name");
+            def.columns = ps.into_iter().map(|(_, c)| c).collect();
+            result.push(def);
+        }
+
+        self.indexes.insert(table.to_string(), result.clone());
+        Ok(result)
+    }
+
+    /// Get table-level options (engine, default charset/collation, row format).
+    /// Without these the recreated table inherits the server/database defaults —
+    /// most visibly a different collation.
+    pub fn get_table_options(&mut self, table: &str) -> Result<TableOptions> {
+        if let Some(opts) = self.table_options.get(table) {
+            return Ok(opts.clone());
+        }
+
+        let row: Option<Row> = self.conn.exec_first(
+            r#"
+            SELECT ENGINE, TABLE_COLLATION, ROW_FORMAT
+            FROM INFORMATION_SCHEMA.TABLES
+            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?
+            "#,
+            (table,),
+        )?;
+
+        let mut opts = TableOptions::default();
+        if let Some(row) = row {
+            opts.engine = row.get_opt("ENGINE").and_then(|r| r.ok());
+            let collation: Option<String> = row.get_opt("TABLE_COLLATION").and_then(|r| r.ok());
+            // A collation name is `<charset>_<...>`, so the charset is its prefix.
+            opts.charset = collation
+                .as_deref()
+                .and_then(|c| c.split('_').next())
+                .map(str::to_string);
+            opts.collation = collation;
+            opts.row_format = row.get_opt("ROW_FORMAT").and_then(|r| r.ok());
+        }
+
+        self.table_options.insert(table.to_string(), opts.clone());
+        Ok(opts)
+    }
+
     /// Discover foreign key constraints from MySQL's INFORMATION_SCHEMA.
     /// Returns single-column FK relations (composite FKs are skipped).
     pub fn discover_foreign_keys(&mut self) -> Result<Vec<Relation>> {
@@ -274,6 +400,52 @@ impl MySqlConnection {
         }
 
         Ok(relations)
+    }
+
+    /// Capture full foreign key definitions from the source database so a load
+    /// or import into a fresh target can reconstruct them (jibs otherwise only
+    /// preserves the target's own pre-existing FKs across a reload).
+    ///
+    /// Unlike [`Self::discover_foreign_keys`] (which drives aggregate traversal
+    /// and keeps only single-column relations), this keeps composite FKs and
+    /// carries the `ON UPDATE` / `ON DELETE` actions. The referenced schema is
+    /// intentionally dropped: the constraint is recreated in the target schema.
+    pub fn capture_foreign_keys(&mut self) -> Result<Vec<ForeignKeyDef>> {
+        type FkRow = (String, String, String, String, String, String, String);
+        let rows: Vec<FkRow> = self.conn.query(
+            "SELECT kcu.TABLE_NAME, kcu.CONSTRAINT_NAME, kcu.COLUMN_NAME, \
+                    kcu.REFERENCED_TABLE_NAME, kcu.REFERENCED_COLUMN_NAME, \
+                    rc.UPDATE_RULE, rc.DELETE_RULE \
+             FROM information_schema.KEY_COLUMN_USAGE kcu \
+             JOIN information_schema.REFERENTIAL_CONSTRAINTS rc \
+               ON rc.CONSTRAINT_SCHEMA = kcu.CONSTRAINT_SCHEMA \
+              AND rc.CONSTRAINT_NAME = kcu.CONSTRAINT_NAME \
+              AND rc.TABLE_NAME = kcu.TABLE_NAME \
+             WHERE kcu.TABLE_SCHEMA = DATABASE() AND kcu.REFERENCED_TABLE_NAME IS NOT NULL \
+             ORDER BY kcu.TABLE_NAME, kcu.CONSTRAINT_NAME, kcu.ORDINAL_POSITION",
+        )?;
+
+        // Rows are ordered so all parts of one constraint are contiguous and in
+        // key order; fold consecutive parts into a single def.
+        let mut defs: Vec<ForeignKeyDef> = Vec::new();
+        for (table, constraint, column, ref_table, ref_column, update_rule, delete_rule) in rows {
+            match defs.last_mut() {
+                Some(last) if last.table == table && last.constraint == constraint => {
+                    last.columns.push(column);
+                    last.ref_columns.push(ref_column);
+                }
+                _ => defs.push(ForeignKeyDef {
+                    table,
+                    constraint,
+                    columns: vec![column],
+                    ref_table,
+                    ref_columns: vec![ref_column],
+                    update_rule,
+                    delete_rule,
+                }),
+            }
+        }
+        Ok(defs)
     }
 
     /// Get cached primary key for a table

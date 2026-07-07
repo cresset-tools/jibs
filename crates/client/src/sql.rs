@@ -6,12 +6,14 @@ use mysql::prelude::*;
 use mysql::Conn;
 use tracing::{debug, info};
 
-use jibs_protocol::{ColumnDef, SetRule, Value};
+use jibs_protocol::{ColumnDef, IndexDef, IndexKind, SetRule, TableOptions, Value};
 
 pub(crate) fn create_table(
     conn: &mut Conn,
     table: &str,
     columns: &[ColumnDef],
+    indexes: &[IndexDef],
+    options: &TableOptions,
     anon_rules: Option<&Vec<jibs_protocol::AnonymizeRule>>,
 ) -> Result<()> {
     use jibs_protocol::AnonymizeTarget;
@@ -25,6 +27,16 @@ pub(crate) fn create_table(
         // Use full_type which includes the complete type definition
         // (e.g., "enum('a','b')", "varchar(255)", "int unsigned")
         let mut def = format!("`{}` {}", col.name, col.full_type);
+
+        // Per-column collation, emitted only when it differs from the table
+        // default. COLUMN_TYPE (full_type) doesn't carry COLLATE, so without this
+        // the column silently takes the table default and case/sort semantics can
+        // change.
+        if let Some(col_collation) = &col.collation {
+            if options.collation.as_deref() != Some(col_collation.as_str()) {
+                def.push_str(&format!(" COLLATE {}", col_collation));
+            }
+        }
 
         // Check if this column is being anonymized to NULL
         let is_anonymized_to_null = anon_rules
@@ -65,15 +77,80 @@ pub(crate) fn create_table(
         ));
     }
 
-    let create_sql = format!(
+    // Secondary indexes (unique + non-unique). PRIMARY is already emitted above;
+    // the server never sends it in `indexes`.
+    for idx in indexes {
+        column_defs.push(index_ddl(idx));
+    }
+
+    let mut create_sql = format!(
         "CREATE TABLE `{}` (\n  {}\n)",
         table,
         column_defs.join(",\n  ")
     );
 
+    // Table options — reproduce engine + default charset/collation so the copy
+    // doesn't silently inherit the server/database defaults.
+    if let Some(engine) = &options.engine {
+        create_sql.push_str(&format!(" ENGINE={}", engine));
+    }
+    if let Some(charset) = &options.charset {
+        create_sql.push_str(&format!(" DEFAULT CHARSET={}", charset));
+    }
+    if let Some(collation) = &options.collation {
+        create_sql.push_str(&format!(" COLLATE={}", collation));
+    }
+    if let Some(row_format) = &options.row_format {
+        create_sql.push_str(&format!(" ROW_FORMAT={}", row_format));
+    }
+
     debug!("Creating table: {}", create_sql);
     conn.query_drop(&create_sql)?;
     Ok(())
+}
+
+/// Render one secondary index as a `CREATE TABLE` clause.
+fn index_ddl(idx: &IndexDef) -> String {
+    let keyword = if idx.unique {
+        "UNIQUE KEY"
+    } else {
+        match idx.kind {
+            IndexKind::Fulltext => "FULLTEXT KEY",
+            IndexKind::Spatial => "SPATIAL KEY",
+            _ => "KEY",
+        }
+    };
+
+    let cols = idx
+        .columns
+        .iter()
+        .map(|c| {
+            if let Some(expr) = &c.expression {
+                // Functional key part: MySQL wants it wrapped in parentheses.
+                format!("({})", expr)
+            } else {
+                let mut part = format!("`{}`", c.name);
+                if let Some(len) = c.prefix_len {
+                    part.push_str(&format!("({})", len));
+                }
+                if c.descending {
+                    part.push_str(" DESC");
+                }
+                part
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    // BTREE is the default; HASH needs to be stated (MEMORY tables). FULLTEXT /
+    // SPATIAL are conveyed by the keyword above, not USING.
+    let using = if matches!(idx.kind, IndexKind::Hash) {
+        " USING HASH"
+    } else {
+        ""
+    };
+
+    format!("{} `{}` ({}){}", keyword, idx.name, cols, using)
 }
 
 /// Load TSV data into a table using LOAD DATA LOCAL INFILE
@@ -191,6 +268,78 @@ fn value_to_sql(value: &Value) -> String {
             .collect::<Vec<_>>()
             .join(", "),
         Value::Null => "NULL".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::index_ddl;
+    use jibs_protocol::{IndexColumn, IndexDef, IndexKind};
+
+    fn part(name: &str) -> IndexColumn {
+        IndexColumn {
+            name: name.to_string(),
+            prefix_len: None,
+            descending: false,
+            expression: None,
+        }
+    }
+
+    fn idx(name: &str, columns: Vec<IndexColumn>, unique: bool, kind: IndexKind) -> IndexDef {
+        IndexDef {
+            name: name.to_string(),
+            columns,
+            unique,
+            kind,
+        }
+    }
+
+    #[test]
+    fn unique_single_column() {
+        let d = idx("EMAIL_WEBSITE", vec![part("email"), part("website_id")], true, IndexKind::BTree);
+        assert_eq!(index_ddl(&d), "UNIQUE KEY `EMAIL_WEBSITE` (`email`, `website_id`)");
+    }
+
+    #[test]
+    fn non_unique_secondary() {
+        let d = idx("STORE_ID", vec![part("store_id")], false, IndexKind::BTree);
+        assert_eq!(index_ddl(&d), "KEY `STORE_ID` (`store_id`)");
+    }
+
+    #[test]
+    fn prefix_length() {
+        let mut p = part("body");
+        p.prefix_len = Some(255);
+        let d = idx("BODY", vec![p], false, IndexKind::BTree);
+        assert_eq!(index_ddl(&d), "KEY `BODY` (`body`(255))");
+    }
+
+    #[test]
+    fn fulltext() {
+        let d = idx("FTS", vec![part("content")], false, IndexKind::Fulltext);
+        assert_eq!(index_ddl(&d), "FULLTEXT KEY `FTS` (`content`)");
+    }
+
+    #[test]
+    fn descending_part() {
+        let mut p = part("created_at");
+        p.descending = true;
+        let d = idx("RECENT", vec![p], false, IndexKind::BTree);
+        assert_eq!(index_ddl(&d), "KEY `RECENT` (`created_at` DESC)");
+    }
+
+    #[test]
+    fn expression_part_double_parens() {
+        let mut p = part("");
+        p.expression = Some("json_value(`d`,'$.x')".to_string());
+        let d = idx("FUNC", vec![p], false, IndexKind::BTree);
+        assert_eq!(index_ddl(&d), "KEY `FUNC` ((json_value(`d`,'$.x')))");
+    }
+
+    #[test]
+    fn hash_uses_clause() {
+        let d = idx("H", vec![part("k")], false, IndexKind::Hash);
+        assert_eq!(index_ddl(&d), "KEY `H` (`k`) USING HASH");
     }
 }
 

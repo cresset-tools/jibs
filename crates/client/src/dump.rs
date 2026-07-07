@@ -22,14 +22,23 @@ use anyhow::{bail, Context, Result};
 use bincode::{Decode, Encode};
 
 use jibs_protocol::framing::{bincode_config, write_message_noflush};
-use jibs_protocol::{AnonymizeRule, ColumnDef, CompressionMode, PreserveRule, SetRule};
+use jibs_protocol::{
+    AnonymizeRule, ColumnDef, CompressionMode, ForeignKeyDef, IndexDef, PreserveRule, SetRule,
+    TableOptions,
+};
 
 /// Magic bytes at the start of every `.jibsdump` file.
 pub(crate) const MAGIC: &[u8; 8] = b"JIBSDUMP";
 
 /// Current on-disk format version. Bump this on any incompatible change to the
 /// preamble or [`DumpRecord`]; the loader refuses versions it doesn't know.
-pub(crate) const FORMAT_VERSION: u16 = 1;
+///
+/// v2 added secondary indexes + table options to [`DumpRecord::Table`].
+/// v3 added [`DumpRecord::ForeignKeys`], carrying the source schema's foreign
+/// keys so a load into a fresh database can reconstruct them. The record layout
+/// is not self-describing (bincode), so a loader cannot read an older dump —
+/// older dumps must be regenerated (they are ephemeral by design).
+pub(crate) const FORMAT_VERSION: u16 = 3;
 
 /// Length of the fixed preamble: 8-byte magic + 2-byte version.
 const PREAMBLE_LEN: usize = 10;
@@ -55,6 +64,10 @@ pub(crate) enum DumpRecord {
     Table {
         name: String,
         columns: Vec<ColumnDef>,
+        /// Secondary indexes (unique + non-unique); PRIMARY lives in `columns`.
+        indexes: Vec<IndexDef>,
+        /// Table-level options (engine, default charset/collation, row format).
+        options: TableOptions,
         /// Anonymization rules that shaped the DDL (e.g. columns forced
         /// nullable). The data is already anonymized server-side; these are
         /// carried only so `load` recreates the exact same table definition.
@@ -79,6 +92,11 @@ pub(crate) enum DumpRecord {
         /// Raw `after { ... }` SQL statements from the config.
         after_statements: Vec<String>,
     },
+    /// Foreign key constraints from the source schema, applied after all data is
+    /// loaded (with FK checks off). Written once, just before `End`. Always
+    /// emitted (even empty) so it authoritatively describes the source's FK set,
+    /// letting a load into a fresh database reconstruct them.
+    ForeignKeys { foreign_keys: Vec<ForeignKeyDef> },
     /// Terminator. A complete dump ends with exactly one of these.
     End,
 }
@@ -114,11 +132,15 @@ impl<W: Write> DumpWriter<W> {
         &mut self,
         name: &str,
         columns: &[ColumnDef],
+        indexes: &[IndexDef],
+        options: &TableOptions,
         anon_rules: Option<&[AnonymizeRule]>,
     ) -> Result<()> {
         let rec = DumpRecord::Table {
             name: name.to_string(),
             columns: columns.to_vec(),
+            indexes: indexes.to_vec(),
+            options: options.clone(),
             anon_rules: anon_rules.map(<[AnonymizeRule]>::to_vec),
         };
         write_message_noflush(&mut self.inner, &rec)?;
@@ -174,6 +196,17 @@ impl<W: Write> DumpWriter<W> {
         let rec = DumpRecord::PostProcess {
             sets: sets.to_vec(),
             after_statements: after_statements.to_vec(),
+        };
+        write_message_noflush(&mut self.inner, &rec)?;
+        Ok(())
+    }
+
+    /// Write the source schema's foreign key constraints, to be reconstructed on
+    /// load after all data is in place. Written unconditionally (even when
+    /// empty) so the record authoritatively describes the source's FK set.
+    pub(crate) fn write_foreign_keys(&mut self, foreign_keys: &[ForeignKeyDef]) -> Result<()> {
+        let rec = DumpRecord::ForeignKeys {
+            foreign_keys: foreign_keys.to_vec(),
         };
         write_message_noflush(&mut self.inner, &rec)?;
         Ok(())
@@ -330,7 +363,14 @@ mod tests {
         let mut buf = Vec::new();
         {
             let mut w = DumpWriter::new(&mut buf).unwrap();
-            w.write_table("users", &[col("id"), col("name")], None).unwrap();
+            w.write_table(
+                "users",
+                &[col("id"), col("name")],
+                &[],
+                &jibs_protocol::TableOptions::default(),
+                None,
+            )
+            .unwrap();
             // Feed an uncompressed chunk; the writer must store it compressed.
             w.write_chunk("users", CompressionMode::None, 2, b"1\tAlice\n2\tBob\n".to_vec())
                 .unwrap();
@@ -411,7 +451,14 @@ mod tests {
         {
             let mut w = DumpWriter::new(&mut buf).unwrap();
             w.write_manifest(&preserves).unwrap();
-            w.write_table("users", &[col("id")], None).unwrap();
+            w.write_table(
+                "users",
+                &[col("id")],
+                &[],
+                &jibs_protocol::TableOptions::default(),
+                None,
+            )
+            .unwrap();
             w.write_table_end("users", 0).unwrap();
             w.write_post_process(&sets, &after).unwrap();
             w.finish().unwrap();
@@ -437,13 +484,63 @@ mod tests {
         assert!(matches!(r.next_record().unwrap().unwrap(), DumpRecord::End));
     }
 
+    #[test]
+    fn roundtrip_foreign_keys() {
+        let fks = vec![ForeignKeyDef {
+            table: "orders".to_string(),
+            constraint: "fk_orders_user".to_string(),
+            columns: vec!["user_id".to_string()],
+            ref_table: "users".to_string(),
+            ref_columns: vec!["id".to_string()],
+            update_rule: "NO ACTION".to_string(),
+            delete_rule: "CASCADE".to_string(),
+        }];
+
+        let mut buf = Vec::new();
+        {
+            let mut w = DumpWriter::new(&mut buf).unwrap();
+            w.write_table(
+                "users",
+                &[col("id")],
+                &[],
+                &jibs_protocol::TableOptions::default(),
+                None,
+            )
+            .unwrap();
+            w.write_table_end("users", 0).unwrap();
+            w.write_foreign_keys(&fks).unwrap();
+            w.finish().unwrap();
+        }
+
+        let mut r = open(buf).unwrap();
+        assert!(matches!(r.next_record().unwrap().unwrap(), DumpRecord::Table { .. }));
+        assert!(matches!(r.next_record().unwrap().unwrap(), DumpRecord::TableEnd { .. }));
+        match r.next_record().unwrap().unwrap() {
+            DumpRecord::ForeignKeys { foreign_keys } => {
+                assert_eq!(foreign_keys.len(), 1);
+                assert_eq!(foreign_keys[0].constraint, "fk_orders_user");
+                assert_eq!(foreign_keys[0].ref_table, "users");
+                assert_eq!(foreign_keys[0].delete_rule, "CASCADE");
+            }
+            other => panic!("expected ForeignKeys, got {other:?}"),
+        }
+        assert!(matches!(r.next_record().unwrap().unwrap(), DumpRecord::End));
+    }
+
     /// A stream truncated mid-record must be an error, not a clean end.
     #[test]
     fn truncation_is_an_error_not_clean_eof() {
         let mut buf = Vec::new();
         {
             let mut w = DumpWriter::new(&mut buf).unwrap();
-            w.write_table("users", &[col("id"), col("name")], None).unwrap();
+            w.write_table(
+                "users",
+                &[col("id"), col("name")],
+                &[],
+                &jibs_protocol::TableOptions::default(),
+                None,
+            )
+            .unwrap();
             w.write_chunk("users", CompressionMode::None, 2, b"1\tAlice\n".to_vec())
                 .unwrap();
             w.finish().unwrap();
@@ -475,7 +572,14 @@ mod tests {
         let mut buf = Vec::new();
         {
             let mut w = DumpWriter::new(&mut buf).unwrap();
-            w.write_table("users", &[col("id")], None).unwrap();
+            w.write_table(
+                "users",
+                &[col("id")],
+                &[],
+                &jibs_protocol::TableOptions::default(),
+                None,
+            )
+            .unwrap();
             w.finish().unwrap();
         }
         // A cap smaller than the Table record forces a rejection.

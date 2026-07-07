@@ -2,7 +2,9 @@
 
 use bincode::{Decode, Encode};
 
-use crate::plan::{ColumnDef, CompressionMode, ExecutionPlan, TableInfo};
+use crate::plan::{
+    ColumnDef, CompressionMode, ExecutionPlan, ForeignKeyDef, IndexDef, TableInfo, TableOptions,
+};
 
 /// Timing for a single query executed during aggregate BFS traversal
 #[derive(Debug, Clone, Default, Encode, Decode)]
@@ -122,6 +124,11 @@ pub enum ServerMessage {
     Schema {
         table_id: u16,
         columns: Vec<ColumnDef>,
+        /// Secondary indexes (unique + non-unique); PRIMARY is carried in
+        /// `columns`. Empty when the table has none.
+        indexes: Vec<IndexDef>,
+        /// Table-level options (engine, default charset/collation, row format).
+        options: TableOptions,
     },
     /// Data chunk with rows in TSV format
     Data {
@@ -143,6 +150,10 @@ pub enum ServerMessage {
         table_dispositions: Vec<(u16, TableDisposition)>,
         /// Performance metrics (only populated if --metrics flag was used)
         metrics: Option<ServerMetrics>,
+        /// Foreign key constraints discovered in the source database, so a load
+        /// or import into a fresh database can reconstruct them. Empty when the
+        /// stream was interrupted (a partial run doesn't assert an FK set).
+        foreign_keys: Vec<ForeignKeyDef>,
     },
     /// Error occurred
     Error { message: String, recoverable: bool },
