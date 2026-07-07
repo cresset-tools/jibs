@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.5.0](https://github.com/cresset-tools/jibs/compare/jibs-v0.4.0...jibs-v0.5.0) (2026-07-07)
+
+
+### Features
+
+* add .jibsdump export/load with parallel loader ([#26](https://github.com/cresset-tools/jibs/issues/26)) ([d17f3ba](https://github.com/cresset-tools/jibs/commit/d17f3ba1c86932498eb02b1a5a736eed296b659d))
+
+
+### Bug Fixes
+
+* preserve indexes, collation, table options and foreign keys on load ([#28](https://github.com/cresset-tools/jibs/issues/28)) ([7a2a0b1](https://github.com/cresset-tools/jibs/commit/7a2a0b1a696ff9229494b9ab7781921f1a3eaab5))
+
 ## [0.4.0](https://github.com/cresset-tools/jibs/compare/jibs-v0.3.0...jibs-v0.4.0) (2026-07-06)
 
 
