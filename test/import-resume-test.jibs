@@ -20,8 +20,6 @@ anonymize users {
     password_hash -> null
 }
 
-faker emails [
-    "anon1@test.local",
-    "anon2@test.local",
-    "anon3@test.local"
-]
+// `users.email` is UNIQUE (reproduced by jibs), so anonymized emails must be
+// distinct — unique() gives each imported user its own address.
+faker emails ["anon{unique()}@test.local"]

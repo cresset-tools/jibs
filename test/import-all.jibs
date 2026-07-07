@@ -15,14 +15,10 @@ anonymize users {
     password_hash -> null
 }
 
-// Faker pool for email anonymization
-faker emails [
-    "user1@test.local",
-    "user2@test.local",
-    "user3@test.local",
-    "user4@test.local",
-    "user5@test.local"
-]
+// Faker for email anonymization. `users.email` carries a UNIQUE index (which
+// jibs now reproduces), so anonymized values must be distinct — unique() gives
+// each row its own address. A fixed pool would collide and silently drop rows.
+faker emails ["user{unique()}@test.local"]
 
 // Post-import: set a default password for all users
 after {
