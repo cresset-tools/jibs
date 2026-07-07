@@ -54,7 +54,7 @@ enum Commands {
     Check(CheckArgs),
     /// Show resolved execution plan (for debugging)
     Plan(PlanArgs),
-    /// Load a .jibsdump file into a local database (parallel)
+    /// Load a .jibsdump file or URL into a local database (parallel)
     Load(LoadArgs),
 }
 
@@ -192,7 +192,8 @@ struct CheckArgs {
 
 #[derive(Args)]
 struct LoadArgs {
-    /// Path to the .jibsdump file to load
+    /// Path to a .jibsdump file, or an http(s) URL (e.g. a presigned snapshot)
+    /// to stream and load without a temp-file hop
     dump: PathBuf,
 
     /// Local MySQL connection URL

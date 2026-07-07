@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 use std::io::{BufReader, Read};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
@@ -50,14 +50,63 @@ pub(crate) struct LoadConfig {
     pub(crate) clean: bool,
 }
 
+/// If `source` is an `http://` or `https://` URL, return it as a string; else
+/// `None` (a local file path). Lets `jibs load` take a file or a URL in the same
+/// positional argument.
+fn url_source(source: &Path) -> Option<&str> {
+    let s = source.to_str()?;
+    (s.starts_with("http://") || s.starts_with("https://")).then_some(s)
+}
+
+/// Open a `.jibsdump` URL for streaming into the loader. Presigned URLs are plain
+/// GETs, so there's no auth here — the caller (or sconce) bakes it into the URL.
+/// The body streams (no whole-file buffering), so a multi-GB dump loads chunk by
+/// chunk just like a local file.
+fn open_dump_url(url: &str) -> Result<Box<dyn Read>> {
+    match ureq::get(url).call() {
+        Ok(resp) => Ok(Box::new(resp.into_reader())),
+        Err(ureq::Error::Status(code, resp)) => {
+            // Surface the server's reason, and flag the most common failure:
+            // an expired presigned URL comes back as 403.
+            let hint = match code {
+                403 => " (the presigned URL may have expired)",
+                404 => " (no dump at this URL — is the snapshot published?)",
+                _ => "",
+            };
+            let body = resp.into_string().unwrap_or_default();
+            let body = body.trim();
+            let detail = if body.is_empty() {
+                String::new()
+            } else {
+                format!(" — {}", body.chars().take(200).collect::<String>())
+            };
+            bail!("failed to download dump: HTTP {}{}{}", code, hint, detail)
+        }
+        Err(e) => Err(anyhow::anyhow!("failed to download dump from {}: {}", url, e)),
+    }
+}
+
 /// Load a `.jibsdump` file into the local database.
 pub(crate) fn run_load(config: LoadConfig) -> Result<()> {
-    info!("Loading dump {}", config.dump_path.display());
-
-    let file = std::fs::File::open(&config.dump_path)
-        .with_context(|| format!("failed to open dump {}", config.dump_path.display()))?;
+    // The source is either a local file or an http(s) URL (e.g. a presigned
+    // snapshot). Both yield a `Read` the streaming DumpReader consumes the same
+    // way — no temp-file hop for the URL case.
+    let source: Box<dyn Read> = match url_source(&config.dump_path) {
+        Some(url) => {
+            info!("Downloading dump from {}", url);
+            open_dump_url(url)?
+        }
+        None => {
+            info!("Loading dump {}", config.dump_path.display());
+            Box::new(
+                std::fs::File::open(&config.dump_path).with_context(|| {
+                    format!("failed to open dump {}", config.dump_path.display())
+                })?,
+            )
+        }
+    };
     let mut reader =
-        DumpReader::with_max_record_size(BufReader::new(file), config.max_message_size)?;
+        DumpReader::with_max_record_size(BufReader::new(source), config.max_message_size)?;
 
     info!(
         "Connecting to local MySQL: {}",
@@ -349,4 +398,30 @@ fn drain_completed(pending: Vec<PendingLoad>, rows_loaded: &mut u64) -> Result<V
         }
     }
     Ok(still)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::url_source;
+    use std::path::Path;
+
+    #[test]
+    fn detects_http_and_https_urls() {
+        assert_eq!(
+            url_source(Path::new("https://x.test/a.jibsdump?sig=1")),
+            Some("https://x.test/a.jibsdump?sig=1")
+        );
+        assert_eq!(
+            url_source(Path::new("http://127.0.0.1:8080/d.jibsdump")),
+            Some("http://127.0.0.1:8080/d.jibsdump")
+        );
+    }
+
+    #[test]
+    fn local_paths_are_not_urls() {
+        assert_eq!(url_source(Path::new("/tmp/a.jibsdump")), None);
+        assert_eq!(url_source(Path::new("./a.jibsdump")), None);
+        // A path that merely contains "http" is not a URL.
+        assert_eq!(url_source(Path::new("my-http-dump.jibsdump")), None);
+    }
 }
