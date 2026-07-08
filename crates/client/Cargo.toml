@@ -34,3 +34,6 @@ hex.workspace = true
 indicatif.workspace = true
 crossbeam-channel.workspace = true
 regex = "1"
+# Blocking HTTP client for `jibs load <url>` (the load path is synchronous, so a
+# blocking client avoids dragging an async runtime in). rustls, no system OpenSSL.
+ureq = "2"
