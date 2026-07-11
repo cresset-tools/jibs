@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.0](https://github.com/cresset-tools/jibs/compare/jibs-v0.5.0...jibs-v0.6.0) (2026-07-11)
+
+
+### Features
+
+* load a dump from an http(s) URL ([#30](https://github.com/cresset-tools/jibs/issues/30)) ([dbf2ffd](https://github.com/cresset-tools/jibs/commit/dbf2ffd022e43fdaf234755cf5e256f2b356c0ca))
+
 ## [0.5.0](https://github.com/cresset-tools/jibs/compare/jibs-v0.4.0...jibs-v0.5.0) (2026-07-07)
 
 
