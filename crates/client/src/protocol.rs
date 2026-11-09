@@ -20,7 +20,7 @@ use crate::checkpoint::{
     BACKUP_TABLE_PREFIX,
 };
 use crate::loader::{
-    load_tsv_data, maybe_decompress, warn_dropped_rows, wait_for_load, DdlResult, LoadResult,
+    load_tsv_data, loaded_rows, maybe_decompress, warn_dropped_rows, wait_for_load, DdlResult, LoadResult,
     LoaderPool, PendingLoad,
 };
 use crate::metrics::ClientMetrics;
@@ -282,6 +282,8 @@ async fn run_protocol_inner(
     client_metrics: &mut ClientMetrics,
     mut encoder: MessageWriter<()>,
 ) -> Result<()> {
+    // `get` (aggregates_only) merges into existing tables instead of replacing them
+    let upsert = plan.aggregates_only;
 
     // Set up checkpointing
     Checkpoint::create(local_conn)?;
@@ -485,7 +487,7 @@ async fn run_protocol_inner(
                     pending_ddls.insert(table.clone(), ddl_rx);
                 } else {
                     let ddl_start = Instant::now();
-                    create_table(local_conn, table, &columns, &indexes, &options, anon_rules.as_ref())?;
+                    create_table(local_conn, table, &columns, &indexes, &options, anon_rules.as_ref(), upsert)?;
                     if config.collect_metrics {
                         client_metrics.add_ddl_time(ddl_start.elapsed());
                     }
@@ -587,7 +589,8 @@ async fn run_protocol_inner(
                     }
 
                     let load_start = Instant::now();
-                    let loaded = load_tsv_data(local_conn, table, &schema, decompressed)?;
+                    let affected = load_tsv_data(local_conn, table, &schema, decompressed, upsert)?;
+                    let loaded = loaded_rows(affected, u64::from(row_count), upsert);
                     if config.collect_metrics {
                         client_metrics.add_load_time(load_start.elapsed());
                         client_metrics.add_rows_loaded(loaded);

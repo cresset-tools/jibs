@@ -62,8 +62,11 @@ pub(crate) struct LoaderPool {
 
 impl LoaderPool {
     /// Create a new loader pool with N workers
-    /// Returns an error if any worker fails to initialize
-    pub(crate) fn new(mysql_url: &str, num_workers: usize) -> Result<Self> {
+    /// Returns an error if any worker fails to initialize.
+    ///
+    /// `upsert` (the `get` command) keeps existing tables and loads with
+    /// `REPLACE`, merging rows instead of rebuilding tables.
+    pub(crate) fn new(mysql_url: &str, num_workers: usize, upsert: bool) -> Result<Self> {
         let (work_tx, work_rx) = crossbeam_channel::unbounded::<LoadWork>();
 
         // Channel for workers to report initialization status
@@ -145,6 +148,7 @@ impl LoaderPool {
                                     &indexes,
                                     &options,
                                     anon_rules.as_ref(),
+                                    upsert,
                                 )?;
                                 Ok(DdlResult {
                                     ddl_ns: ddl_start.elapsed().as_nanos() as u64,
@@ -167,12 +171,14 @@ impl LoaderPool {
                                     decompress_start.elapsed().as_nanos() as u64;
 
                                 let load_start = Instant::now();
-                                let rows = load_tsv_data(
+                                let affected = load_tsv_data(
                                     &mut conn,
                                     &table,
                                     &columns,
                                     decompressed,
+                                    upsert,
                                 )?;
+                                let rows = loaded_rows(affected, expected_rows, upsert);
                                 let load_ns = load_start.elapsed().as_nanos() as u64;
 
                                 // Fewer rows inserted than sent → MySQL skipped
@@ -328,12 +334,27 @@ impl LoaderPool {
     }
 }
 
+/// Rows a chunk actually loaded, from LOAD DATA's affected-row count.
+///
+/// `REPLACE` counts a replaced row twice (delete + insert) and never skips one,
+/// so in upsert mode every sent row landed and the count is capped at that.
+pub(crate) fn loaded_rows(affected: u64, expected_rows: u64, upsert: bool) -> u64 {
+    if upsert {
+        affected.min(expected_rows)
+    } else {
+        affected
+    }
+}
+
 /// Build the LOAD DATA LOCAL INFILE statement for a table.
 ///
 /// Binary-typed columns arrive hex-encoded in the TSV stream (the server
 /// cannot put raw bytes in a text stream safely), so they are read into
 /// user variables and decoded with UNHEX() in a SET clause.
-fn build_load_data_sql(table: &str, columns: &[ColumnDef]) -> String {
+///
+/// With `upsert`, `REPLACE` overwrites rows whose primary/unique key already
+/// exists instead of skipping them.
+fn build_load_data_sql(table: &str, columns: &[ColumnDef], upsert: bool) -> String {
     let mut col_list: Vec<String> = Vec::with_capacity(columns.len());
     let mut set_clauses: Vec<String> = Vec::new();
 
@@ -347,7 +368,8 @@ fn build_load_data_sql(table: &str, columns: &[ColumnDef]) -> String {
     }
 
     let mut sql = format!(
-        r"LOAD DATA LOCAL INFILE 'data.tsv' INTO TABLE `{}` FIELDS TERMINATED BY '\t' ESCAPED BY '\\' LINES TERMINATED BY '\n' ({})",
+        r"LOAD DATA LOCAL INFILE 'data.tsv' {}INTO TABLE `{}` FIELDS TERMINATED BY '\t' ESCAPED BY '\\' LINES TERMINATED BY '\n' ({})",
+        if upsert { "REPLACE " } else { "" },
         table,
         col_list.join(", ")
     );
@@ -364,6 +386,7 @@ pub(crate) fn load_tsv_data(
     table: &str,
     columns: &[ColumnDef],
     tsv_data: Vec<u8>,
+    upsert: bool,
 ) -> Result<u64> {
     use std::io::Write;
 
@@ -382,7 +405,7 @@ pub(crate) fn load_tsv_data(
     conn.set_local_infile_handler(Some(handler));
 
     // Execute LOAD DATA LOCAL INFILE
-    let load_sql = build_load_data_sql(table, columns);
+    let load_sql = build_load_data_sql(table, columns, upsert);
 
     debug!("LOAD DATA SQL (worker): {}", load_sql);
     let result = conn.query_iter(&load_sql)?;
@@ -501,15 +524,32 @@ mod tests {
     fn load_data_sql_plain_columns() {
         let columns = vec![col("id", "INT"), col("name", "VARCHAR")];
         assert_eq!(
-            build_load_data_sql("users", &columns),
+            build_load_data_sql("users", &columns, false),
             r"LOAD DATA LOCAL INFILE 'data.tsv' INTO TABLE `users` FIELDS TERMINATED BY '\t' ESCAPED BY '\\' LINES TERMINATED BY '\n' (`id`, `name`)"
         );
     }
     #[test]
+    fn load_data_sql_upsert_uses_replace() {
+        let columns = vec![col("id", "INT"), col("name", "VARCHAR")];
+        assert_eq!(
+            build_load_data_sql("users", &columns, true),
+            r"LOAD DATA LOCAL INFILE 'data.tsv' REPLACE INTO TABLE `users` FIELDS TERMINATED BY '\t' ESCAPED BY '\\' LINES TERMINATED BY '\n' (`id`, `name`)"
+        );
+    }
+
+    #[test]
+    fn loaded_rows_caps_replace_double_count() {
+        // 3 rows sent, 2 replaced existing rows: REPLACE reports 1 + 2*2 = 5.
+        assert_eq!(loaded_rows(5, 3, true), 3);
+        // Plain LOAD DATA reports skipped duplicates as a lower count.
+        assert_eq!(loaded_rows(2, 3, false), 2);
+    }
+
+    #[test]
     fn load_data_sql_binary_columns_use_unhex() {
         let columns = vec![col("id", "INT"), col("data", "BLOB"), col("tag", "VARBINARY")];
         assert_eq!(
-            build_load_data_sql("files", &columns),
+            build_load_data_sql("files", &columns, false),
             r"LOAD DATA LOCAL INFILE 'data.tsv' INTO TABLE `files` FIELDS TERMINATED BY '\t' ESCAPED BY '\\' LINES TERMINATED BY '\n' (`id`, @jibs_hex_1, @jibs_hex_2) SET `data` = UNHEX(@jibs_hex_1), `tag` = UNHEX(@jibs_hex_2)"
         );
     }
