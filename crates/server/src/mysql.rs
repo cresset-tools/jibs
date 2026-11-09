@@ -306,7 +306,8 @@ impl MySqlConnection {
         Ok(result)
     }
 
-    /// Get table-level options (engine, default charset/collation, row format).
+    /// Get table-level options (engine, default charset/collation, row format,
+    /// AUTO_INCREMENT counter).
     /// Without these the recreated table inherits the server/database defaults —
     /// most visibly a different collation.
     pub fn get_table_options(&mut self, table: &str) -> Result<TableOptions> {
@@ -334,6 +335,15 @@ impl MySqlConnection {
                 .map(str::to_string);
             opts.collation = collation;
             opts.row_format = row.get_opt("ROW_FORMAT").and_then(|r| r.ok());
+
+            // The counter comes from SHOW CREATE TABLE, not INFORMATION_SCHEMA:
+            // MySQL 8 caches the latter for up to a day, and even uncached it
+            // reports one less than the real counter until the table is first
+            // opened after a server restart.
+            let create: Option<(String, String)> = self
+                .conn
+                .query_first(format!("SHOW CREATE TABLE `{}`", escape_identifier(table)))?;
+            opts.auto_increment = create.and_then(|(_, ddl)| auto_increment_from_ddl(&ddl));
         }
 
         self.table_options.insert(table.to_string(), opts.clone());
@@ -484,6 +494,19 @@ impl MySqlConnection {
     }
 }
 
+/// The `AUTO_INCREMENT=<n>` table option from `SHOW CREATE TABLE` output, or
+/// `None` when the table has none (no AUTO_INCREMENT column, or a counter
+/// still at 1). Only the options after the column list are searched (SHOW
+/// CREATE TABLE closes it with a `)` at the start of a line; newlines inside
+/// comments and defaults are escaped), so the `AUTO_INCREMENT` column
+/// attribute and a trailing PARTITION clause don't interfere.
+fn auto_increment_from_ddl(ddl: &str) -> Option<u64> {
+    let options = &ddl[ddl.find("\n)")? + 2..];
+    let rest = &options[options.find(" AUTO_INCREMENT=")? + " AUTO_INCREMENT=".len()..];
+    let digits = rest.split(|c: char| !c.is_ascii_digit()).next()?;
+    digits.parse().ok()
+}
+
 /// Escape a MySQL identifier (table name, column name) for use in queries
 /// This escapes backticks by doubling them
 fn escape_identifier(s: &str) -> String {
@@ -573,6 +596,18 @@ pub fn escape_tsv_bytes(buf: &mut Vec<u8>, bytes: &[u8]) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn reads_auto_increment_table_option() {
+        let ddl = "CREATE TABLE `products` (\n  `id` int NOT NULL AUTO_INCREMENT,\n  `note` varchar(9) DEFAULT ')',\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB AUTO_INCREMENT=1000 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci\n/*!50100 PARTITION BY HASH (`id`)\nPARTITIONS 4 */";
+        assert_eq!(super::auto_increment_from_ddl(ddl), Some(1000));
+    }
+
+    #[test]
+    fn no_auto_increment_table_option() {
+        let ddl = "CREATE TABLE `t` (\n  `id` int NOT NULL AUTO_INCREMENT,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4";
+        assert_eq!(super::auto_increment_from_ddl(ddl), None);
+    }
+
     use super::*;
 
     fn escape_to_string(input: &[u8]) -> String {

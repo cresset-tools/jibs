@@ -101,24 +101,35 @@ pub(crate) fn create_table(
         column_defs.join(",\n  ")
     );
 
-    // Table options — reproduce engine + default charset/collation so the copy
-    // doesn't silently inherit the server/database defaults.
-    if let Some(engine) = &options.engine {
-        create_sql.push_str(&format!(" ENGINE={}", engine));
-    }
-    if let Some(charset) = &options.charset {
-        create_sql.push_str(&format!(" DEFAULT CHARSET={}", charset));
-    }
-    if let Some(collation) = &options.collation {
-        create_sql.push_str(&format!(" COLLATE={}", collation));
-    }
-    if let Some(row_format) = &options.row_format {
-        create_sql.push_str(&format!(" ROW_FORMAT={}", row_format));
-    }
+    create_sql.push_str(&table_options_ddl(options));
 
     debug!("Creating table: {}", create_sql);
     conn.query_drop(&create_sql)?;
     Ok(())
+}
+
+/// Render the table options that follow `CREATE TABLE (...)`: engine, default
+/// charset/collation and row format so the copy doesn't silently inherit the
+/// server/database defaults, and the source's AUTO_INCREMENT counter. InnoDB
+/// keeps the higher of that counter and max(id)+1 as rows are loaded.
+fn table_options_ddl(options: &TableOptions) -> String {
+    let mut ddl = String::new();
+    if let Some(engine) = &options.engine {
+        ddl.push_str(&format!(" ENGINE={}", engine));
+    }
+    if let Some(charset) = &options.charset {
+        ddl.push_str(&format!(" DEFAULT CHARSET={}", charset));
+    }
+    if let Some(collation) = &options.collation {
+        ddl.push_str(&format!(" COLLATE={}", collation));
+    }
+    if let Some(row_format) = &options.row_format {
+        ddl.push_str(&format!(" ROW_FORMAT={}", row_format));
+    }
+    if let Some(auto_increment) = options.auto_increment {
+        ddl.push_str(&format!(" AUTO_INCREMENT={}", auto_increment));
+    }
+    ddl
 }
 
 /// Render one secondary index as a `CREATE TABLE` clause.
@@ -295,8 +306,28 @@ fn value_to_sql(value: &Value) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::index_ddl;
-    use jibs_protocol::{IndexColumn, IndexDef, IndexKind};
+    use super::{index_ddl, table_options_ddl};
+    use jibs_protocol::{IndexColumn, IndexDef, IndexKind, TableOptions};
+
+    #[test]
+    fn table_options_include_auto_increment() {
+        let options = TableOptions {
+            engine: Some("InnoDB".to_string()),
+            charset: Some("utf8mb4".to_string()),
+            collation: Some("utf8mb4_general_ci".to_string()),
+            row_format: None,
+            auto_increment: Some(1042),
+        };
+        assert_eq!(
+            table_options_ddl(&options),
+            " ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci AUTO_INCREMENT=1042"
+        );
+    }
+
+    #[test]
+    fn table_options_omit_missing_auto_increment() {
+        assert_eq!(table_options_ddl(&TableOptions::default()), "");
+    }
 
     fn part(name: &str) -> IndexColumn {
         IndexColumn {

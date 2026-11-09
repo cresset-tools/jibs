@@ -290,6 +290,9 @@ fn load_records<R: Read>(
             DumpRecord::ManifestV3 { .. } => {
                 unreachable!("DumpReader::next_record turns v3 manifests into Manifest")
             }
+            DumpRecord::TableV4 { .. } => {
+                unreachable!("DumpReader::next_record turns v4 tables into Table")
+            }
             DumpRecord::Table {
                 name,
                 columns,

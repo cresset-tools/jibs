@@ -442,4 +442,9 @@ pub struct TableOptions {
     pub collation: Option<String>,
     /// Row format, when the table pins one (e.g. `DYNAMIC`).
     pub row_format: Option<String>,
+    /// The source table's next AUTO_INCREMENT value. Without it the copy's
+    /// counter lands at max(id)+1 of the imported rows, which for a subset
+    /// import is usually far below the source's — so new local rows reuse ids
+    /// (and sequence-driven numbers) that already exist upstream.
+    pub auto_increment: Option<u64>,
 }
