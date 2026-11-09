@@ -1,0 +1,29 @@
+// Generates crates/client/tests/fixtures/dump-v<N>.jibsdump: a small dump that
+// carries every DumpRecord variant (Manifest, Table with anonymize rules,
+// Chunk, TableEnd, PostProcess with set + after, ForeignKeys, End), so the
+// checked-in fixture exercises the whole on-disk format. See the
+// FORMAT_VERSION doc comment in crates/client/src/dump.rs for when to
+// regenerate it.
+
+exclude_data audit_log
+ignore_table sessions
+
+anonymize users {
+    email -> emails
+    password_hash -> null
+}
+
+faker emails ["user{unique()}@test.local"]
+
+// Manifest record
+preserve users where "email = 'local-admin@test.local'"
+
+// PostProcess record (set + after)
+set users {
+    match id = 1
+    name = "Fixture admin"
+}
+
+after {
+    """UPDATE users SET password_hash = '$2b$10$testpasswordhash' WHERE password_hash IS NULL"""
+}
