@@ -13,6 +13,7 @@ use jibs_protocol::{
 const UNIQUE_SENTINEL: &str = "{unique()}";
 
 /// Pre-computed anonymization action for a column
+#[derive(Clone, Copy)]
 enum AnonAction {
     /// Write \\N
     Null,
@@ -22,14 +23,27 @@ enum AnonAction {
     FakerUnique(usize),
 }
 
+/// One anonymization rule for a column, resolved to an action
+struct ColumnRule {
+    /// Index into [`TsvWriter::conditions`]; `None` applies to every row
+    condition: Option<usize>,
+    action: AnonAction,
+}
+
 /// TSV writer for streaming table data
 pub struct TsvWriter {
     /// Buffer for building rows
     buffer: Vec<u8>,
     /// Number of columns
     num_columns: usize,
-    /// Pre-computed anonymization lookup: one entry per column, None = no anonymization
-    anon_by_column: Vec<Option<AnonAction>>,
+    /// Pre-computed anonymization lookup: the rules for each column, in the
+    /// order they are tried (conditional rules first, then the unconditional
+    /// one). Empty = no anonymization.
+    anon_by_column: Vec<Vec<ColumnRule>>,
+    /// Distinct row conditions of the rules. Each is evaluated by the SELECT
+    /// that reads the rows (see [`TsvWriter::select_list`]) and arrives as an
+    /// extra column after the table's own, at `num_columns + index`.
+    conditions: Vec<String>,
     /// Per-column flag: binary-typed columns are hex-encoded in the TSV stream
     /// (decoded with UNHEX() by the client's LOAD DATA)
     binary_by_column: Vec<bool>,
@@ -88,33 +102,61 @@ impl TsvWriter {
             }
         };
 
+        // Distinct conditions, in first-seen order
+        let mut conditions: Vec<String> = Vec::new();
+        for rule in &anonymization {
+            if let Some(cond) = &rule.condition {
+                if !conditions.contains(cond) {
+                    conditions.push(cond.clone());
+                }
+            }
+        }
+
+        // Conditional rules are tried first (in declaration order) so they can
+        // carve exceptions out of an unconditional rule for the same column
+        let ordered: Vec<&AnonymizeRule> = anonymization
+            .iter()
+            .filter(|r| r.condition.is_some())
+            .chain(anonymization.iter().filter(|r| r.condition.is_none()))
+            .collect();
+
         // Build pre-computed anonymization lookup by column index
-        let anon_by_column: Vec<Option<AnonAction>> = columns
+        let anon_by_column: Vec<Vec<ColumnRule>> = columns
             .iter()
             .map(|col_name| {
-                anonymization
+                ordered
                     .iter()
-                    .find(|r| &r.column == col_name)
-                    .map(|rule| match &rule.target {
-                        AnonymizeTarget::Null => AnonAction::Null,
-                        AnonymizeTarget::Faker(faker_name) => {
-                            let pool_idx = get_or_create_pool(
-                                faker_name,
-                                &mut faker_pool_names,
-                                &mut faker_pools,
-                                &mut faker_pools_raw,
-                            );
-                            // Auto-detect: if any pool value contains {unique()}, use unique mode
-                            let has_unique = faker_pools_raw[pool_idx]
-                                .iter()
-                                .any(|v| v.contains(UNIQUE_SENTINEL));
-                            if has_unique {
-                                AnonAction::FakerUnique(pool_idx)
-                            } else {
-                                AnonAction::Faker(pool_idx)
+                    .filter(|r| &r.column == col_name)
+                    .map(|rule| {
+                        let action = match &rule.target {
+                            AnonymizeTarget::Null => AnonAction::Null,
+                            AnonymizeTarget::Faker(faker_name) => {
+                                let pool_idx = get_or_create_pool(
+                                    faker_name,
+                                    &mut faker_pool_names,
+                                    &mut faker_pools,
+                                    &mut faker_pools_raw,
+                                );
+                                // Auto-detect: if any pool value contains {unique()}, use unique mode
+                                let has_unique = faker_pools_raw[pool_idx]
+                                    .iter()
+                                    .any(|v| v.contains(UNIQUE_SENTINEL));
+                                if has_unique {
+                                    AnonAction::FakerUnique(pool_idx)
+                                } else {
+                                    AnonAction::Faker(pool_idx)
+                                }
                             }
+                        };
+                        ColumnRule {
+                            condition: rule
+                                .condition
+                                .as_ref()
+                                .and_then(|c| conditions.iter().position(|x| x == c)),
+                            action,
                         }
                     })
+                    .collect()
             })
             .collect();
 
@@ -127,12 +169,20 @@ impl TsvWriter {
             buffer,
             num_columns,
             anon_by_column,
+            conditions,
             binary_by_column,
             faker_pools,
             faker_pools_raw,
             rng: rand::thread_rng(),
             unique_counter: 0,
         }
+    }
+
+    /// The select list for reading this table's rows: `*`, followed by one
+    /// `(<condition>) IS TRUE` flag per row condition. `IS TRUE` makes a NULL
+    /// result count as false, like a WHERE clause would.
+    pub fn select_list(&self) -> String {
+        select_list(&self.conditions)
     }
 
     /// Write a row to the internal buffer
@@ -145,8 +195,12 @@ impl TsvWriter {
             }
 
             let is_binary = self.binary_by_column[i];
+            let num_columns = self.num_columns;
+            let action = pick_action(&self.anon_by_column[i], |cond| {
+                flag_is_true(row.as_ref(num_columns + cond))
+            });
 
-            match &self.anon_by_column[i] {
+            match action {
                 Some(AnonAction::Null) => {
                     self.buffer.extend_from_slice(b"\\N");
                 }
@@ -154,7 +208,7 @@ impl TsvWriter {
                     if is_binary {
                         // Binary columns carry hex on the wire, so hex-encode
                         // the raw faker value instead of the escaped one
-                        let pool = &self.faker_pools_raw[*pool_idx];
+                        let pool = &self.faker_pools_raw[pool_idx];
                         if let Some(value) = pool.choose(&mut self.rng) {
                             self.buffer
                                 .extend_from_slice(hex::encode(value.as_bytes()).as_bytes());
@@ -162,7 +216,7 @@ impl TsvWriter {
                             self.buffer.extend_from_slice(b"\\N");
                         }
                     } else {
-                        let pool = &self.faker_pools[*pool_idx];
+                        let pool = &self.faker_pools[pool_idx];
                         if let Some(value) = pool.choose(&mut self.rng) {
                             self.buffer.extend_from_slice(value);
                         } else {
@@ -171,7 +225,7 @@ impl TsvWriter {
                     }
                 }
                 Some(AnonAction::FakerUnique(pool_idx)) => {
-                    let pool = &self.faker_pools_raw[*pool_idx];
+                    let pool = &self.faker_pools_raw[pool_idx];
                     if pool.is_empty() {
                         self.buffer.extend_from_slice(b"\\N");
                     } else {
@@ -272,5 +326,129 @@ impl TsvWriter {
     /// Check if no TSV data has been written (header-only).
     pub fn is_empty(&self) -> bool {
         self.buffer.len() <= RAW_CHUNK_HEADER_LEN
+    }
+}
+
+/// `*` plus one `(<condition>) IS TRUE` flag column per condition.
+fn select_list(conditions: &[String]) -> String {
+    let mut list = String::from("*");
+    for cond in conditions {
+        list.push_str(", (");
+        list.push_str(cond);
+        list.push_str(") IS TRUE");
+    }
+    list
+}
+
+/// The first rule whose condition holds (an unconditional rule always does).
+fn pick_action(rules: &[ColumnRule], flag: impl Fn(usize) -> bool) -> Option<AnonAction> {
+    rules
+        .iter()
+        .find(|r| r.condition.is_none_or(&flag))
+        .map(|r| r.action)
+}
+
+/// Read a condition flag column. The text protocol (`query_iter`) returns it
+/// as bytes, the binary protocol (`exec_iter`) as an integer.
+fn flag_is_true(value: Option<&MySqlValue>) -> bool {
+    match value {
+        Some(MySqlValue::Int(i)) => *i != 0,
+        Some(MySqlValue::UInt(u)) => *u != 0,
+        Some(MySqlValue::Bytes(b)) => !b.is_empty() && b.as_slice() != b"0",
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rule(condition: Option<usize>, action: AnonAction) -> ColumnRule {
+        ColumnRule { condition, action }
+    }
+
+    #[test]
+    fn select_list_appends_one_flag_per_condition() {
+        assert_eq!(select_list(&[]), "*");
+        assert_eq!(
+            select_list(&["path LIKE 'payment/%'".to_string(), "id = 1".to_string()]),
+            "*, (path LIKE 'payment/%') IS TRUE, (id = 1) IS TRUE"
+        );
+    }
+
+    #[test]
+    fn conditional_rule_applies_only_when_its_flag_is_set() {
+        let rules = [rule(Some(0), AnonAction::Null)];
+        assert!(matches!(
+            pick_action(&rules, |_| true),
+            Some(AnonAction::Null)
+        ));
+        assert!(pick_action(&rules, |_| false).is_none());
+    }
+
+    #[test]
+    fn conditional_rule_overrides_unconditional_fallback() {
+        // Ordered as TsvWriter::new orders them: conditional first
+        let rules = [
+            rule(Some(0), AnonAction::Null),
+            rule(None, AnonAction::Faker(3)),
+        ];
+        assert!(matches!(
+            pick_action(&rules, |_| true),
+            Some(AnonAction::Null)
+        ));
+        assert!(matches!(
+            pick_action(&rules, |_| false),
+            Some(AnonAction::Faker(3))
+        ));
+    }
+
+    #[test]
+    fn flags_from_both_protocols() {
+        assert!(flag_is_true(Some(&MySqlValue::Int(1))));
+        assert!(flag_is_true(Some(&MySqlValue::Bytes(b"1".to_vec()))));
+        assert!(!flag_is_true(Some(&MySqlValue::Int(0))));
+        assert!(!flag_is_true(Some(&MySqlValue::Bytes(b"0".to_vec()))));
+        assert!(!flag_is_true(Some(&MySqlValue::NULL)));
+        assert!(!flag_is_true(None));
+    }
+
+    #[test]
+    fn writer_orders_conditional_rules_first_and_dedupes_conditions() {
+        let cols = vec![ColumnDef {
+            name: "value".into(),
+            type_name: "TEXT".into(),
+            full_type: "text".into(),
+            max_length: None,
+            nullable: true,
+            is_primary_key: false,
+            charset: None,
+            collation: None,
+            flags: Default::default(),
+        }];
+        let rules = vec![
+            AnonymizeRule {
+                column: "value".into(),
+                target: AnonymizeTarget::Faker("x".into()),
+                condition: None,
+            },
+            AnonymizeRule {
+                column: "value".into(),
+                target: AnonymizeTarget::Null,
+                condition: Some("a = 1".into()),
+            },
+            AnonymizeRule {
+                column: "other".into(),
+                target: AnonymizeTarget::Null,
+                condition: Some("a = 1".into()),
+            },
+        ];
+        let w = TsvWriter::new(&cols, rules, Default::default());
+        assert_eq!(w.select_list(), "*, (a = 1) IS TRUE");
+        let value_rules = &w.anon_by_column[0];
+        assert_eq!(value_rules.len(), 2);
+        assert_eq!(value_rules[0].condition, Some(0));
+        assert!(matches!(value_rules[0].action, AnonAction::Null));
+        assert_eq!(value_rules[1].condition, None);
     }
 }

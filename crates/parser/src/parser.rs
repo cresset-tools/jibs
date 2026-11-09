@@ -361,11 +361,16 @@ impl<'tokens, 'src> Parser<'tokens, 'src> {
         ))
     }
 
-    /// anonymize table { column -> null|faker ... }
+    /// anonymize table [where "condition"] { column -> null|faker ... }
     fn anonymize_stmt(&mut self) -> Result<StatementKind<'src>, ParseError> {
         self.pos += 1;
         let table = self.expect_ident("a table name after 'anonymize'")?;
-        self.expect(Token::LBrace, "'{' to open the anonymize block")?;
+        let where_clause = if self.eat(&Token::Where) {
+            Some(self.string_literal("a condition string after 'where'")?)
+        } else {
+            None
+        };
+        self.expect(Token::LBrace, "'{' (or 'where') after the table name")?;
 
         let mut rules = Vec::new();
         while let Some(Token::Ident(_)) = self.peek() {
@@ -387,7 +392,11 @@ impl<'tokens, 'src> Parser<'tokens, 'src> {
         }
 
         self.expect(Token::RBrace, "'}' to close the anonymize block")?;
-        Ok(StatementKind::Anonymize(AnonymizeBlock { table, rules }))
+        Ok(StatementKind::Anonymize(AnonymizeBlock {
+            table,
+            where_clause,
+            rules,
+        }))
     }
 
     /// A table name or /regex/ pattern
@@ -1105,7 +1114,29 @@ mod tests {
         match &program.statements[0].0.kind {
             StatementKind::Anonymize(block) => {
                 assert_eq!(block.table.0, "customer");
+                assert!(block.where_clause.is_none());
                 assert_eq!(block.rules.len(), 2);
+            }
+            _ => panic!("Expected Anonymize"),
+        }
+    }
+
+    #[test]
+    fn test_anonymize_with_where() {
+        let program = parse(r#"
+            anonymize core_config_data where "path LIKE 'payment/%'" {
+                value -> null
+            }
+        "#);
+        match &program.statements[0].0.kind {
+            StatementKind::Anonymize(block) => {
+                assert_eq!(block.table.0, "core_config_data");
+                let (cond, _) = block.where_clause.as_ref().expect("where clause");
+                assert_eq!(
+                    cond.parts,
+                    vec![StringPart::Text("path LIKE 'payment/%'".into())]
+                );
+                assert_eq!(block.rules.len(), 1);
             }
             _ => panic!("Expected Anonymize"),
         }

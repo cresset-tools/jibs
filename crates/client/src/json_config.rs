@@ -135,6 +135,9 @@ struct JsonAnonymizeBlock {
     rules: Vec<JsonAnonymizeRule>,
     #[serde(default)]
     when: Option<String>,
+    /// SQL condition: the rules only apply to rows matching it
+    #[serde(default, rename = "where")]
+    where_clause: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -747,7 +750,7 @@ impl JsonResolver {
         match anonymize {
             JsonAnonymizeBlocks::Map(map) => {
                 for (table, rules) in map {
-                    self.add_anonymize_rules(table, rules)?;
+                    self.add_anonymize_rules(table, rules, None)?;
                 }
             }
             JsonAnonymizeBlocks::Array(arr) => {
@@ -757,7 +760,12 @@ impl JsonResolver {
                             continue;
                         }
                     }
-                    self.add_anonymize_rules(&block.table, &block.rules)?;
+                    let condition = block
+                        .where_clause
+                        .as_ref()
+                        .map(|w| self.interpolate_string(w))
+                        .transpose()?;
+                    self.add_anonymize_rules(&block.table, &block.rules, condition)?;
                 }
             }
             JsonAnonymizeBlocks::Empty => {}
@@ -765,7 +773,12 @@ impl JsonResolver {
         Ok(())
     }
 
-    fn add_anonymize_rules(&mut self, table: &str, rules: &[JsonAnonymizeRule]) -> Result<()> {
+    fn add_anonymize_rules(
+        &mut self,
+        table: &str,
+        rules: &[JsonAnonymizeRule],
+        condition: Option<String>,
+    ) -> Result<()> {
         let mut resolved_rules = Vec::new();
         for rule in rules {
             let target = if rule.null == Some(true) {
@@ -782,6 +795,7 @@ impl JsonResolver {
             resolved_rules.push(AnonymizeRule {
                 column: rule.column.clone(),
                 target,
+                condition: condition.clone(),
             });
         }
         self.plan
@@ -1065,5 +1079,31 @@ mod tests {
     fn test_parse_column_ref_invalid() {
         assert!(parse_column_ref("invalid").is_err());
         assert!(parse_column_ref("a.b.c").is_err());
+    }
+
+    #[test]
+    fn anonymize_block_where_is_interpolated() {
+        let dir = std::env::temp_dir().join(format!("jibs-json-anon-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        std::fs::write(
+            &path,
+            r#"{
+              "variable": [{"name": "prefix", "type": "string", "default": "payment/"}],
+              "anonymize": [
+                {"table": "core_config_data", "where": "path LIKE '{$prefix}%'",
+                 "rules": [{"column": "value", "null": true}]},
+                {"table": "core_config_data", "rules": [{"column": "path", "null": true}]}
+              ]
+            }"#,
+        )
+        .unwrap();
+        let plan = parse_json_config(&path, &HashMap::new()).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+
+        let rules = &plan.anonymization["core_config_data"];
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0].condition.as_deref(), Some("path LIKE 'payment/%'"));
+        assert_eq!(rules[1].condition, None);
     }
 }

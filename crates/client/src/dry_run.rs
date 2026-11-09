@@ -164,7 +164,19 @@ fn print_dry_run_report(
         let mut summary: Vec<String> = plan
             .anonymization
             .iter()
-            .map(|(table, rules)| format!("{} ({} column(s))", table, rules.len()))
+            .map(|(table, rules)| {
+                let conditional = rules.iter().filter(|r| r.condition.is_some()).count();
+                if conditional > 0 {
+                    format!(
+                        "{} ({} rule(s), {} conditional)",
+                        table,
+                        rules.len(),
+                        conditional
+                    )
+                } else {
+                    format!("{} ({} column(s))", table, rules.len())
+                }
+            })
             .collect();
         summary.sort();
         println!("Anonymization: {}", summary.join(", "));

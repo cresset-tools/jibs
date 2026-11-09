@@ -23,8 +23,8 @@ use bincode::{Decode, Encode};
 
 use jibs_protocol::framing::{bincode_config, write_message_noflush};
 use jibs_protocol::{
-    AnonymizeRule, ColumnDef, CompressionMode, ForeignKeyDef, IndexDef, PreserveRule, SetRule,
-    TableOptions,
+    AnonymizeRule, AnonymizeTarget, ColumnDef, CompressionMode, ForeignKeyDef, IndexDef,
+    PreserveRule, SetRule, TableOptions,
 };
 
 /// Magic bytes at the start of every `.jibsdump` file.
@@ -78,7 +78,7 @@ pub(crate) enum DumpRecord {
         /// Anonymization rules that shaped the DDL (e.g. columns forced
         /// nullable). The data is already anonymized server-side; these are
         /// carried only so `load` recreates the exact same table definition.
-        anon_rules: Option<Vec<AnonymizeRule>>,
+        anon_rules: Option<Vec<DumpAnonymizeRule>>,
     },
     /// One chunk of TSV rows for a table. `data` is stored per `compression`
     /// (always `Zstd` as written by [`DumpWriter`]).
@@ -106,6 +106,38 @@ pub(crate) enum DumpRecord {
     ForeignKeys { foreign_keys: Vec<ForeignKeyDef> },
     /// Terminator. A complete dump ends with exactly one of these.
     End,
+}
+
+/// An anonymization rule as stored in a jibs dump: only what shapes the DDL.
+///
+/// Deliberately its own type rather than [`AnonymizeRule`], so wire-protocol
+/// additions to that rule don't change the on-disk layout. A rule's row
+/// condition (`anonymize t where "..."`) is left out: the data is already
+/// anonymized, and a conditional `-> null` forces the column nullable exactly
+/// like an unconditional one.
+#[derive(Debug, Clone, Encode, Decode)]
+pub(crate) struct DumpAnonymizeRule {
+    pub(crate) column: String,
+    pub(crate) target: AnonymizeTarget,
+}
+
+impl From<&AnonymizeRule> for DumpAnonymizeRule {
+    fn from(rule: &AnonymizeRule) -> Self {
+        Self {
+            column: rule.column.clone(),
+            target: rule.target.clone(),
+        }
+    }
+}
+
+impl From<DumpAnonymizeRule> for AnonymizeRule {
+    fn from(rule: DumpAnonymizeRule) -> Self {
+        Self {
+            column: rule.column,
+            target: rule.target,
+            condition: None,
+        }
+    }
 }
 
 /// Writes a `.jibsdump` stream to any [`Write`] sink.
@@ -148,7 +180,7 @@ impl<W: Write> DumpWriter<W> {
             columns: columns.to_vec(),
             indexes: indexes.to_vec(),
             options: options.clone(),
-            anon_rules: anon_rules.map(<[AnonymizeRule]>::to_vec),
+            anon_rules: anon_rules.map(|rules| rules.iter().map(DumpAnonymizeRule::from).collect()),
         };
         write_message_noflush(&mut self.inner, &rec)?;
         Ok(())

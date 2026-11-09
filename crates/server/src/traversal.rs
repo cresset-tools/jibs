@@ -414,7 +414,6 @@ fn run_aggregate_bfs(
 
         // Stream root table
         let root_table = &aggregate.root_table;
-        let root_query = build_root_query(aggregate);
         let pk_columns = conn
             .get_cached_primary_key(root_table)
             .cloned()
@@ -451,6 +450,7 @@ fn run_aggregate_bfs(
         };
 
         let mut tsv_writer = TsvWriter::new(&columns, anonymization, plan.fakers.clone());
+        let root_query = build_root_query(aggregate, &tsv_writer.select_list());
         let mut chunk_row_count: u16 = 0;
 
         // Accumulators for FK values
@@ -706,7 +706,8 @@ fn run_aggregate_bfs(
                         let placeholders: Vec<&str> =
                             (0..batch.len()).map(|_| "?").collect();
                         let query = format!(
-                            "SELECT * FROM `{}` WHERE `{}` IN ({})",
+                            "SELECT {} FROM `{}` WHERE `{}` IN ({})",
+                            tsv_writer.select_list(),
                             table,
                             column,
                             placeholders.join(", ")
@@ -1269,9 +1270,10 @@ impl<'a> DependencyTraverser<'a> {
 // Query building
 // ============================================================================
 
-/// Build the root table query string with WHERE, ORDER BY, and LIMIT
-fn build_root_query(aggregate: &ResolvedAggregate) -> String {
-    let mut query = format!("SELECT * FROM `{}`", aggregate.root_table);
+/// Build the root table query string with WHERE, ORDER BY, and LIMIT.
+/// `select` is the writer's select list (`*` plus any anonymize condition flags).
+fn build_root_query(aggregate: &ResolvedAggregate, select: &str) -> String {
+    let mut query = format!("SELECT {} FROM `{}`", select, aggregate.root_table);
 
     if let Some(where_clause) = &aggregate.where_clause {
         query.push_str(" WHERE ");
@@ -1495,7 +1497,7 @@ fn stream_full_table_to_channel(
     }))
     .map_err(|_| crate::error::ServerError::Protocol("Channel closed".to_string()))?;
 
-    let query = format!("SELECT * FROM `{}`", table);
+    let query = format!("SELECT {} FROM `{}`", tsv_writer.select_list(), table);
 
     // Time query execution
     let query_start = Instant::now();
