@@ -14,7 +14,7 @@
 # .github/build-setup.yml), so either image arch can deploy to either
 # remote-host arch.
 
-ARG RUST_VERSION=1.100
+ARG RUST_VERSION=1.96
 
 FROM rust:${RUST_VERSION}-alpine AS build
 
