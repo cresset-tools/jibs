@@ -56,6 +56,9 @@ enum Commands {
     Plan(PlanArgs),
     /// Load a .jibsdump file or URL into a local database (parallel)
     Load(LoadArgs),
+    /// Print the .jibsdump format version this build writes. It also loads
+    /// the version before it.
+    DumpFormatVersion,
 }
 
 /// Common connection arguments shared between import and get
@@ -192,8 +195,8 @@ struct CheckArgs {
 
 #[derive(Args)]
 struct LoadArgs {
-    /// Path to a .jibsdump file, or an http(s) URL (e.g. a presigned snapshot)
-    /// to stream and load without a temp-file hop
+    /// Path to a .jibsdump file, `-` to read it from stdin, or an http(s) URL
+    /// (e.g. a presigned snapshot) to stream and load without a temp-file hop
     dump: PathBuf,
 
     /// Local MySQL connection URL
@@ -270,6 +273,10 @@ async fn main() -> Result<()> {
         Commands::Check(args) => run_check(args),
         Commands::Plan(args) => run_plan(args),
         Commands::Load(args) => run_load(args),
+        Commands::DumpFormatVersion => {
+            println!("{}", crate::dump::FORMAT_VERSION);
+            Ok(())
+        }
     }
 }
 

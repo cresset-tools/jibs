@@ -35,9 +35,16 @@ pub(crate) const MAGIC: &[u8; 8] = b"JIBSDUMP";
 ///
 /// v2 added secondary indexes + table options to [`DumpRecord::Table`].
 /// v3 added [`DumpRecord::ForeignKeys`], carrying the source schema's foreign
-/// keys so a load into a fresh database can reconstruct them. The record layout
-/// is not self-describing (bincode), so a loader cannot read an older dump —
-/// older dumps must be regenerated (they are ephemeral by design).
+/// keys so a load into a fresh database can reconstruct them.
+///
+/// Compatibility policy: a jibs build loads dumps of its own version and the one
+/// before it (N and N-1), so producers and consumers of published dumps can
+/// upgrade in either order. The record layout is not self-describing (bincode),
+/// so a bump must keep a frozen decoder for the previous layout. Checked-in
+/// fixtures enforce this (`tests/fixtures/dump-v<N>.jibsdump`, generated from
+/// `test/dump-fixture.jibs`): on a bump, add the new version's fixture and keep
+/// the previous one loading. v3 is the first version under this policy; nothing
+/// reads v1 or v2.
 pub(crate) const FORMAT_VERSION: u16 = 3;
 
 /// Length of the fixed preamble: 8-byte magic + 2-byte version.
@@ -586,5 +593,65 @@ mod tests {
         let mut r = DumpReader::with_max_record_size(Cursor::new(buf), 4).unwrap();
         let err = expect_err(r.next_record());
         assert!(err.to_string().contains("too large"), "got: {err}");
+    }
+
+    /// Checked-in dumps, one per format version this build must load. See the
+    /// [`FORMAT_VERSION`] compatibility policy.
+    const FIXTURES: &[(u16, &[u8])] = &[(3, include_bytes!("../tests/fixtures/dump-v3.jibsdump"))];
+
+    #[test]
+    fn fixture_exists_for_current_version() {
+        assert!(
+            FIXTURES.iter().any(|(v, _)| *v == FORMAT_VERSION),
+            "no fixture for format v{FORMAT_VERSION}: export test/dump-fixture.jibs to \
+             crates/client/tests/fixtures/dump-v{FORMAT_VERSION}.jibsdump and add it to FIXTURES"
+        );
+    }
+
+    #[test]
+    fn loads_current_and_previous_version_fixtures() {
+        for (version, bytes) in FIXTURES {
+            if *version + 1 < FORMAT_VERSION {
+                continue; // older than N-1: no longer supported
+            }
+            assert_eq!(u16::from_le_bytes([bytes[8], bytes[9]]), *version);
+
+            let mut r = open(bytes.to_vec())
+                .unwrap_or_else(|e| panic!("v{version} fixture rejected: {e:#}"));
+            let (mut manifest, mut tables, mut chunks, mut table_ends) = (0, 0, 0, 0);
+            let (mut post_process, mut foreign_keys, mut end) = (0, 0, 0);
+            while let Some(rec) = r
+                .next_record()
+                .unwrap_or_else(|e| panic!("v{version} fixture failed to decode: {e:#}"))
+            {
+                assert_eq!(end, 0, "v{version} fixture has records after End");
+                match rec {
+                    DumpRecord::Manifest { preserves } => {
+                        assert_eq!(preserves.len(), 1);
+                        manifest += 1;
+                    }
+                    DumpRecord::Table { name, anon_rules, .. } => {
+                        if name == "users" {
+                            assert!(anon_rules.is_some_and(|r| !r.is_empty()));
+                        }
+                        tables += 1;
+                    }
+                    DumpRecord::Chunk { .. } => chunks += 1,
+                    DumpRecord::TableEnd { .. } => table_ends += 1,
+                    DumpRecord::PostProcess { sets, after_statements } => {
+                        assert_eq!((sets.len(), after_statements.len()), (1, 1));
+                        post_process += 1;
+                    }
+                    DumpRecord::ForeignKeys { foreign_keys: fks } => {
+                        assert!(!fks.is_empty());
+                        foreign_keys += 1;
+                    }
+                    DumpRecord::End => end += 1,
+                }
+            }
+            assert_eq!((manifest, post_process, foreign_keys, end), (1, 1, 1, 1), "v{version}");
+            assert_eq!((tables, table_ends), (8, 8), "v{version}");
+            assert!(chunks > 0, "v{version} fixture has no data chunks");
+        }
     }
 }

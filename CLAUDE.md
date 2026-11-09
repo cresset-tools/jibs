@@ -76,13 +76,20 @@ cargo run -p jibs -- import test/import-resume-test.jibs \
 ### Test Dump Export / Load
 `import --dump-to <file>` writes the (already anonymized, aggregate-resolved)
 stream to a versioned, zstd-compressed `.jibsdump` file instead of a local DB.
-`jibs load <file>` replays it into a local DB using the parallel loader pool
+`jibs load <file>` (a path, an http(s) URL, or `-` for stdin) replays it into a local DB using the parallel loader pool
 (`--parallel` defaults to 4), reproducing a live import: `preserve` backups,
 `set` upserts and `after` statements all run. No SSH is needed to load. Loading
 is atomic-ish: an incomplete/truncated dump (missing its `End` terminator)
 fails loudly instead of loading partial data. `--clean` discards leftover state
 from a previous interrupted import; `--max-message-size` matches a dump exported
 with a raised wire cap.
+
+`jibs dump-format-version` prints the format version this build writes; it also
+loads the version before it (N-1). Each supported version has a checked-in
+fixture at `crates/client/tests/fixtures/dump-v<N>.jibsdump`, exported from
+`test/dump-fixture.jibs` (which hits every record type). When bumping
+`FORMAT_VERSION`, export a new fixture and keep the previous version loading;
+the dump tests fail until both are done.
 
 ```bash
 # Export to a .jibsdump file (connects to the remote like a normal import)

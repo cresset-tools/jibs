@@ -58,6 +58,13 @@ fn url_source(source: &Path) -> Option<&str> {
     (s.starts_with("http://") || s.starts_with("https://")).then_some(s)
 }
 
+/// `-` as the source means stdin, so an authenticated download can be piped in
+/// (`curl -fsS -H "Authorization: ..." <url> | jibs load - ...`) without jibs
+/// knowing about auth.
+fn is_stdin_source(source: &Path) -> bool {
+    source.as_os_str() == "-"
+}
+
 /// Open a `.jibsdump` URL for streaming into the loader. Presigned URLs are plain
 /// GETs, so there's no auth here — the caller (or sconce) bakes it into the URL.
 /// The body streams (no whole-file buffering), so a multi-GB dump loads chunk by
@@ -88,22 +95,22 @@ fn open_dump_url(url: &str) -> Result<Box<dyn Read>> {
 
 /// Load a `.jibsdump` file into the local database.
 pub(crate) fn run_load(config: LoadConfig) -> Result<()> {
-    // The source is either a local file or an http(s) URL (e.g. a presigned
-    // snapshot). Both yield a `Read` the streaming DumpReader consumes the same
-    // way — no temp-file hop for the URL case.
-    let source: Box<dyn Read> = match url_source(&config.dump_path) {
-        Some(url) => {
-            info!("Downloading dump from {}", url);
-            open_dump_url(url)?
-        }
-        None => {
-            info!("Loading dump {}", config.dump_path.display());
-            Box::new(
-                std::fs::File::open(&config.dump_path).with_context(|| {
-                    format!("failed to open dump {}", config.dump_path.display())
-                })?,
-            )
-        }
+    // The source is stdin (`-`), a local file or an http(s) URL (e.g. a
+    // presigned snapshot). All yield a `Read` the streaming DumpReader consumes
+    // the same way — no temp-file hop for stdin or a URL.
+    let source: Box<dyn Read> = if is_stdin_source(&config.dump_path) {
+        info!("Loading dump from stdin");
+        Box::new(std::io::stdin().lock())
+    } else if let Some(url) = url_source(&config.dump_path) {
+        info!("Downloading dump from {}", url);
+        open_dump_url(url)?
+    } else {
+        info!("Loading dump {}", config.dump_path.display());
+        Box::new(
+            std::fs::File::open(&config.dump_path).with_context(|| {
+                format!("failed to open dump {}", config.dump_path.display())
+            })?,
+        )
     };
     let mut reader =
         DumpReader::with_max_record_size(BufReader::new(source), config.max_message_size)?;
@@ -425,7 +432,7 @@ fn drain_completed(
 
 #[cfg(test)]
 mod tests {
-    use super::url_source;
+    use super::{is_stdin_source, url_source};
     use std::path::Path;
 
     #[test]
@@ -446,5 +453,12 @@ mod tests {
         assert_eq!(url_source(Path::new("./a.jibsdump")), None);
         // A path that merely contains "http" is not a URL.
         assert_eq!(url_source(Path::new("my-http-dump.jibsdump")), None);
+    }
+
+    #[test]
+    fn dash_means_stdin() {
+        assert!(is_stdin_source(Path::new("-")));
+        assert!(!is_stdin_source(Path::new("./-")));
+        assert!(!is_stdin_source(Path::new("-.jibsdump")));
     }
 }
