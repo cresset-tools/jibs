@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.7.0](https://github.com/cresset-tools/jibs/compare/jibs-v0.6.0...jibs-v0.7.0) (2026-11-09)
+
+
+### Features
+
+* load a dump from stdin and add dump format version compatibility checks ([#36](https://github.com/cresset-tools/jibs/issues/36)) ([3bcc919](https://github.com/cresset-tools/jibs/commit/3bcc919d15e3f17736a48ad02e46aafa6dc144d9))
+* merge `get` results into existing tables instead of recreating them ([#34](https://github.com/cresset-tools/jibs/issues/34)) ([d0c14bd](https://github.com/cresset-tools/jibs/commit/d0c14bdd95e378465b2dd11d2edd1cd0ecd3ec1b))
+
 ## [0.6.0](https://github.com/cresset-tools/jibs/compare/jibs-v0.5.0...jibs-v0.6.0) (2026-07-11)
 
 
