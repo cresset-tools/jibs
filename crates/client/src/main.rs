@@ -21,6 +21,7 @@ mod preserve;
 mod protocol;
 mod report;
 mod sql;
+mod triggers;
 mod json_config;
 mod metrics;
 mod progress;

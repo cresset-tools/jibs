@@ -19,7 +19,7 @@ use mysql::prelude::*;
 use mysql::{Conn, Opts};
 use tracing::info;
 
-use jibs_protocol::{AnonymizeRule, ColumnDef, ForeignKeyDef, PreserveRule, SetRule};
+use jibs_protocol::{AnonymizeRule, ColumnDef, ForeignKeyDef, PreserveRule, SetRule, TriggerDef};
 
 use crate::checkpoint::{
     backup_preserved_rows, find_backup_tables, preserve_match_for, restore_preserved_rows, Checkpoint,
@@ -34,6 +34,7 @@ use crate::import::redact_mysql_url;
 use crate::loader::{warn_dropped_rows, wait_for_load, DdlResult, LoaderPool, PendingLoad};
 use crate::preserve::TableKeys;
 use crate::sql::execute_set_block;
+use crate::triggers::apply_triggers;
 
 /// Maximum number of in-flight load chunks before we drain completed ones.
 /// Bounds memory while keeping the pool busy across tables.
@@ -147,7 +148,7 @@ pub(crate) fn run_load(config: LoadConfig) -> Result<()> {
     pool.shutdown();
 
     match outcome {
-        Ok((tables, rows, source_fks)) => {
+        Ok((tables, rows, source_fks, triggers)) => {
             // Prefer the authoritative source-schema FKs carried by the dump —
             // they rebuild constraints even in a fresh target the preserve path
             // could never capture. Fall back to the target's own captured FKs
@@ -159,6 +160,8 @@ pub(crate) fn run_load(config: LoadConfig) -> Result<()> {
                 }
                 None => restore_foreign_keys(&mut conn)?,
             }
+            // Every loaded table was recreated, dropping its triggers.
+            apply_triggers(&mut conn, &triggers)?;
             let _ = conn.query_drop("SET FOREIGN_KEY_CHECKS = 1");
             let _ = conn.query_drop("SET UNIQUE_CHECKS = 1");
             info!("Load complete: {} tables, {} rows", tables, rows);
@@ -218,7 +221,7 @@ fn load_and_finalize<R: Read>(
     reader: &mut DumpReader<R>,
     pool: &LoaderPool,
     conn: &mut Conn,
-) -> Result<(usize, u64, Option<Vec<ForeignKeyDef>>)> {
+) -> Result<(usize, u64, Option<Vec<ForeignKeyDef>>, Vec<TriggerDef>)> {
     let loaded = load_records(reader, pool, conn)?;
 
     // Restore preserved rows before post-processing (import order). Backups were
@@ -246,7 +249,7 @@ fn load_and_finalize<R: Read>(
         conn.query_drop(statement)?;
     }
 
-    Ok((loaded.tables, loaded.rows, loaded.foreign_keys))
+    Ok((loaded.tables, loaded.rows, loaded.foreign_keys, loaded.triggers))
 }
 
 /// Result of consuming a dump stream.
@@ -261,6 +264,8 @@ struct Loaded {
     /// no `ForeignKeys` record (older/foreign producers); `Some` (possibly
     /// empty) when it did, in which case it is authoritative.
     foreign_keys: Option<Vec<ForeignKeyDef>>,
+    /// Source-schema triggers to recreate after load.
+    triggers: Vec<TriggerDef>,
 }
 
 /// Drive the dump records through the loader pool.
@@ -276,6 +281,7 @@ fn load_records<R: Read>(
     let mut sets: Vec<SetRule> = Vec::new();
     let mut after_statements: Vec<String> = Vec::new();
     let mut foreign_keys: Option<Vec<ForeignKeyDef>> = None;
+    let mut triggers: Vec<TriggerDef> = Vec::new();
     let mut tables_loaded = 0usize;
     let mut rows_loaded = 0u64;
     // Rows sent but not inserted (silent duplicate-key skips), summed per table.
@@ -369,6 +375,9 @@ fn load_records<R: Read>(
             DumpRecord::ForeignKeys { foreign_keys: fks } => {
                 foreign_keys = Some(fks);
             }
+            DumpRecord::Triggers { triggers: t } => {
+                triggers = t;
+            }
             DumpRecord::End => {
                 saw_end = true;
                 break;
@@ -406,6 +415,7 @@ fn load_records<R: Read>(
         sets,
         after_statements,
         foreign_keys,
+        triggers,
     })
 }
 

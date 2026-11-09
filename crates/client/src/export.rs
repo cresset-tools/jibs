@@ -19,7 +19,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use tracing::{info, warn};
 
-use jibs_protocol::{ClientMessage, ExecutionPlan, ForeignKeyDef, MessageWriter, ServerMessage};
+use jibs_protocol::{
+    ClientMessage, ExecutionPlan, ForeignKeyDef, MessageWriter, ServerMessage, TriggerDef,
+};
 
 use crate::dump::DumpWriter;
 use crate::import::ImportConfig;
@@ -147,7 +149,7 @@ async fn stream_to_dump(
 
     // The loop only breaks on the terminal `Done`, yielding the source-schema
     // FKs it carries; every other message either continues or returns an error.
-    let foreign_keys: Vec<ForeignKeyDef> = loop {
+    let (foreign_keys, triggers): (Vec<ForeignKeyDef>, Vec<TriggerDef>) = loop {
         match recv_message(server, config.max_message_size).await? {
             ServerMessage::Schema {
                 table_id,
@@ -175,8 +177,12 @@ async fn stream_to_dump(
                 tables_written += 1;
                 rows_written += row_count;
             }
-            ServerMessage::Done { foreign_keys, .. } => {
-                break foreign_keys;
+            ServerMessage::Done {
+                foreign_keys,
+                triggers,
+                ..
+            } => {
+                break (foreign_keys, triggers);
             }
             ServerMessage::Error {
                 message,
@@ -208,6 +214,9 @@ async fn stream_to_dump(
     // Carry the source schema's foreign keys so `load` can reconstruct them into
     // a fresh database (jibs otherwise only preserves the target's own FKs).
     dump.write_foreign_keys(&foreign_keys)?;
+
+    // And its triggers, which `load` recreates once all data is in.
+    dump.write_triggers(&triggers)?;
 
     Ok((tables_written, rows_written))
 }

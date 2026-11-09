@@ -1,6 +1,7 @@
 // Generates crates/client/tests/fixtures/dump-v<N>.jibsdump: a small dump that
 // carries every DumpRecord variant (Manifest, Table with anonymize rules,
-// Chunk, TableEnd, PostProcess with set + after, ForeignKeys, End), so the
+// Chunk, TableEnd, PostProcess with set + after, ForeignKeys, Triggers, End),
+// plus AUTO_INCREMENT counters in the table options, so the
 // checked-in fixture exercises the whole on-disk format. See the
 // FORMAT_VERSION doc comment in crates/client/src/dump.rs for when to
 // regenerate it.
