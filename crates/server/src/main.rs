@@ -11,7 +11,6 @@ mod error;
 mod metrics;
 mod mysql;
 mod traversal;
-mod triggers;
 mod tsv;
 
 use std::collections::{HashMap, HashSet};
@@ -236,26 +235,6 @@ fn run() -> Result<()> {
         explicit_count, added, ignored_count
     );
 
-    // Capture source triggers on tables this import touches, and refuse up
-    // front (before any data moves) when one would write into a table the
-    // import skips.
-    let triggers: Vec<jibs_protocol::TriggerDef> = conn
-        .capture_triggers()
-        .unwrap_or_else(|e| {
-            eprintln!("Warning: could not capture triggers: {}", e);
-            Vec::new()
-        })
-        .into_iter()
-        .filter(|t| !plan.ignored_tables.contains(&t.table))
-        .collect();
-    if let Err(message) = triggers::check_trigger_targets(&triggers, &plan.ignored_tables) {
-        writer.write_message(&ServerMessage::Error {
-            message: message.clone(),
-            recoverable: false,
-        })?;
-        return Err(ServerError::Config(message));
-    }
-
     // Negotiate compression
     let compression = negotiate_compression(client_compression);
 
@@ -323,7 +302,6 @@ fn run() -> Result<()> {
                             metrics,
                             // Partial run — don't assert an FK set to reconstruct.
                             foreign_keys: Vec::new(),
-                            triggers: Vec::new(),
                         });
                         let _ = listener_handle.join();
                         return Ok(());
@@ -345,7 +323,6 @@ fn run() -> Result<()> {
                 table_dispositions,
                 metrics,
                 foreign_keys,
-                triggers,
             })?;
 
             // Wait for listener thread (will get Shutdown from client)

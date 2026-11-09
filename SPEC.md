@@ -515,11 +515,6 @@ ignore_table /^report_/
 ignore_table /^cache/
 ```
 
-An import is refused when a trigger on an imported table writes into an
-ignored table: the trigger would be recreated locally, and every write to its
-table would then fail. Import the target empty with `exclude_data` instead —
-for example Magento's mview changelog tables (`exclude_data /_cl$/`).
-
 An aggregate whose root table is ignored is a configuration error. Relations
 into ignored tables are not followed.
 
@@ -706,7 +701,7 @@ jibs get shop.jibs [connection options] -- \
   (with their other rows, indexes and foreign keys), and fetched rows replace
   local rows with the same primary/unique key (`LOAD DATA ... REPLACE`).
   Tables that don't exist locally yet are created, and get the source
-  schema's foreign keys and triggers.
+  schema's foreign keys.
 - `get` refuses to run if state from an interrupted import exists (backup
   tables or a checkpoint); pass `--clean` to discard that state explicitly.
 
@@ -1011,7 +1006,6 @@ anything connects.
 | `--dry-run` | Report what would be imported without touching the local database |
 | `--resume` | Resume a previously interrupted import |
 | `--clean` | Discard state from a previous interrupted import and start fresh |
-| `--keep-tables` | Load into the tables that already exist instead of dropping and recreating them (also on `jibs load`) |
 
 `--dry-run` connects to the remote host, classifies every table the way the
 import would (aggregate / full / excluded), and counts how many root rows
@@ -1023,26 +1017,6 @@ tables in the local database; the next import must choose `--resume` or
 `--clean`. Foreign key constraints in the local schema are dropped during an
 import and automatically restored afterwards (or on the next successful run
 after an interruption).
-
-With `--keep-tables` an import does for every table what `get` does for its
-aggregates: a table that already exists locally is left as it is and the
-incoming rows are merged in (a row with the same primary or unique key is
-replaced, other local rows stay), its foreign keys and triggers are not
-touched, and only tables that are missing are created from the source. It is
-meant for a target that was prepared in advance, such as a schema-only copy or
-a filesystem clone of one: creating tables is most of what an import of a
-small subset costs (on a shop with 826 tables, 79 s recreating them against
-2.7 s with `--keep-tables`). Because the tables are kept, their triggers fire
-during the load, and a table whose columns differ from the source's is refused
-with the name of the column; import once without the option to bring the
-schema up to date.
-
-Each imported table keeps the source's AUTO_INCREMENT counter, so new local
-rows don't reuse ids that exist upstream. The source's triggers on imported
-tables are recreated once all data is loaded (so they don't fire during the
-load), in their original firing order and under the `sql_mode` they were
-created with. They are created without a `DEFINER`, so the importing user owns
-them: the source's definer usually doesn't exist locally.
 
 ### Examples
 

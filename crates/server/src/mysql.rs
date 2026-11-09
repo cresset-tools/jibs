@@ -7,7 +7,7 @@ use mysql::{Conn, Opts, Row, Value as MySqlValue};
 
 use jibs_protocol::{
     ColumnDef, ColumnFlags, ExecutionPlan, ForeignKeyDef, IndexColumn, IndexDef, IndexKind,
-    Relation, TableInfo, TableOptions, TriggerDef,
+    Relation, TableInfo, TableOptions,
 };
 
 use crate::error::{Result, ServerError};
@@ -340,17 +340,10 @@ impl MySqlConnection {
             // MySQL 8 caches the latter for up to a day, and even uncached it
             // reports one less than the real counter until the table is first
             // opened after a server restart.
-            //
-            // Read the DDL by position, not as a two-column row: for a view the
-            // statement answers four columns (the view, its definition, and
-            // two connection settings), and Magento has one in every install
-            // (`inventory_stock_1`). A view has no counter.
-            let create: Option<Row> = self
+            let create: Option<(String, String)> = self
                 .conn
                 .query_first(format!("SHOW CREATE TABLE `{}`", escape_identifier(table)))?;
-            opts.auto_increment = create
-                .and_then(|row| row.get_opt::<String, _>(1).and_then(|ddl| ddl.ok()))
-                .and_then(|ddl| auto_increment_from_ddl(&ddl));
+            opts.auto_increment = create.and_then(|(_, ddl)| auto_increment_from_ddl(&ddl));
         }
 
         self.table_options.insert(table.to_string(), opts.clone());
@@ -463,31 +456,6 @@ impl MySqlConnection {
             }
         }
         Ok(defs)
-    }
-
-    /// Capture the source schema's triggers in creation order: per table, timing
-    /// and event, `ACTION_ORDER` is the order they fire in, and recreating them
-    /// in that order reproduces it.
-    pub fn capture_triggers(&mut self) -> Result<Vec<TriggerDef>> {
-        type TriggerRow = (String, String, String, String, String, String);
-        let rows: Vec<TriggerRow> = self.conn.query(
-            "SELECT TRIGGER_NAME, EVENT_OBJECT_TABLE, ACTION_TIMING, EVENT_MANIPULATION, \
-                    ACTION_STATEMENT, SQL_MODE \
-             FROM information_schema.TRIGGERS \
-             WHERE TRIGGER_SCHEMA = DATABASE() \
-             ORDER BY EVENT_OBJECT_TABLE, ACTION_TIMING, EVENT_MANIPULATION, ACTION_ORDER",
-        )?;
-        Ok(rows
-            .into_iter()
-            .map(|(name, table, timing, event, statement, sql_mode)| TriggerDef {
-                name,
-                table,
-                timing,
-                event,
-                statement,
-                sql_mode,
-            })
-            .collect())
     }
 
     /// Get cached primary key for a table

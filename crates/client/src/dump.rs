@@ -24,7 +24,7 @@ use bincode::{Decode, Encode};
 use jibs_protocol::framing::{bincode_config, write_message_noflush};
 use jibs_protocol::{
     AnonymizeRule, AnonymizeTarget, ColumnDef, CompressionMode, ForeignKeyDef, IndexDef,
-    PreserveMatch, PreserveRule, SetRule, TableOptions, TriggerDef,
+    PreserveMatch, PreserveRule, SetRule, TableOptions,
 };
 
 /// Magic bytes at the start of every `.jibsdump` file.
@@ -41,8 +41,7 @@ pub(crate) const MAGIC: &[u8; 8] = b"JIBSDUMP";
 /// [`DumpRecord::ManifestV3`], so v4 builds still read v3 dumps.
 /// v5 added `auto_increment` to the table options, so a load restores the
 /// source's AUTO_INCREMENT counters: [`DumpRecord::Table`] moved to the end of
-/// the enum; the v4 table record decodes as [`DumpRecord::TableV4`]. v5 also
-/// added [`DumpRecord::Triggers`].
+/// the enum; the v4 table record decodes as [`DumpRecord::TableV4`].
 ///
 /// Compatibility policy: a jibs build loads dumps of its own version and the one
 /// before it (N and N-1), so producers and consumers of published dumps can
@@ -134,9 +133,6 @@ pub(crate) enum DumpRecord {
         /// carried only so `load` recreates the exact same table definition.
         anon_rules: Option<Vec<DumpAnonymizeRule>>,
     },
-    /// Triggers from the source schema (none on ignored tables), recreated after
-    /// all data is loaded. Written once (even empty), just before `End`.
-    Triggers { triggers: Vec<TriggerDef> },
 }
 
 /// Table options as v4 dumps encode them (frozen layout): no `auto_increment`.
@@ -293,16 +289,6 @@ impl<W: Write> DumpWriter<W> {
     pub(crate) fn write_foreign_keys(&mut self, foreign_keys: &[ForeignKeyDef]) -> Result<()> {
         let rec = DumpRecord::ForeignKeys {
             foreign_keys: foreign_keys.to_vec(),
-        };
-        write_message_noflush(&mut self.inner, &rec)?;
-        Ok(())
-    }
-
-    /// Write the source schema's triggers, recreated on load after all data is
-    /// in place.
-    pub(crate) fn write_triggers(&mut self, triggers: &[TriggerDef]) -> Result<()> {
-        let rec = DumpRecord::Triggers {
-            triggers: triggers.to_vec(),
         };
         write_message_noflush(&mut self.inner, &rec)?;
         Ok(())
@@ -667,38 +653,6 @@ mod tests {
         assert!(matches!(r.next_record().unwrap().unwrap(), DumpRecord::End));
     }
 
-    #[test]
-    fn roundtrip_triggers() {
-        let triggers = vec![jibs_protocol::TriggerDef {
-            name: "trg_products_after_insert".to_string(),
-            table: "products".to_string(),
-            timing: "AFTER".to_string(),
-            event: "INSERT".to_string(),
-            statement: "INSERT INTO products_cl (entity_id) VALUES (NEW.id)".to_string(),
-            sql_mode: "ANSI_QUOTES".to_string(),
-        }];
-
-        let mut buf = Vec::new();
-        {
-            let mut w = DumpWriter::new(&mut buf).unwrap();
-            w.write_foreign_keys(&[]).unwrap();
-            w.write_triggers(&triggers).unwrap();
-            w.finish().unwrap();
-        }
-
-        let mut r = open(buf).unwrap();
-        assert!(matches!(r.next_record().unwrap().unwrap(), DumpRecord::ForeignKeys { .. }));
-        match r.next_record().unwrap().unwrap() {
-            DumpRecord::Triggers { triggers } => {
-                assert_eq!(triggers.len(), 1);
-                assert_eq!(triggers[0].name, "trg_products_after_insert");
-                assert_eq!(triggers[0].sql_mode, "ANSI_QUOTES");
-            }
-            other => panic!("expected Triggers, got {other:?}"),
-        }
-        assert!(matches!(r.next_record().unwrap().unwrap(), DumpRecord::End));
-    }
-
     /// A stream truncated mid-record must be an error, not a clean end.
     #[test]
     fn truncation_is_an_error_not_clean_eof() {
@@ -789,7 +743,7 @@ mod tests {
                 .unwrap_or_else(|e| panic!("v{version} fixture rejected: {e:#}"));
             let (mut manifest, mut tables, mut chunks, mut table_ends) = (0, 0, 0, 0);
             let (mut post_process, mut foreign_keys, mut end) = (0, 0, 0);
-            let (mut counters, mut triggers) = (0, 0);
+            let mut counters = 0;
             while let Some(rec) = r
                 .next_record()
                 .unwrap_or_else(|e| panic!("v{version} fixture failed to decode: {e:#}"))
@@ -836,15 +790,9 @@ mod tests {
                         assert!(!fks.is_empty());
                         foreign_keys += 1;
                     }
-                    DumpRecord::Triggers { triggers: t } => {
-                        assert!(!t.is_empty());
-                        triggers += 1;
-                    }
                     DumpRecord::End => end += 1,
                 }
             }
-            // v4 had no Triggers record; v5 writes it unconditionally.
-            assert_eq!(triggers, usize::from(*version >= 5), "v{version}");
             assert_eq!((manifest, post_process, foreign_keys, end), (1, 1, 1, 1), "v{version}");
             // v5's fixture also has the counter-gap seed's tables.
             assert_eq!(tables, table_ends, "v{version}");

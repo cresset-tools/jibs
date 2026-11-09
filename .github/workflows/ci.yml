@@ -156,24 +156,6 @@ jobs:
       - name: Aggregate import
         run: ./target/debug/jibs import test/import-aggregate.jibs $JIBS_CONN --clean
 
-      # Every source table the config does not ignore must exist locally,
-      # including one the aggregate reaches without finding a row in it
-      # (order_notes) and a view (order_totals).
-      - name: Verify the aggregate import created every table
-        run: |
-          remote=$(docker exec jibs-remote mysql -N -u root -premote_root_pass production -e "SHOW TABLES" | grep -vxE 'sessions|order_audit' | sort)
-          imported=$(docker exec jibs-local mysql -N -u root -plocal_root_pass imported -e "SHOW TABLES" | sort)
-          missing=$(comm -23 <(echo "$remote") <(echo "$imported"))
-          if [ -n "$missing" ]; then
-            echo "::error::Tables missing after the aggregate import: $missing"
-            exit 1
-          fi
-          fks=$(docker exec jibs-local mysql -N -u root -plocal_root_pass imported -e "SELECT COUNT(*) FROM information_schema.REFERENTIAL_CONSTRAINTS WHERE CONSTRAINT_SCHEMA = 'imported' AND TABLE_NAME = 'order_notes'")
-          if [ "$fks" != "1" ]; then
-            echo "::error::order_notes lost its foreign key (got $fks)"
-            exit 1
-          fi
-
       - name: Full table import
         run: ./target/debug/jibs import test/import-all.jibs $JIBS_CONN --clean
 
@@ -191,46 +173,12 @@ jobs:
           done
           exit $fail
 
-      # --keep-tables loads into the tables the full import above left behind:
-      # a row that only exists locally survives (no table is recreated), a
-      # changed row is brought back to the source's, and foreign keys and
-      # triggers stay as they were. Then the same through a dump.
-      - name: Import and load into existing tables (--keep-tables)
-        run: |
-          L() { docker exec jibs-local mysql -N -u root -plocal_root_pass imported -e "$1"; }
-          shape() { L "SELECT CONCAT((SELECT COUNT(*) FROM information_schema.REFERENTIAL_CONSTRAINTS WHERE CONSTRAINT_SCHEMA='imported'), ' fks, ', (SELECT COUNT(*) FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA='imported'), ' triggers')"; }
-          check() {
-            kept=$(L "SELECT COUNT(*) FROM products WHERE id = 9999")
-            name=$(L "SELECT name FROM users WHERE id = 1")
-            if [ "$kept" != "1" ] || [ "$name" = "stale" ] || [ "$(shape)" != "$before" ]; then
-              echo "::error::$1: local-only row kept=$kept, user 1 name=$name, $(shape) (was $before)"
-              exit 1
-            fi
-          }
-          L "INSERT INTO products (id, name, sku, price) VALUES (9999, 'local only', 'LOCAL-1', 1.00)"
-          before=$(shape)
-
-          L "UPDATE users SET name = 'stale' WHERE id = 1"
-          ./target/debug/jibs import test/import-all.jibs $JIBS_CONN --keep-tables
-          check "import --keep-tables"
-
-          ./target/debug/jibs import test/import-all.jibs $JIBS_CONN --dump-to "$RUNNER_TEMP/all.jibsdump"
-          L "UPDATE users SET name = 'stale' WHERE id = 1"
-          ./target/debug/jibs load "$RUNNER_TEMP/all.jibsdump" --local-mysql mysql://root:local_root_pass@127.0.0.1:3308/imported --parallel 4 --keep-tables
-          check "load --keep-tables"
-
-          L "ALTER TABLE users MODIFY name VARCHAR(50) NOT NULL"
-          if ./target/debug/jibs import test/import-all.jibs $JIBS_CONN --keep-tables; then
-            echo "::error::--keep-tables accepted a table whose column type differs from the source"
-            exit 1
-          fi
-
       # Mirrors test/test-resume.sh: seed a local-only row that a preserve rule
       # protects, crash the import so the backup table exists but the restore
       # hasn't happened, then resume.
       #
       # --fail-after-tables must equal the total checkpointed table count (the
-      # 12 seed tables and views minus ignored sessions = 11): with --parallel 4 the table
+      # 9 seed tables minus ignored sessions = 8): with --parallel 4 the table
       # completion order is a race, so any smaller threshold can fire before
       # users was reached, leaving no _jibs_preserve_ backup. After the last
       # checkpoint the crash is still before post-processing, so the backup
@@ -255,8 +203,8 @@ jobs:
 
       - name: Resume test (simulated crash)
         run: |
-          if ./target/debug/jibs import test/import-resume-test.jibs $JIBS_CONN --fail-after-tables 11; then
-            echo "::error::Import was expected to crash after 11 tables but succeeded (did the seed schema gain tables? Keep --fail-after-tables equal to the checkpointed table count)"
+          if ./target/debug/jibs import test/import-resume-test.jibs $JIBS_CONN --fail-after-tables 8; then
+            echo "::error::Import was expected to crash after 8 tables but succeeded (did the seed schema gain tables? Keep --fail-after-tables equal to the checkpointed table count)"
             exit 1
           fi
           backup=$(docker exec jibs-local mysql -N -u root -plocal_root_pass imported -e "SHOW TABLES LIKE '_jibs_preserve_%'")
