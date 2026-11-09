@@ -609,7 +609,11 @@ jibs get shop.jibs [connection options] -- \
   imports are skipped.
 - Traversal, deduplication, and **anonymization** work exactly as in a
   regular import.
-- Fetched tables are dropped and recreated locally with the fetched rows.
+- Fetched rows are merged into the local database: existing tables are kept
+  (with their other rows, indexes and foreign keys), and fetched rows replace
+  local rows with the same primary/unique key (`LOAD DATA ... REPLACE`).
+  Tables that don't exist locally yet are created, and get the source
+  schema's foreign keys.
 - `get` refuses to run if state from an interrupted import exists (backup
   tables or a checkpoint); pass `--clean` to discard that state explicitly.
 

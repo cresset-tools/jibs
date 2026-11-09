@@ -131,7 +131,7 @@ pub(crate) fn run_load(config: LoadConfig) -> Result<()> {
 
     let workers = config.client_parallel.unwrap_or(config.parallel).max(1);
     info!("Creating loader pool with {} workers", workers);
-    let pool = LoaderPool::new(&config.local_mysql, workers)?;
+    let pool = LoaderPool::new(&config.local_mysql, workers, false)?;
 
     let outcome = load_and_finalize(&mut reader, &pool, &mut conn);
 

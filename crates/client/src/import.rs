@@ -1,6 +1,6 @@
 //! Import orchestration - coordinates the entire import process
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -227,16 +227,33 @@ pub async fn run_import(config: ImportConfig) -> Result<()> {
     // Allow inserting 0 into auto-increment columns (e.g. store_website.website_id = 0)
     local_conn.query_drop("SET SQL_MODE = 'NO_AUTO_VALUE_ON_ZERO'")?;
 
+    // `get` (aggregates_only) merges into the existing tables: they are kept,
+    // and rows load with REPLACE (see create_table / build_load_data_sql).
+    let upsert = plan.aggregates_only;
+
     // Capture all FK constraints in the local database, then drop them to
     // prevent MySQL ERROR 1822 during parallel table recreation. They are
     // restored after the import completes (see restore_foreign_keys below).
-    preserve_and_drop_foreign_keys(&mut local_conn)?;
+    //
+    // In upsert mode no existing table is recreated, so their FKs stay in place
+    // untouched. Remember which tables exist so that only the tables this run
+    // creates get the source schema's FKs afterwards.
+    let preexisting_tables: HashSet<String> = if upsert {
+        local_conn.query(
+            "SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE()",
+        )?
+        .into_iter()
+        .collect()
+    } else {
+        preserve_and_drop_foreign_keys(&mut local_conn)?;
+        HashSet::new()
+    };
 
     // Create loader pool for parallel loading
     let client_workers = config.client_parallel.unwrap_or(config.parallel);
     let loader_pool = if client_workers > 1 {
         info!("Creating loader pool with {} workers", client_workers);
-        Some(LoaderPool::new(&config.local_mysql, client_workers)?)
+        Some(LoaderPool::new(&config.local_mysql, client_workers, upsert)?)
     } else {
         None
     };
@@ -293,7 +310,20 @@ pub async fn run_import(config: ImportConfig) -> Result<()> {
     // but that path also leaves result Err, so this only applies on a clean run
     // against an older server). On failure the persisted definitions are kept so
     // a later successful run (e.g. after --resume) restores them.
-    if outcome.result.is_ok() {
+    if outcome.result.is_ok() && upsert {
+        // Existing tables kept their FKs; add the source FKs to new tables only.
+        let new_table_fks: Vec<_> = outcome
+            .stats
+            .source_foreign_keys
+            .iter()
+            .filter(|fk| {
+                !preexisting_tables.contains(&fk.table)
+                    && outcome.stats.tables_imported_names.contains(&fk.table)
+            })
+            .cloned()
+            .collect();
+        apply_foreign_keys(&mut local_conn, &new_table_fks)?;
+    } else if outcome.result.is_ok() {
         if outcome.stats.source_foreign_keys.is_empty() {
             restore_foreign_keys(&mut local_conn)?;
         } else {

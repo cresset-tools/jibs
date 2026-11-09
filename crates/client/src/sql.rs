@@ -8,6 +8,11 @@ use tracing::{debug, info};
 
 use jibs_protocol::{ColumnDef, IndexDef, IndexKind, SetRule, TableOptions, Value};
 
+/// Create a table in local MySQL from the remote schema.
+///
+/// When `upsert` is true (the `get` command), an existing table is kept as-is so
+/// its rows survive and incoming rows are merged in; only missing tables are
+/// created. Otherwise the table is dropped and recreated.
 pub(crate) fn create_table(
     conn: &mut Conn,
     table: &str,
@@ -15,11 +20,18 @@ pub(crate) fn create_table(
     indexes: &[IndexDef],
     options: &TableOptions,
     anon_rules: Option<&Vec<jibs_protocol::AnonymizeRule>>,
+    upsert: bool,
 ) -> Result<()> {
     use jibs_protocol::AnonymizeTarget;
 
-    // Drop existing table
-    conn.query_drop(format!("DROP TABLE IF EXISTS `{}`", table))?;
+    if upsert {
+        if table_exists(conn, table)? {
+            debug!("Table {} already exists, keeping it for upsert", table);
+            return Ok(());
+        }
+    } else {
+        conn.query_drop(format!("DROP TABLE IF EXISTS `{}`", table))?;
+    }
 
     let mut column_defs = Vec::new();
 
@@ -154,6 +166,16 @@ fn index_ddl(idx: &IndexDef) -> String {
 }
 
 /// Load TSV data into a table using LOAD DATA LOCAL INFILE
+
+/// Whether `table` exists in the current database.
+pub(crate) fn table_exists(conn: &mut Conn, table: &str) -> Result<bool> {
+    let found: Option<String> = conn.exec_first(
+        "SELECT TABLE_NAME FROM information_schema.TABLES \
+         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?",
+        (table,),
+    )?;
+    Ok(found.is_some())
+}
 
 /// Execute a set (upsert) block
 ///
