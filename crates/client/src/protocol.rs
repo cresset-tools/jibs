@@ -12,7 +12,7 @@ use tracing::{debug, info, warn};
 
 use jibs_protocol::{
     ClientMessage, ColumnDef, CompressionMode, ExecutionPlan, ForeignKeyDef, MessageWriter,
-    PreserveRule, ServerMessage, ServerMetrics, TriggerDef,
+    PreserveRule, ServerMessage, ServerMetrics,
 };
 
 use crate::checkpoint::{
@@ -221,9 +221,6 @@ pub(crate) struct ImportStats {
     /// import so a fresh target ends up with the source's FKs. Empty on
     /// interruption.
     pub(crate) source_foreign_keys: Vec<ForeignKeyDef>,
-    /// Source-schema triggers reported on `Done`, recreated after the import.
-    /// Empty on interruption.
-    pub(crate) source_triggers: Vec<TriggerDef>,
 }
 
 /// Apply get function invocations for the `get` command
@@ -253,7 +250,6 @@ pub(crate) async fn run_protocol(
         server_metrics: None,
         table_durations: Vec::new(),
         source_foreign_keys: Vec::new(),
-        source_triggers: Vec::new(),
     };
 
     let mut client_metrics = ClientMetrics::new();
@@ -660,11 +656,10 @@ async fn run_protocol_inner(
                 }
             }
 
-            ServerMessage::Done { table_dispositions, metrics: server_metrics, foreign_keys, triggers } => {
-                // Source-schema FKs and triggers to reconstruct once loading
-                // finishes (applied by the caller, after the pool has drained).
+            ServerMessage::Done { table_dispositions, metrics: server_metrics, foreign_keys } => {
+                // Source-schema FKs to reconstruct once loading finishes (applied
+                // by the caller, after the loader pool has drained).
                 stats.source_foreign_keys = foreign_keys;
-                stats.source_triggers = triggers;
 
                 // Drain any remaining pending DDLs
                 for (tbl, ddl_rx) in pending_ddls.drain() {

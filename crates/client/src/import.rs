@@ -14,7 +14,6 @@ use jibs_protocol::{
 
 use crate::checkpoint::{find_backup_tables, Checkpoint};
 use crate::dry_run::run_dry_run;
-use crate::triggers::apply_triggers;
 use crate::foreign_keys::{
     apply_foreign_keys, discard_preserved_foreign_keys, preserve_and_drop_foreign_keys,
     restore_foreign_keys,
@@ -337,18 +336,6 @@ pub async fn run_import(config: ImportConfig) -> Result<()> {
             .cloned()
             .collect();
         apply_foreign_keys(&mut local_conn, &new_table_fks)?;
-        // Existing tables kept their triggers too; only new tables need them.
-        let new_table_triggers: Vec<_> = outcome
-            .stats
-            .source_triggers
-            .iter()
-            .filter(|t| {
-                !preexisting_tables.contains(&t.table)
-                    && outcome.stats.tables_imported_names.contains(&t.table)
-            })
-            .cloned()
-            .collect();
-        apply_triggers(&mut local_conn, &new_table_triggers)?;
     } else if outcome.result.is_ok() {
         if outcome.stats.source_foreign_keys.is_empty() {
             restore_foreign_keys(&mut local_conn)?;
@@ -356,9 +343,6 @@ pub async fn run_import(config: ImportConfig) -> Result<()> {
             apply_foreign_keys(&mut local_conn, &outcome.stats.source_foreign_keys)?;
             discard_preserved_foreign_keys(&mut local_conn)?;
         }
-        // Every imported table was dropped and recreated, which dropped its
-        // triggers (including tables finished by an earlier, resumed run).
-        apply_triggers(&mut local_conn, &outcome.stats.source_triggers)?;
     }
 
     // Re-enable checks
