@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.0](https://github.com/cresset-tools/jibs/compare/jibs-v0.7.0...jibs-v0.8.0) (2026-11-11)
+
+
+### Features
+
+* conditional anonymize with `anonymize <table> where "..."` ([#37](https://github.com/cresset-tools/jibs/issues/37)) ([183baf7](https://github.com/cresset-tools/jibs/commit/183baf7d06f76c48d3310e9756f02827d9c4d592))
+
 ## [0.7.0](https://github.com/cresset-tools/jibs/compare/jibs-v0.6.0...jibs-v0.7.0) (2026-11-09)
 
 
