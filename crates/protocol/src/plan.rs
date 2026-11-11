@@ -240,6 +240,10 @@ pub struct AnonymizeRule {
     pub column: String,
     /// Anonymization target
     pub target: AnonymizeTarget,
+    /// Resolved SQL condition (`anonymize t where "..."`): the rule applies
+    /// only to rows where it is true. Evaluated on the remote server in the
+    /// same SELECT that reads the rows. `None` applies to every row.
+    pub condition: Option<String>,
 }
 
 /// What to replace the column value with

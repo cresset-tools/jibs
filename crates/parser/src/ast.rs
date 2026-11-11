@@ -157,6 +157,8 @@ pub struct ColumnRef<'src> {
 #[derive(Debug, Clone)]
 pub struct AnonymizeBlock<'src> {
     pub table: Spanned<&'src str>,
+    /// `where "<condition>"`: the rules only apply to rows matching it
+    pub where_clause: Option<Spanned<StringLiteral<'src>>>,
     pub rules: Vec<Spanned<AnonymizeRule<'src>>>,
 }
 

@@ -19,7 +19,7 @@ use mysql::prelude::*;
 use mysql::{Conn, Opts};
 use tracing::info;
 
-use jibs_protocol::{ColumnDef, ForeignKeyDef, PreserveRule, SetRule};
+use jibs_protocol::{AnonymizeRule, ColumnDef, ForeignKeyDef, PreserveRule, SetRule};
 
 use crate::checkpoint::{
     backup_preserved_rows, find_backup_tables, restore_preserved_rows, Checkpoint,
@@ -301,6 +301,8 @@ fn load_records<R: Read>(
 
                 let cols = Arc::new(columns);
                 schemas.insert(name.clone(), Arc::clone(&cols));
+                let anon_rules =
+                    anon_rules.map(|rules| rules.into_iter().map(AnonymizeRule::from).collect());
                 let ddl_rx = pool.submit_ddl(name.clone(), cols, indexes, options, anon_rules)?;
                 pending_ddls.insert(name, ddl_rx);
             }

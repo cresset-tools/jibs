@@ -1,0 +1,45 @@
+// Conditional anonymization (`anonymize <table> where "..."`) on every path
+// that reads rows on the server:
+//   - users:    aggregate root (text protocol query)
+//   - orders:   reached by traversal (binary protocol `IN (...)` query)
+//   - products: imported in full with --parallel (worker query)
+//
+// Expected after import:
+//   users 1:  name NULL, email anon<n>@test.local
+//   users 2:  name kept, email staff<n>@test.local (conditional beats unconditional)
+//   orders:   shipping_address NULL only where status = 'shipped' (order 2)
+//   products: description NULL only where price > 500 (products 1, 2, 3)
+
+relation orders.user_id -> users.id
+
+aggregate first_users {
+    root users
+    where "id IN (1, 2)"
+}
+
+exclude_data audit_log
+ignore_table sessions
+ignore_table order_audit
+
+faker emails ["anon{unique()}@test.local"]
+faker staff_emails ["staff{unique()}@test.local"]
+
+anonymize users {
+    email -> emails
+}
+
+anonymize users where "id = 1" {
+    name -> null
+}
+
+anonymize users where "id = 2" {
+    email -> staff_emails
+}
+
+anonymize orders where "status = 'shipped'" {
+    shipping_address -> null
+}
+
+anonymize products where "price > 500" {
+    description -> null
+}

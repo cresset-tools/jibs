@@ -269,7 +269,9 @@ order:
 This ordering affects:
 - **Variable declarations**: later declarations with the same name override earlier ones
 - **Faker definitions**: later definitions with the same name override earlier ones
-- **Anonymization rules**: later rules for the same table override earlier ones
+- **Anonymization rules**: a later `anonymize` block replaces an earlier one for
+  the same table and the same `where` condition (or no condition); blocks with a
+  different condition apply alongside it
 - **After blocks**: executed in collection order (see [After Transformations](#after-transformations))
 
 ---
@@ -366,11 +368,17 @@ leave the remote host. It applies to every import mode, including `get`.
 ### Syntax
 
 ```text
-anonymize <table> {
+anonymize <table> [where "<sql_condition>"] {
     <column> -> <faker_name>
     <column> -> null
 }
 ```
+
+With `where`, the rules only apply to rows matching the condition; other rows
+keep their values. The condition is evaluated on the remote server in the same
+query that reads the rows, so it runs before anything leaves the remote host.
+A condition that evaluates to NULL counts as false, as in a WHERE clause. The
+string is interpolated like other `where` strings.
 
 ### Examples
 
@@ -384,6 +392,30 @@ anonymize customer_entity {
     lastname    -> names
     password    -> null
     rp_token    -> null
+}
+```
+
+Keep secrets out of a table you otherwise want to import in full:
+
+```jibs
+// Encrypted config values ("<key version>:<cipher>:<payload>") become NULL
+anonymize core_config_data where "value REGEXP '^[0-9]+:[0-9]+:'" {
+    value -> null
+}
+```
+
+When several rules cover the same column, conditional rules are tried first,
+in the order they appear, and an unconditional rule applies to the remaining
+rows:
+
+```jibs
+anonymize customer_entity {
+    email -> emails
+}
+
+// Staff accounts keep a recognizable address
+anonymize customer_entity where "email LIKE '%@example.com'" {
+    email -> staff_emails
 }
 ```
 

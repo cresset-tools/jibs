@@ -755,6 +755,11 @@ impl Resolver {
 
     fn process_anonymize(&mut self, anon_block: &AnonymizeBlock<'_>) -> Result<()> {
         let table = anon_block.table.0.to_string();
+        let condition = anon_block
+            .where_clause
+            .as_ref()
+            .map(|(w, _span)| self.resolve_string_literal(w))
+            .transpose()?;
         let mut rules = Vec::new();
 
         for (rule, _span) in &anon_block.rules {
@@ -765,10 +770,19 @@ impl Resolver {
                 }
                 jibs_parser::ast::AnonymizeTarget::Null => AnonymizeTarget::Null,
             };
-            rules.push(AnonymizeRule { column, target });
+            rules.push(AnonymizeRule {
+                column,
+                target,
+                condition: condition.clone(),
+            });
         }
 
-        self.plan.anonymization.insert(table, rules);
+        // A later block replaces an earlier one for the same table and the
+        // same condition (e.g. a project overriding its base config); blocks
+        // with a different condition apply alongside it.
+        let existing = self.plan.anonymization.entry(table).or_default();
+        existing.retain(|r| r.condition != condition);
+        existing.extend(rules);
         Ok(())
     }
 
@@ -1085,6 +1099,44 @@ mod tests {
         )
         .expect("valid config");
         assert_eq!(config.plan.anonymization.len(), 1);
+    }
+
+    #[test]
+    fn conditional_anonymize_keeps_its_interpolated_condition() {
+        let config = resolve_str(
+            r#"
+            var prefix: string = "payment/"
+            anonymize core_config_data where "path LIKE '{$prefix}%'" {
+                value -> null
+            }
+            "#,
+        )
+        .expect("valid config");
+        let rules = &config.plan.anonymization["core_config_data"];
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].condition.as_deref(), Some("path LIKE 'payment/%'"));
+    }
+
+    #[test]
+    fn anonymize_blocks_replace_only_the_same_condition() {
+        let config = resolve_str(
+            r#"
+            faker emails ["a@test"]
+            anonymize users { email -> emails }
+            anonymize users where "id = 1" { name -> null }
+            anonymize users { password -> null }
+            anonymize users where "id = 1" { email -> null }
+            "#,
+        )
+        .expect("valid config");
+        let rules = &config.plan.anonymization["users"];
+        let summary: Vec<(&str, Option<&str>)> = rules
+            .iter()
+            .map(|r| (r.column.as_str(), r.condition.as_deref()))
+            .collect();
+        // The second unconditional block replaced the first, the second
+        // `id = 1` block replaced the first `id = 1` block
+        assert_eq!(summary, vec![("password", None), ("email", Some("id = 1"))]);
     }
 
     #[test]
