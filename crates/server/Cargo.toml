@@ -14,7 +14,6 @@ path = "src/main.rs"
 jibs_protocol = { path = "../protocol" }
 # Use minimal mysql features to reduce binary size
 mysql = { version = "25", default-features = false, features = ["minimal-rust", "binlog"] }
-bincode.workspace = true
 zstd.workspace = true
 thiserror.workspace = true
 hex.workspace = true
