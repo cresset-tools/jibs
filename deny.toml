@@ -1,0 +1,11 @@
+# cargo-deny configuration. Only the advisory check runs (see
+# .github/workflows/advisories.yml); licences, bans and sources are not checked.
+#
+# Every ignored advisory needs a reason that says why it does not apply or
+# what has to happen before the entry can go.
+[advisories]
+ignore = [
+    { id = "RUSTSEC-2025-0119", reason = "number_prefix is unmaintained, not vulnerable. It arrives through indicatif 0.17" },
+    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile is unmaintained, not vulnerable. It arrives through the mysql crate" },
+    { id = "RUSTSEC-2025-0141", reason = "bincode is unmaintained, not vulnerable. It is the jibs wire format; replacing it is a protocol change" },
+]
