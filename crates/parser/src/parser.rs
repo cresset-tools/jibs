@@ -555,13 +555,45 @@ impl<'tokens, 'src> Parser<'tokens, 'src> {
         Ok((where_clause, order_by, limit, exclude_tables, root_only))
     }
 
-    /// preserve table where "condition"
+    /// preserve table [match unique | match key (col, ...)] where "condition"
     fn preserve_stmt(&mut self) -> Result<StatementKind<'src>, ParseError> {
         self.pos += 1;
         let table = self.expect_ident("a table name after 'preserve'")?;
-        self.expect(Token::Where, "'where' after the table name")?;
+        let match_key = if self.peek() == Some(&Token::Match) {
+            Some(self.preserve_match()?)
+        } else {
+            None
+        };
+        self.expect(Token::Where, "'where' after the table name or match clause")?;
         let where_clause = self.string_literal("a condition string after 'where'")?;
-        Ok(StatementKind::Preserve(PreserveStmt { table, where_clause }))
+        Ok(StatementKind::Preserve(PreserveStmt { table, match_key, where_clause }))
+    }
+
+    /// match unique | match key (col, ...)
+    ///
+    /// `unique` and `key` are contextual: they are only keywords here, so
+    /// columns and tables named `key` keep working everywhere else.
+    fn preserve_match(&mut self) -> Result<Spanned<PreserveMatch<'src>>, ParseError> {
+        let start = self.cur_span();
+        self.pos += 1; // match
+        let kind = match self.peek() {
+            Some(Token::Ident("unique")) => {
+                self.pos += 1;
+                PreserveMatch::Unique
+            }
+            Some(Token::Ident("key")) => {
+                self.pos += 1;
+                self.expect(Token::LParen, "'(' before the key columns")?;
+                let mut columns = vec![self.expect_ident("a column name")?];
+                while self.eat(&Token::Comma) {
+                    columns.push(self.expect_ident("a column name")?);
+                }
+                self.expect(Token::RParen, "')' after the key columns")?;
+                PreserveMatch::Key(columns)
+            }
+            _ => return Err(self.err_here("'unique' or 'key (...)' after 'match'")),
+        };
+        Ok((kind, Span::new(start.start, self.prev_end())))
     }
 
     /// set table { match col = val, ...  col = val ... }
@@ -1337,6 +1369,63 @@ mod tests {
                 assert_eq!(stmt.table.0, "config");
             }
             _ => panic!("Expected Preserve"),
+        }
+    }
+
+    #[test]
+    fn test_preserve_match_unique() {
+        let program = parse(r#"preserve core_config_data match unique where "path = 'a'""#);
+        match &program.statements[0].0.kind {
+            StatementKind::Preserve(stmt) => {
+                assert!(matches!(stmt.match_key, Some((PreserveMatch::Unique, _))));
+            }
+            _ => panic!("Expected Preserve"),
+        }
+    }
+
+    #[test]
+    fn test_preserve_match_key() {
+        let program =
+            parse(r#"preserve core_config_data match key (scope, scope_id, path) where "1""#);
+        match &program.statements[0].0.kind {
+            StatementKind::Preserve(stmt) => match &stmt.match_key {
+                Some((PreserveMatch::Key(cols), _)) => {
+                    let names: Vec<&str> = cols.iter().map(|c| c.0).collect();
+                    assert_eq!(names, ["scope", "scope_id", "path"]);
+                }
+                other => panic!("Expected match key, got {:?}", other),
+            },
+            _ => panic!("Expected Preserve"),
+        }
+    }
+
+    #[test]
+    fn test_preserve_without_match() {
+        let program = parse(r#"preserve config where "1""#);
+        match &program.statements[0].0.kind {
+            StatementKind::Preserve(stmt) => assert!(stmt.match_key.is_none()),
+            _ => panic!("Expected Preserve"),
+        }
+    }
+
+    #[test]
+    fn test_key_and_unique_stay_identifiers() {
+        let program = parse(
+            "relation settings.key -> keys.unique\npreserve key match key (key) where \"1\"",
+        );
+        assert_eq!(program.statements.len(), 2);
+    }
+
+    #[test]
+    fn test_preserve_match_errors() {
+        for src in [
+            r#"preserve t match where "1""#,
+            r#"preserve t match key where "1""#,
+            r#"preserve t match key () where "1""#,
+            r#"preserve t match key (a, b where "1""#,
+            r#"preserve t match primary where "1""#,
+        ] {
+            assert!(crate::parse(src).is_err(), "should fail: {src}");
         }
     }
 

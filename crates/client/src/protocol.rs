@@ -16,7 +16,7 @@ use jibs_protocol::{
 };
 
 use crate::checkpoint::{
-    backup_preserved_rows, find_backup_tables, restore_preserved_rows, Checkpoint,
+    backup_preserved_rows, find_backup_tables, preserve_match_for, restore_preserved_rows, Checkpoint,
     BACKUP_TABLE_PREFIX,
 };
 use crate::loader::{
@@ -24,6 +24,7 @@ use crate::loader::{
     LoaderPool, PendingLoad,
 };
 use crate::metrics::ClientMetrics;
+use crate::preserve::TableKeys;
 use crate::progress::ImportProgress;
 use crate::sql::{create_table, execute_set_block};
 use crate::ssh::{ProtocolRead, ProtocolWrite, RemoteProcess};
@@ -467,7 +468,8 @@ async fn run_protocol_inner(
                     .collect();
 
                 if !table_preserves.is_empty() {
-                    if backup_preserved_rows(local_conn, table, &table_preserves)? {
+                    let incoming_keys = TableKeys::from_schema(&columns, &indexes);
+                    if backup_preserved_rows(local_conn, table, &table_preserves, &incoming_keys)? {
                         tables_with_preserves.push(table.clone());
                     }
                 }
@@ -767,7 +769,7 @@ async fn run_protocol_inner(
         for backup_table in &backup_tables {
             // Extract original table name from backup table name
             let table = backup_table.strip_prefix(BACKUP_TABLE_PREFIX).unwrap_or(backup_table);
-            restore_preserved_rows(local_conn, table)?;
+            restore_preserved_rows(local_conn, table, &preserve_match_for(&plan.preserves, table))?;
         }
     }
 

@@ -16,7 +16,7 @@ anonymize users {
 faker emails ["user{unique()}@test.local"]
 
 // Manifest record
-preserve users where "email = 'local-admin@test.local'"
+preserve users match unique where "email = 'local-admin@test.local'"
 
 // PostProcess record (set + after)
 set users {

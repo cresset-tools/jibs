@@ -230,6 +230,23 @@ pub struct PreserveRule {
     pub table: String,
     /// Resolved WHERE clause
     pub where_clause: String,
+    /// How preserved rows are matched against imported rows on restore
+    pub match_key: PreserveMatch,
+}
+
+/// How a `preserve` restore finds the imported row a preserved row replaces.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Encode, Decode)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum PreserveMatch {
+    /// No `match` clause: `REPLACE INTO` with every column, so the row is
+    /// matched on the primary key (and any unique key).
+    #[default]
+    Replace,
+    /// `match unique`: the table's only unique key besides the primary key.
+    Unique,
+    /// `match key (a, b)`: the unique key (or primary key) with exactly these
+    /// columns, in any order.
+    Key(Vec<String>),
 }
 
 /// Anonymization rule for a column

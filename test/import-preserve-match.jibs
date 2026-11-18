@@ -1,0 +1,16 @@
+// Preserve with a match clause (see test/test-preserve-match.sh).
+//
+// The local database keeps two users: local-admin (not on the remote) and bob
+// (also on the remote, with a different name). The local ids collide with
+// unrelated remote users, which REPLACE INTO would delete.
+
+var match_mode: string = "unique"
+
+exclude_data audit_log
+ignore_table sessions
+
+#[when($match_mode == "unique")]
+preserve users match unique where "email IN ('local-admin@test.local', 'bob@example.com')"
+
+#[when($match_mode == "key")]
+preserve users match key (email) where "email IN ('local-admin@test.local', 'bob@example.com')"
