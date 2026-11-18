@@ -62,6 +62,21 @@ enum Commands {
     DumpFormatVersion,
 }
 
+/// Where `import <path>` looks for files
+#[derive(Args)]
+struct SearchPathArgs {
+    /// Directory to look up `import <path>` files in (can be repeated; searched
+    /// in order, before the directories in JIBS_PATH)
+    #[arg(short = 'I', long = "include-path", value_name = "DIR")]
+    include_path: Vec<PathBuf>,
+}
+
+impl SearchPathArgs {
+    fn dirs(&self) -> Vec<PathBuf> {
+        resolver::search_path(&self.include_path)
+    }
+}
+
 /// Common connection arguments shared between import and get
 #[derive(Args)]
 struct ConnectionArgs {
@@ -136,6 +151,9 @@ struct ImportArgs {
     config: Option<PathBuf>,
 
     #[command(flatten)]
+    search_path: SearchPathArgs,
+
+    #[command(flatten)]
     connection: ConnectionArgs,
 
     /// Resume a previously interrupted import
@@ -168,6 +186,9 @@ struct GetArgs {
     config: PathBuf,
 
     #[command(flatten)]
+    search_path: SearchPathArgs,
+
+    #[command(flatten)]
     connection: ConnectionArgs,
 
     /// Discard state (backup tables, checkpoint) left by a previous interrupted import
@@ -183,6 +204,9 @@ struct GetArgs {
 struct CheckArgs {
     /// Path to the configuration file (.jibs or .json)
     config: PathBuf,
+
+    #[command(flatten)]
+    search_path: SearchPathArgs,
 
     /// Variable assignments (can be repeated); variables without a value or
     /// default are reported and checked with placeholder values
@@ -227,6 +251,9 @@ struct LoadArgs {
 struct PlanArgs {
     /// Path to the configuration file (.jibs or .json)
     config: PathBuf,
+
+    #[command(flatten)]
+    search_path: SearchPathArgs,
 
     /// Variable assignments (can be repeated)
     #[arg(long = "var", value_parser = parse_var)]
@@ -294,6 +321,7 @@ async fn run_import(args: ImportArgs) -> Result<()> {
 
     let config = ImportConfig {
         config_path: args.config, // None = import all tables
+        search_path: args.search_path.dirs(),
         remote_host: args.connection.host,
         remote_mysql: args.connection.remote_mysql,
         local_mysql: args.connection.local_mysql,
@@ -336,6 +364,7 @@ async fn run_get(args: GetArgs) -> Result<()> {
 
     let config = ImportConfig {
         config_path: Some(args.config), // Required for `get` command
+        search_path: args.search_path.dirs(),
         remote_host: args.connection.host,
         remote_mysql: args.connection.remote_mysql,
         local_mysql: args.connection.local_mysql,
@@ -456,7 +485,7 @@ fn run_check(args: CheckArgs) -> Result<()> {
     if extension == "json" {
         // Fully parse and validate the JSON config (previously this only
         // checked that the file was syntactically valid JSON)
-        let plan = json_config::parse_json_config(&args.config, &vars)
+        let plan = json_config::parse_json_config(&args.config, &vars, &args.search_path.dirs())
             .map_err(|e| anyhow::anyhow!("JSON config error: {}", e))?;
         resolver::validate_plan(&plan, &[])?;
         println!(
@@ -486,7 +515,8 @@ fn run_check(args: CheckArgs) -> Result<()> {
     };
     println!("parsed:   {} statement(s)", program.statements.len());
 
-    let resolved = resolver::resolve_lenient(&args.config, &program, &vars)?;
+    let resolved =
+        resolver::resolve_lenient(&args.config, &program, &vars, &args.search_path.dirs())?;
 
     println!(
         "resolved: {} aggregate(s), {} get function(s), {} relation(s), \
@@ -503,6 +533,19 @@ fn run_check(args: CheckArgs) -> Result<()> {
         resolved.plan.sets.len(),
         resolved.plan.after_statements.len(),
     );
+
+    if !resolved.imports.is_empty() {
+        println!();
+        println!("imports:");
+        for import in &resolved.imports {
+            println!(
+                "  {} -> {} (sha256 {})",
+                import.spec,
+                import.path.display(),
+                import.sha256
+            );
+        }
+    }
 
     if !resolved.missing_vars.is_empty() {
         println!();
@@ -553,7 +596,7 @@ fn run_plan(args: PlanArgs) -> Result<()> {
 
     if extension == "json" {
         // Parse as JSON config
-        let plan = json_config::parse_json_config(&args.config, &vars)
+        let plan = json_config::parse_json_config(&args.config, &vars, &args.search_path.dirs())
             .map_err(|e| anyhow::anyhow!("JSON config error: {}", e))?;
         println!("{}", serde_json::to_string_pretty(&plan)?);
     } else {
@@ -571,7 +614,7 @@ fn run_plan(args: PlanArgs) -> Result<()> {
         })?;
 
         // Resolve the plan
-        let resolved = resolver::resolve(&args.config, &program, &vars)?;
+        let resolved = resolver::resolve(&args.config, &program, &vars, &args.search_path.dirs())?;
 
         // Print the plan as JSON
         println!("{}", serde_json::to_string_pretty(&resolved.plan)?);

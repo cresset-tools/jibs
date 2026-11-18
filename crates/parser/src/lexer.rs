@@ -15,6 +15,8 @@ pub enum Token<'src> {
     String(&'src str),
     MultilineString(&'src str),
     Regex(&'src str),
+    /// `<path>` right after `import`: a file in the import search path
+    AnglePath(&'src str),
 
     // Identifiers and keywords
     Ident(&'src str),
@@ -99,6 +101,7 @@ impl fmt::Display for Token<'_> {
             Token::String(s) => write!(f, "\"{s}\""),
             Token::MultilineString(s) => write!(f, "\"\"\"{s}\"\"\""),
             Token::Regex(s) => write!(f, "/{s}/"),
+            Token::AnglePath(s) => write!(f, "<{s}>"),
             Token::Ident(s) => write!(f, "{s}"),
             Token::Import => write!(f, "import"),
             Token::Var => write!(f, "var"),
@@ -251,6 +254,9 @@ impl<'src> Lexer<'src> {
                 '0'..='9' => self.number(start),
                 '`' => self.backtick_ident(start),
                 '/' => self.slash_or_regex(start),
+                '<' if matches!(self.tokens.last(), Some((Token::Import, _))) => {
+                    self.angle_path(start)
+                }
                 c if c.is_ascii_alphabetic() || c == '_' => self.ident_or_keyword(start),
                 _ => self.operator_or_punct(start, c),
             }
@@ -370,6 +376,25 @@ impl<'src> Lexer<'src> {
     /// space). This disambiguates regexes from division: `$a / 2` fails the
     /// regex rule at the space and falls back to the Slash operator, instead
     /// of swallowing everything up to the next '/' in the file.
+    /// `<path>` after `import`, up to the next `>` on the same line.
+    fn angle_path(&mut self, start: usize) {
+        let rest = &self.source[start + 1..];
+        let end = rest.find(|c| c == '>' || c == '\n').unwrap_or(rest.len());
+        if rest[end..].starts_with('>') && !rest[..end].trim().is_empty() {
+            self.pos = start + 1 + end + 1;
+            self.push(
+                Token::AnglePath(&self.source[start + 1..start + 1 + end]),
+                start,
+            );
+        } else {
+            self.pos = start + 1 + end;
+            self.error(
+                Span::new(start, self.pos),
+                "unterminated import path: expected `<path>` on one line".to_string(),
+            );
+        }
+    }
+
     fn slash_or_regex(&mut self, start: usize) {
         if self.opts.regex_literals {
             let mut j = start + 1;
@@ -677,6 +702,31 @@ mod tests {
                 Token::RBracket,
             ]
         );
+    }
+
+    #[test]
+    fn test_import_angle_path() {
+        let tokens = lex_tokens("import <magento/base.jibs>\nvar");
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Import,
+                Token::AnglePath("magento/base.jibs"),
+                Token::Var
+            ]
+        );
+        // Only right after `import`: elsewhere `<` is still the operator
+        assert_eq!(
+            lex_tokens("1 < 2"),
+            vec![Token::Int(1), Token::Lt, Token::Int(2)]
+        );
+    }
+
+    #[test]
+    fn test_unterminated_import_angle_path_is_error() {
+        let (_, errors) = lex("import <base.jibs\nvar x: int");
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].message.contains("unterminated import path"));
     }
 
     #[test]

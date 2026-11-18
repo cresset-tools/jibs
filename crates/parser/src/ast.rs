@@ -18,11 +18,20 @@ pub struct Statement<'src> {
     pub kind: StatementKind<'src>,
 }
 
+/// The file an `import` names.
+#[derive(Debug, Clone)]
+pub struct ImportPath<'src> {
+    pub path: Spanned<&'src str>,
+    /// `import <path>`: looked up in the import search path, never next to
+    /// the importing file. `import "path"` is relative to the importing file.
+    pub search_path: bool,
+}
+
 /// The different kinds of statements
 #[derive(Debug, Clone)]
 pub enum StatementKind<'src> {
-    /// import "path"
-    Import(Spanned<&'src str>),
+    /// import "path" or import <path>
+    Import(ImportPath<'src>),
 
     /// var name: type = default
     Var(VarDecl<'src>),

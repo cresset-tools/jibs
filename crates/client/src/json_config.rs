@@ -18,6 +18,7 @@ use crate::error::{ClientError, Result};
 pub fn parse_json_config(
     config_path: &Path,
     cli_vars: &HashMap<String, String>,
+    search_dirs: &[std::path::PathBuf],
 ) -> Result<ExecutionPlan> {
     let content = std::fs::read_to_string(config_path).map_err(|e| ClientError::Io {
         operation: format!("read config '{}'", config_path.display()),
@@ -27,7 +28,7 @@ pub fn parse_json_config(
     let config: JsonConfig = serde_json::from_str(&content)
         .map_err(|e| ClientError::Parse(format!("Invalid JSON config: {}", e)))?;
 
-    let mut resolver = JsonResolver::new(config_path, cli_vars.clone());
+    let mut resolver = JsonResolver::new(config_path, cli_vars.clone(), search_dirs);
     resolver.resolve(config)
 }
 
@@ -259,13 +260,19 @@ struct JsonAfter {
 struct JsonResolver {
     base_path: std::path::PathBuf,
     imported_files: HashSet<std::path::PathBuf>,
+    /// Directories `<path>` imports are looked up in
+    search_dirs: Vec<std::path::PathBuf>,
     variables: HashMap<String, Value>,
     pending_vars: HashMap<String, (String, Option<serde_json::Value>)>,
     plan: ExecutionPlan,
 }
 
 impl JsonResolver {
-    fn new(base_path: &Path, cli_vars: HashMap<String, String>) -> Self {
+    fn new(
+        base_path: &Path,
+        cli_vars: HashMap<String, String>,
+        search_dirs: &[std::path::PathBuf],
+    ) -> Self {
         let mut variables = HashMap::new();
         for (k, v) in cli_vars {
             variables.insert(k, Value::String(v));
@@ -279,6 +286,7 @@ impl JsonResolver {
         Self {
             base_path: base_path.to_path_buf(),
             imported_files,
+            search_dirs: search_dirs.to_vec(),
             variables,
             pending_vars: HashMap::new(),
             plan: ExecutionPlan::new(),
@@ -323,14 +331,22 @@ impl JsonResolver {
         Ok(std::mem::take(&mut self.plan))
     }
 
+    /// `import_path` is relative to the importing file, or `<path>` to look it
+    /// up in the import search path.
     fn process_import(&mut self, import_path: &str) -> Result<()> {
-        let base_dir = self.base_path.parent().unwrap_or(Path::new("."));
-        let import_file = base_dir.join(import_path);
-
-        let canonical_path = import_file.canonicalize().map_err(|e| ClientError::Io {
-            operation: format!("resolve import path '{}'", import_path),
-            message: e.to_string(),
-        })?;
+        let (import_path, search_path) = match import_path
+            .strip_prefix('<')
+            .and_then(|p| p.strip_suffix('>'))
+        {
+            Some(inner) => (inner, true),
+            None => (import_path, false),
+        };
+        let canonical_path = crate::resolver::locate_import(
+            &self.base_path,
+            import_path,
+            search_path,
+            &self.search_dirs,
+        )?;
 
         if self.imported_files.contains(&canonical_path) {
             return Ok(());
@@ -341,6 +357,18 @@ impl JsonResolver {
             operation: format!("read import '{}'", import_path),
             message: e.to_string(),
         })?;
+        let resolved = crate::resolver::ResolvedImport::new(
+            import_path,
+            search_path,
+            canonical_path.clone(),
+            &content,
+        );
+        tracing::info!(
+            "Imported {} from {} (sha256 {})",
+            resolved.spec,
+            resolved.path.display(),
+            resolved.sha256
+        );
 
         // Determine if JSON or jibs based on extension
         let extension = canonical_path
@@ -405,7 +433,8 @@ impl JsonResolver {
                 .collect();
 
             // Use the DSL resolver for .jibs files
-            let imported_config = crate::resolver::resolve(&canonical_path, &program, &cli_vars)
+            let imported_config =
+                crate::resolver::resolve(&canonical_path, &program, &cli_vars, &self.search_dirs)
                 .map_err(|e| ClientError::Parse(format!("Resolution error in '{}': {}", import_path, e)))?;
             let imported_plan = imported_config.plan;
 
@@ -1126,7 +1155,7 @@ mod tests {
             }"#,
         )
         .unwrap();
-        let plan = parse_json_config(&path, &HashMap::new()).unwrap();
+        let plan = parse_json_config(&path, &HashMap::new(), &[]).unwrap();
         std::fs::remove_dir_all(&dir).ok();
 
         let rules = &plan.anonymization["core_config_data"];
@@ -1152,7 +1181,7 @@ mod tests {
             }"#,
         )
         .unwrap();
-        let plan = parse_json_config(&path, &HashMap::new()).unwrap();
+        let plan = parse_json_config(&path, &HashMap::new(), &[]).unwrap();
         std::fs::remove_dir_all(&dir).ok();
 
         let rules = &plan.anonymization["users"];
@@ -1186,7 +1215,7 @@ mod tests {
             }"#,
         )
         .unwrap();
-        let plan = parse_json_config(&path, &HashMap::new()).unwrap();
+        let plan = parse_json_config(&path, &HashMap::new(), &[]).unwrap();
         std::fs::remove_dir_all(&dir).ok();
 
         let rules = &plan.anonymization["users"];
@@ -1199,6 +1228,23 @@ mod tests {
         );
         assert!(columns.contains(&"email"));
         assert!(columns.contains(&"name"));
+    }
+
+    #[test]
+    fn json_import_with_angle_brackets_uses_the_search_path() {
+        let root = std::env::temp_dir().join(format!("jibs-json-search-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::create_dir_all(root.join("lib")).unwrap();
+        std::fs::write(root.join("lib/base.jibs"), "exclude_data from_lib\n").unwrap();
+        let path = root.join("config.json");
+        std::fs::write(&path, r#"{"import": [{"path": "<base.jibs>"}]}"#).unwrap();
+
+        let plan = parse_json_config(&path, &HashMap::new(), &[root.join("lib")]).unwrap();
+        let missing = parse_json_config(&path, &HashMap::new(), &[]);
+        std::fs::remove_dir_all(&root).ok();
+
+        assert!(plan.excluded_tables.contains("from_lib"));
+        assert!(missing.is_err());
     }
 
     #[test]
@@ -1217,11 +1263,11 @@ mod tests {
             }"#,
         )
         .unwrap();
-        let plan = parse_json_config(&path, &HashMap::new()).unwrap();
+        let plan = parse_json_config(&path, &HashMap::new(), &[]).unwrap();
 
         std::fs::write(&path, r#"{"preserve": [{"table": "a", "where": "1", "match": "primary"}]}"#)
             .unwrap();
-        let invalid = parse_json_config(&path, &HashMap::new());
+        let invalid = parse_json_config(&path, &HashMap::new(), &[]);
         std::fs::remove_dir_all(&dir).ok();
 
         let matches: Vec<&PreserveMatch> = plan.preserves.iter().map(|p| &p.match_key).collect();

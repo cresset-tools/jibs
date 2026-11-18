@@ -32,6 +32,8 @@ pub struct GetInvocation {
 pub struct ImportConfig {
     /// Path to the .jibs configuration file (None = import all tables)
     pub config_path: Option<PathBuf>,
+    /// Directories `import <path>` is looked up in
+    pub search_path: Vec<PathBuf>,
     pub remote_host: String,
     pub remote_mysql: String,
     pub local_mysql: String,
@@ -92,8 +94,9 @@ pub async fn run_import(config: ImportConfig) -> Result<()> {
 
         if extension == "json" {
             // Parse as JSON config (no get functions in JSON configs)
-            let plan = crate::json_config::parse_json_config(config_path, &vars)
-                .map_err(|e| anyhow::anyhow!("JSON config error: {}", e))?;
+            let plan =
+                crate::json_config::parse_json_config(config_path, &vars, &config.search_path)
+                    .map_err(|e| anyhow::anyhow!("JSON config error: {}", e))?;
             (plan, Vec::new())
         } else {
             // Parse as .jibs DSL
@@ -114,8 +117,16 @@ pub async fn run_import(config: ImportConfig) -> Result<()> {
             })?;
 
             // Resolve the execution plan
-            let resolved = resolver::resolve(config_path, &program, &vars)
+            let resolved = resolver::resolve(config_path, &program, &vars, &config.search_path)
                 .map_err(|e| anyhow::anyhow!("Resolution failed: {}", e))?;
+            for import in &resolved.imports {
+                info!(
+                    "Imported {} from {} (sha256 {})",
+                    import.spec,
+                    import.path.display(),
+                    import.sha256
+                );
+            }
             (resolved.plan, resolved.get_functions)
         }
     } else {

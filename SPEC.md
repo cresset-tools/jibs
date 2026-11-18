@@ -232,11 +232,13 @@ common rules across projects.
 ### Syntax
 
 ```text
-import "<path>"
+import "path/to/file.jibs"
+import <path/to/file.jibs>
 ```
 
-Paths are resolved relative to the importing file. Import paths are raw
-strings: no interpolation is applied.
+`import "path"` is resolved relative to the importing file. `import <path>`
+is looked up in the import search path instead (see below), never next to the
+importing file. Import paths are raw: no interpolation is applied.
 
 ### Examples
 
@@ -246,13 +248,40 @@ import "anonymization-rules.jibs"
 
 // Import from subdirectory
 import "magento/base.jibs"
+
+// Import a shared file from the import search path
+import <magento/base.jibs>
 ```
+
+### Import Search Path
+
+`import <path>` searches, in order:
+
+1. each directory given with `-I <dir>` / `--include-path <dir>`, in the order
+   given
+2. each directory in the `JIBS_PATH` environment variable, separated like
+   `PATH` (`:` on Unix)
+
+The first directory that contains the file wins. It is an error when no
+directory does (the error lists the directories searched), when the search
+path is empty, or when the path is absolute or contains `..`.
+
+`-I` is accepted by `import`, `get`, `check` and `plan`. Inside a file found
+through the search path, `import "path"` is still relative to that file, so a
+shared library can be split into several files. A shared file is never
+shadowed by a file of the same name next to the config that imports it.
+
+In JSON configs, write the search path form as `{"path": "<magento/base.jibs>"}`.
+
+Because the search path depends on the machine, `jibs check` lists every file
+an import resolved to with its SHA-256, and `jibs import` logs the same.
 
 ### Import Resolution
 
 - Each file is processed at most once: if a file is imported again (directly,
   via a diamond `A -> B,C -> D`, or via a cycle), the repeat import is
-  silently skipped.
+  silently skipped. Files are compared by their resolved path, whichever form
+  of import reached them.
 - Resolution is depth-first: each import is fully resolved (including its
   nested imports) before proceeding to the next statement.
 

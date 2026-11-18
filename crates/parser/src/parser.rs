@@ -243,11 +243,22 @@ impl<'tokens, 'src> Parser<'tokens, 'src> {
         }
     }
 
-    /// import "path" — the path is a raw string (no interpolation)
+    /// import "path" | import <path> — the path is raw (no interpolation)
     fn import_stmt(&mut self) -> Result<StatementKind<'src>, ParseError> {
         self.pos += 1;
-        let path = self.string_raw("a file path string after 'import'")?;
-        Ok(StatementKind::Import(path))
+        if let Some(Token::AnglePath(p)) = self.peek() {
+            let path = (*p, self.cur_span());
+            self.pos += 1;
+            return Ok(StatementKind::Import(ImportPath {
+                path,
+                search_path: true,
+            }));
+        }
+        let path = self.string_raw("a file path string or <path> after 'import'")?;
+        Ok(StatementKind::Import(ImportPath {
+            path,
+            search_path: false,
+        }))
     }
 
     /// var name: type [= default]
@@ -1003,7 +1014,22 @@ mod tests {
         let program = parse(r#"import "base.dsl""#);
         assert_eq!(program.statements.len(), 1);
         match &program.statements[0].0.kind {
-            StatementKind::Import((path, _)) => assert_eq!(*path, "base.dsl"),
+            StatementKind::Import(import) => {
+                assert_eq!(import.path.0, "base.dsl");
+                assert!(!import.search_path);
+            }
+            _ => panic!("Expected Import"),
+        }
+    }
+
+    #[test]
+    fn test_import_search_path() {
+        let program = parse("import <magento/base.jibs>");
+        match &program.statements[0].0.kind {
+            StatementKind::Import(import) => {
+                assert_eq!(import.path.0, "magento/base.jibs");
+                assert!(import.search_path);
+            }
             _ => panic!("Expected Import"),
         }
     }
