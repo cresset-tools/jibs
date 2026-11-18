@@ -5,14 +5,16 @@ use std::path::{Path, PathBuf};
 
 use jibs_parser::ast::{
     AggregateBlock, AnonymizeBlock, Expr, FakerDecl, FakerSource, FakerValue, GetFunctionDef,
-    LimitValue, Literal, PreserveMatch as AstPreserveMatch, PreserveStmt, Program, RelationDecl, SetBlock,
-    SortDirection as AstSortDirection, Statement, StatementKind, StringLiteral, StringPart,
-    TablePattern, VarDecl, VarType,
+    ImportPath, LimitValue, Literal, PreserveMatch as AstPreserveMatch, PreserveStmt, Program,
+    RelationDecl, SetBlock, SortDirection as AstSortDirection, Statement, StatementKind,
+    StringLiteral, StringPart, TablePattern, VarDecl, VarType,
 };
 use jibs_protocol::{
     AnonymizeRule, AnonymizeTarget, Assignment, ExecutionPlan, PreserveMatch, PreserveRule, Relation,
     ResolvedAggregate, SetRule, SortDirection, Value,
 };
+
+use sha2::{Digest, Sha256};
 
 use crate::error::{ClientError, Result};
 
@@ -24,6 +26,103 @@ pub struct ResolvedConfig {
     /// Declared variables that had neither a value nor a default (only
     /// populated by [`resolve_lenient`]; strict resolution errors instead)
     pub missing_vars: Vec<(String, VarType)>,
+    /// Every file an import resolved to, in the order they were read
+    pub imports: Vec<ResolvedImport>,
+}
+
+/// A file an `import` resolved to.
+///
+/// `<path>` imports depend on the search path, so the same config can mean
+/// different files on different machines; this records which one was used.
+#[derive(Debug, Clone)]
+pub struct ResolvedImport {
+    /// The import as written: `"base.jibs"` or `<magento.jibs>`
+    pub spec: String,
+    pub path: PathBuf,
+    /// SHA-256 of the file's contents, hex
+    pub sha256: String,
+}
+
+impl ResolvedImport {
+    pub(crate) fn new(import_path: &str, search_path: bool, path: PathBuf, contents: &str) -> Self {
+        let spec = if search_path {
+            format!("<{import_path}>")
+        } else {
+            format!("\"{import_path}\"")
+        };
+        let sha256 = hex::encode(Sha256::digest(contents.as_bytes()));
+        Self { spec, path, sha256 }
+    }
+}
+
+/// The import search path: `-I` directories in the order given, then the
+/// directories in `JIBS_PATH` (separated like `PATH`).
+pub fn search_path(include_dirs: &[PathBuf]) -> Vec<PathBuf> {
+    let mut dirs = include_dirs.to_vec();
+    if let Some(env) = std::env::var_os("JIBS_PATH") {
+        dirs.extend(std::env::split_paths(&env).filter(|d| !d.as_os_str().is_empty()));
+    }
+    dirs
+}
+
+/// Find the file an import names.
+///
+/// `"path"` is relative to the importing file. `<path>` is looked up in each
+/// search path directory in order and never next to the importing file, so a
+/// project cannot shadow a shared file by accident. It must be a relative path
+/// that stays inside the directory it is found in.
+pub(crate) fn locate_import(
+    importing_file: &Path,
+    import_path: &str,
+    search_path: bool,
+    search_dirs: &[PathBuf],
+) -> Result<PathBuf> {
+    if !search_path {
+        let base_dir = importing_file.parent().unwrap_or(Path::new("."));
+        return base_dir
+            .join(import_path)
+            .canonicalize()
+            .map_err(|e| ClientError::Io {
+                operation: format!("resolve import path '{}'", import_path),
+                message: e.to_string(),
+            });
+    }
+
+    let relative = Path::new(import_path);
+    if relative.is_absolute()
+        || relative
+            .components()
+            .any(|c| !matches!(c, std::path::Component::Normal(_)))
+    {
+        return Err(ClientError::Parse(format!(
+            "import <{}>: a search path import must be a relative path without '..'",
+            import_path
+        )));
+    }
+    if search_dirs.is_empty() {
+        return Err(ClientError::Parse(format!(
+            "import <{}>: the import search path is empty; pass -I <dir> or set JIBS_PATH",
+            import_path
+        )));
+    }
+    for dir in search_dirs {
+        let candidate = dir.join(relative);
+        if candidate.is_file() {
+            return candidate.canonicalize().map_err(|e| ClientError::Io {
+                operation: format!("resolve import <{}>", import_path),
+                message: e.to_string(),
+            });
+        }
+    }
+    Err(ClientError::Parse(format!(
+        "import <{}>: not found in the import search path ({})",
+        import_path,
+        search_dirs
+            .iter()
+            .map(|d| d.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    )))
 }
 
 /// A resolved get function definition (ready for CLI invocation)
@@ -66,8 +165,9 @@ pub fn resolve(
     base_path: &Path,
     program: &Program<'_>,
     cli_vars: &HashMap<String, String>,
+    search_dirs: &[PathBuf],
 ) -> Result<ResolvedConfig> {
-    let mut resolver = Resolver::new(base_path, cli_vars.clone());
+    let mut resolver = Resolver::new(base_path, cli_vars.clone(), search_dirs);
     let config = resolver.resolve_program(program)?;
     validate_plan(&config.plan, &config.get_functions)?;
     Ok(config)
@@ -84,8 +184,9 @@ pub fn resolve_lenient(
     base_path: &Path,
     program: &Program<'_>,
     cli_vars: &HashMap<String, String>,
+    search_dirs: &[PathBuf],
 ) -> Result<ResolvedConfig> {
-    let mut resolver = Resolver::new(base_path, cli_vars.clone());
+    let mut resolver = Resolver::new(base_path, cli_vars.clone(), search_dirs);
     resolver.lenient_missing_vars = true;
     let config = resolver.resolve_program(program)?;
     validate_plan(&config.plan, &config.get_functions)?;
@@ -168,6 +269,10 @@ struct Resolver {
     base_path: PathBuf,
     /// Files that have been imported (to detect circular imports)
     imported_files: HashSet<PathBuf>,
+    /// Directories `<path>` imports are looked up in
+    search_dirs: Vec<PathBuf>,
+    /// The files imports resolved to, in the order they were read
+    imports: Vec<ResolvedImport>,
     /// Variable values (from CLI, files, or defaults)
     variables: HashMap<String, Value>,
     /// Pending variable declarations (name -> (type, default))
@@ -183,7 +288,7 @@ struct Resolver {
 }
 
 impl Resolver {
-    fn new(base_path: &Path, cli_vars: HashMap<String, String>) -> Self {
+    fn new(base_path: &Path, cli_vars: HashMap<String, String>, search_dirs: &[PathBuf]) -> Self {
         // Convert CLI string vars to Values (we'll validate types later)
         let mut variables = HashMap::new();
         for (k, v) in cli_vars {
@@ -199,6 +304,8 @@ impl Resolver {
         Self {
             base_path: base_path.to_path_buf(),
             imported_files,
+            search_dirs: search_dirs.to_vec(),
+            imports: Vec::new(),
             variables,
             pending_vars: HashMap::new(),
             plan: ExecutionPlan::new(),
@@ -211,14 +318,14 @@ impl Resolver {
     fn resolve_program(&mut self, program: &Program<'_>) -> Result<ResolvedConfig> {
         // First pass: process imports (they may define variables, fakers, etc.)
         for (stmt, _span) in &program.statements {
-            if let StatementKind::Import((path, _path_span)) = &stmt.kind {
+            if let StatementKind::Import(import) = &stmt.kind {
                 // Check #[when] condition if present
                 if let Some((condition, _span)) = &stmt.attribute {
                     if !self.evaluate_condition(condition)? {
                         continue; // Skip this import
                     }
                 }
-                self.process_import(path)?;
+                self.process_import(import)?;
             }
         }
 
@@ -241,6 +348,7 @@ impl Resolver {
             plan: std::mem::take(&mut self.plan),
             get_functions: std::mem::take(&mut self.get_functions),
             missing_vars: std::mem::take(&mut self.missing_vars),
+            imports: std::mem::take(&mut self.imports),
         })
     }
 
@@ -255,16 +363,14 @@ impl Resolver {
     /// - Nested imports' after blocks run first (depth-first)
     /// - Then the imported file's own after blocks
     /// - Finally, the importing file's after blocks
-    fn process_import(&mut self, import_path: &str) -> Result<()> {
-        // Resolve the import path relative to the current file's directory
-        let base_dir = self.base_path.parent().unwrap_or(Path::new("."));
-        let import_file = base_dir.join(import_path);
-
-        // Canonicalize to detect circular imports
-        let canonical_path = import_file.canonicalize().map_err(|e| ClientError::Io {
-            operation: format!("resolve import path '{}'", import_path),
-            message: e.to_string(),
-        })?;
+    fn process_import(&mut self, import: &ImportPath<'_>) -> Result<()> {
+        let import_path = import.path.0;
+        let canonical_path = locate_import(
+            &self.base_path,
+            import_path,
+            import.search_path,
+            &self.search_dirs,
+        )?;
 
         // Check for circular imports
         if self.imported_files.contains(&canonical_path) {
@@ -278,6 +384,12 @@ impl Resolver {
             operation: format!("read import '{}'", import_path),
             message: e.to_string(),
         })?;
+        self.imports.push(ResolvedImport::new(
+            import_path,
+            import.search_path,
+            canonical_path.clone(),
+            &source,
+        ));
 
         let program = jibs_parser::parse(&source).map_err(|errors| {
             ClientError::Parse(format!(
@@ -293,13 +405,13 @@ impl Resolver {
         // Recursively process the imported program's statements
         // First: handle nested imports
         for (stmt, _span) in &program.statements {
-            if let StatementKind::Import((path, _path_span)) = &stmt.kind {
+            if let StatementKind::Import(import) = &stmt.kind {
                 if let Some((condition, _span)) = &stmt.attribute {
                     if !self.evaluate_condition(condition)? {
                         continue;
                     }
                 }
-                self.process_import(path)?;
+                self.process_import(import)?;
             }
         }
 
@@ -1100,12 +1212,12 @@ mod tests {
 
     fn resolve_str(source: &str) -> Result<ResolvedConfig> {
         let program = jibs_parser::parse(source).expect("test source must parse");
-        resolve(Path::new("test.jibs"), &program, &HashMap::new())
+        resolve(Path::new("test.jibs"), &program, &HashMap::new(), &[])
     }
 
     fn resolve_lenient_str(source: &str) -> Result<ResolvedConfig> {
         let program = jibs_parser::parse(source).expect("test source must parse");
-        resolve_lenient(Path::new("test.jibs"), &program, &HashMap::new())
+        resolve_lenient(Path::new("test.jibs"), &program, &HashMap::new(), &[])
     }
 
     #[test]
@@ -1236,6 +1348,98 @@ mod tests {
                 ("email", Some("id = 1"), true),
             ]
         );
+    }
+
+    /// A fresh directory for a test's files.
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("jibs-{}-{}", name, std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn resolve_file(path: &Path, search_dirs: &[PathBuf]) -> Result<ResolvedConfig> {
+        let source = std::fs::read_to_string(path).unwrap();
+        let program = jibs_parser::parse(&source).expect("test source must parse");
+        resolve(path, &program, &HashMap::new(), search_dirs)
+    }
+
+    #[test]
+    fn search_path_import_takes_the_first_match_and_never_the_importing_dir() {
+        let root = temp_dir("search-first");
+        let (project, lib1, lib2) = (root.join("project"), root.join("lib1"), root.join("lib2"));
+        for d in [&project, &lib1, &lib2] {
+            std::fs::create_dir_all(d.join("magento")).unwrap();
+        }
+        std::fs::write(project.join("project.jibs"), "import <magento/base.jibs>\n").unwrap();
+        // Next to the importing file: must not be picked up
+        std::fs::write(
+            project.join("magento/base.jibs"),
+            "exclude_data from_project\n",
+        )
+        .unwrap();
+        std::fs::write(
+            lib1.join("magento/base.jibs"),
+            "exclude_data from_lib1\nimport \"sales.jibs\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            lib1.join("magento/sales.jibs"),
+            "exclude_data from_lib1_sales\n",
+        )
+        .unwrap();
+        std::fs::write(lib2.join("magento/base.jibs"), "exclude_data from_lib2\n").unwrap();
+
+        let config = resolve_file(&project.join("project.jibs"), &[lib1.clone(), lib2]).unwrap();
+        std::fs::remove_dir_all(&root).ok();
+
+        let excluded: Vec<String> = config.plan.excluded_tables.iter().cloned().collect();
+        assert!(
+            excluded.iter().any(|e| e.contains("from_lib1")),
+            "{excluded:?}"
+        );
+        // A relative import inside a search path file is relative to that file
+        assert!(
+            excluded.iter().any(|e| e.contains("from_lib1_sales")),
+            "{excluded:?}"
+        );
+        assert!(
+            !excluded
+                .iter()
+                .any(|e| e.contains("from_project") || e.contains("from_lib2")),
+            "{excluded:?}"
+        );
+
+        let specs: Vec<&str> = config.imports.iter().map(|i| i.spec.as_str()).collect();
+        assert_eq!(specs, vec!["<magento/base.jibs>", "\"sales.jibs\""]);
+        assert_eq!(config.imports[0].sha256.len(), 64);
+        assert!(config.imports[0].path.ends_with("lib1/magento/base.jibs"));
+    }
+
+    #[test]
+    fn search_path_import_errors() {
+        let root = temp_dir("search-errors");
+        let file = root.join("project.jibs");
+
+        std::fs::write(&file, "import <base.jibs>\n").unwrap();
+        let empty = resolve_file(&file, &[]).unwrap_err().to_string();
+        assert!(empty.contains("search path is empty"), "{empty}");
+        let missing = resolve_file(&file, &[root.join("lib")])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            missing.contains("not found in the import search path"),
+            "{missing}"
+        );
+        assert!(missing.contains("lib"), "{missing}");
+
+        std::fs::write(&file, "import <../base.jibs>\n").unwrap();
+        let escape = resolve_file(&file, &[root.join("lib")])
+            .unwrap_err()
+            .to_string();
+        assert!(escape.contains("without '..'"), "{escape}");
+
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
