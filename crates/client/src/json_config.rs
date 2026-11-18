@@ -814,11 +814,13 @@ impl JsonResolver {
                 condition: condition.clone(),
             });
         }
-        self.plan
-            .anonymization
-            .entry(table.to_string())
-            .or_default()
-            .extend(resolved_rules);
+        crate::resolver::merge_anonymize_rules(
+            self.plan
+                .anonymization
+                .entry(table.to_string())
+                .or_default(),
+            resolved_rules,
+        );
         Ok(())
     }
 
@@ -1132,6 +1134,34 @@ mod tests {
         assert_eq!(rules.len(), 2);
         assert_eq!(rules[0].condition.as_deref(), Some("path LIKE 'payment/%'"));
         assert_eq!(rules[1].condition, None);
+    }
+
+    #[test]
+    fn anonymize_blocks_override_per_column() {
+        let dir = std::env::temp_dir().join(format!("jibs-json-anon-merge-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        std::fs::write(
+            &path,
+            r#"{
+              "faker": [{"name": "emails", "values": ["a@test"]}],
+              "anonymize": [
+                {"table": "users", "rules": [{"column": "email", "faker": "emails"},
+                                             {"column": "name", "faker": "emails"}]},
+                {"table": "users", "rules": [{"column": "name", "null": true}]}
+              ]
+            }"#,
+        )
+        .unwrap();
+        let plan = parse_json_config(&path, &HashMap::new()).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+
+        let rules = &plan.anonymization["users"];
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0].column, "email");
+        assert!(matches!(rules[0].target, AnonymizeTarget::Faker(_)));
+        assert_eq!(rules[1].column, "name");
+        assert!(matches!(rules[1].target, AnonymizeTarget::Null));
     }
 
     #[test]

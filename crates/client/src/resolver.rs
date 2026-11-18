@@ -792,12 +792,7 @@ impl Resolver {
             });
         }
 
-        // A later block replaces an earlier one for the same table and the
-        // same condition (e.g. a project overriding its base config); blocks
-        // with a different condition apply alongside it.
-        let existing = self.plan.anonymization.entry(table).or_default();
-        existing.retain(|r| r.condition != condition);
-        existing.extend(rules);
+        merge_anonymize_rules(self.plan.anonymization.entry(table).or_default(), rules);
         Ok(())
     }
 
@@ -1079,6 +1074,26 @@ fn placeholder_value(var_type: VarType) -> Value {
     }
 }
 
+/// Add a block's rules to the rules already collected for its table.
+///
+/// A rule overrides an earlier one only for its own column and condition, so a
+/// project that imports a base config and anonymizes one more column of a table
+/// keeps the base config's rules for that table's other columns. Rules with a
+/// different condition apply alongside. An overridden rule keeps its place, so
+/// the order conditional rules are tried in stays the order they were first
+/// written in.
+pub(crate) fn merge_anonymize_rules(existing: &mut Vec<AnonymizeRule>, rules: Vec<AnonymizeRule>) {
+    for rule in rules {
+        match existing
+            .iter_mut()
+            .find(|r| r.column == rule.column && r.condition == rule.condition)
+        {
+            Some(slot) => *slot = rule,
+            None => existing.push(rule),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1184,25 +1199,43 @@ mod tests {
     }
 
     #[test]
-    fn anonymize_blocks_replace_only_the_same_condition() {
+    fn anonymize_blocks_override_per_column_and_condition() {
         let config = resolve_str(
             r#"
             faker emails ["a@test"]
-            anonymize users { email -> emails }
+            faker names ["A"]
+            anonymize users { email -> emails
+                              name -> names }
             anonymize users where "id = 1" { name -> null }
-            anonymize users { password -> null }
+            anonymize users { password -> null
+                              name -> null }
             anonymize users where "id = 1" { email -> null }
             "#,
         )
         .expect("valid config");
         let rules = &config.plan.anonymization["users"];
-        let summary: Vec<(&str, Option<&str>)> = rules
+        let summary: Vec<(&str, Option<&str>, bool)> = rules
             .iter()
-            .map(|r| (r.column.as_str(), r.condition.as_deref()))
+            .map(|r| {
+                (
+                    r.column.as_str(),
+                    r.condition.as_deref(),
+                    matches!(r.target, AnonymizeTarget::Null),
+                )
+            })
             .collect();
-        // The second unconditional block replaced the first, the second
-        // `id = 1` block replaced the first `id = 1` block
-        assert_eq!(summary, vec![("password", None), ("email", Some("id = 1"))]);
+        // email keeps its rule from the first block; name is overridden in
+        // place by the third; password and the second `id = 1` rule are added.
+        assert_eq!(
+            summary,
+            vec![
+                ("email", None, false),
+                ("name", None, true),
+                ("name", Some("id = 1"), true),
+                ("password", None, true),
+                ("email", Some("id = 1"), true),
+            ]
+        );
     }
 
     #[test]
