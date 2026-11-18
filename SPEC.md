@@ -269,9 +269,10 @@ order:
 This ordering affects:
 - **Variable declarations**: later declarations with the same name override earlier ones
 - **Faker definitions**: later definitions with the same name override earlier ones
-- **Anonymization rules**: a later `anonymize` block replaces an earlier one for
-  the same table and the same `where` condition (or no condition); blocks with a
-  different condition apply alongside it
+- **Anonymization rules**: a later rule overrides an earlier one only for the
+  same table, column and `where` condition (or no condition); the earlier
+  block's rules for other columns stay, and rules with a different condition
+  apply alongside it (see [Combining blocks](#combining-blocks))
 - **After blocks**: executed in collection order (see [After Transformations](#after-transformations))
 
 ---
@@ -417,6 +418,32 @@ anonymize customer_entity {
 anonymize customer_entity where "email LIKE '%@example.com'" {
     email -> staff_emails
 }
+```
+
+### Combining blocks
+
+Blocks for the same table add up. A later rule replaces an earlier one only
+for the same column and the same condition; every other rule stays. This
+makes a shared base config safe to extend: a project that imports it and
+anonymizes one more column keeps the base config's rules for the rest of the
+table.
+
+```jibs
+// base.jibs
+anonymize customer_entity {
+    email     -> emails
+    firstname -> names
+    lastname  -> names
+}
+
+// project.jibs
+import "base.jibs"
+
+anonymize customer_entity {
+    taxvat    -> null      // added
+    lastname  -> null      // overrides the base rule for lastname only
+}
+// email and firstname keep the base config's rules
 ```
 
 ### Special Values
