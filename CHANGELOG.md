@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.8.0](https://github.com/cresset-tools/jibs/compare/jibs-v0.7.0...jibs-v0.8.0) (2026-11-18)
+
+
+### ⚠ BREAKING CHANGES
+
+* the .jibsdump format is now v4. Dumps written by this version cannot be loaded by jibs 0.7 or older; upgrade the loading side first. This version still loads v3 dumps.
+
+### Features
+
+* conditional anonymize with `anonymize <table> where "..."` ([#37](https://github.com/cresset-tools/jibs/issues/37)) ([183baf7](https://github.com/cresset-tools/jibs/commit/183baf7d06f76c48d3310e9756f02827d9c4d592))
+* restore preserved rows by a unique key with `preserve t match unique` / `match key (...)` ([#43](https://github.com/cresset-tools/jibs/issues/43)) ([8aa740a](https://github.com/cresset-tools/jibs/commit/8aa740a206fc2335d2ccf2b6813bef5e90ca65a9))
+
+
+### Bug Fixes
+
+* **jibs:** update locked dependencies ([27e1db9](https://github.com/cresset-tools/jibs/commit/27e1db9c7e3a5a57f49dd72a8e70e92d5bf684c3))
+
 ## [0.7.0](https://github.com/cresset-tools/jibs/compare/jibs-v0.6.0...jibs-v0.7.0) (2026-11-09)
 
 
