@@ -268,11 +268,18 @@ get recent_products (days: int = 7, max: int = 100) {
 ### Preserve Statement
 
 ```ebnf
-preserve_stmt = "preserve" identifier "where" string_literal ;
+preserve_stmt = "preserve" identifier [ preserve_match ] "where" string_literal ;
+
+preserve_match = "match" ( "unique" | "key" "(" identifier { "," identifier } ")" ) ;
 ```
+
+`unique` and `key` are contextual: they are keywords only right after `match`
+in a preserve statement, and stay valid identifiers everywhere else.
 
 ```jibs
 preserve core_config_data where "path LIKE 'dev/%'"
+preserve core_config_data match unique where "path LIKE 'dev/%'"
+preserve core_config_data match key (scope, scope_id, path) where "path LIKE 'dev/%'"
 ```
 
 ### Set Block

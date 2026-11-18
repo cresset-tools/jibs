@@ -22,7 +22,7 @@ use tracing::info;
 use jibs_protocol::{AnonymizeRule, ColumnDef, ForeignKeyDef, PreserveRule, SetRule};
 
 use crate::checkpoint::{
-    backup_preserved_rows, find_backup_tables, restore_preserved_rows, Checkpoint,
+    backup_preserved_rows, find_backup_tables, preserve_match_for, restore_preserved_rows, Checkpoint,
     BACKUP_TABLE_PREFIX,
 };
 use crate::dump::{DumpReader, DumpRecord};
@@ -32,6 +32,7 @@ use crate::foreign_keys::{
 };
 use crate::import::redact_mysql_url;
 use crate::loader::{warn_dropped_rows, wait_for_load, DdlResult, LoaderPool, PendingLoad};
+use crate::preserve::TableKeys;
 use crate::sql::execute_set_block;
 
 /// Maximum number of in-flight load chunks before we drain completed ones.
@@ -229,7 +230,7 @@ fn load_and_finalize<R: Read>(
             let table = backup_table
                 .strip_prefix(BACKUP_TABLE_PREFIX)
                 .unwrap_or(backup_table);
-            restore_preserved_rows(conn, table)?;
+            restore_preserved_rows(conn, table, &preserve_match_for(&loaded.preserves, table))?;
         }
     }
 
@@ -252,6 +253,8 @@ fn load_and_finalize<R: Read>(
 struct Loaded {
     tables: usize,
     rows: u64,
+    /// Preserve rules from the manifest, needed again to restore the rows.
+    preserves: Vec<PreserveRule>,
     sets: Vec<SetRule>,
     after_statements: Vec<String>,
     /// Source-schema FKs to reconstruct after load. `None` when the dump carried
@@ -284,6 +287,9 @@ fn load_records<R: Read>(
             DumpRecord::Manifest { preserves: p } => {
                 preserves = p;
             }
+            DumpRecord::ManifestV3 { .. } => {
+                unreachable!("DumpReader::next_record turns v3 manifests into Manifest")
+            }
             DumpRecord::Table {
                 name,
                 columns,
@@ -296,7 +302,7 @@ fn load_records<R: Read>(
                 let rules: Vec<&PreserveRule> =
                     preserves.iter().filter(|r| r.table == name).collect();
                 if !rules.is_empty() {
-                    backup_preserved_rows(conn, &name, &rules)?;
+                    backup_preserved_rows(conn, &name, &rules, &TableKeys::from_schema(&columns, &indexes))?;
                 }
 
                 let cols = Arc::new(columns);
@@ -393,6 +399,7 @@ fn load_records<R: Read>(
     Ok(Loaded {
         tables: tables_loaded,
         rows: rows_loaded,
+        preserves,
         sets,
         after_statements,
         foreign_keys,

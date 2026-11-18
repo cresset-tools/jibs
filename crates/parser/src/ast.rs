@@ -54,7 +54,7 @@ pub enum StatementKind<'src> {
     /// get function definition
     Get(GetFunctionDef<'src>),
 
-    /// preserve table where "condition"
+    /// preserve table [match unique | match key (cols)] where "condition"
     Preserve(PreserveStmt<'src>),
 
     /// set table { ... }
@@ -228,7 +228,15 @@ pub struct GetFunctionDef<'src> {
 #[derive(Debug, Clone)]
 pub struct PreserveStmt<'src> {
     pub table: Spanned<&'src str>,
+    pub match_key: Option<Spanned<PreserveMatch<'src>>>,
     pub where_clause: Spanned<StringLiteral<'src>>,
+}
+
+/// `match unique` or `match key (a, b)` in a preserve statement
+#[derive(Debug, Clone)]
+pub enum PreserveMatch<'src> {
+    Unique,
+    Key(Vec<Spanned<&'src str>>),
 }
 
 /// Set block

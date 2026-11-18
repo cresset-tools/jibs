@@ -8,7 +8,7 @@ use std::path::Path;
 use serde::Deserialize;
 
 use jibs_protocol::{
-    AnonymizeRule, AnonymizeTarget, Assignment, ExecutionPlan, PreserveRule, Relation,
+    AnonymizeRule, AnonymizeTarget, Assignment, ExecutionPlan, PreserveMatch, PreserveRule, Relation,
     ResolvedAggregate, SetRule, SortDirection, Value,
 };
 
@@ -217,8 +217,24 @@ struct JsonPreserve {
     table: String,
     #[serde(rename = "where")]
     where_clause: String,
+    /// `"unique"`, or the key columns as an array (`["scope", "path"]`)
+    #[serde(default, rename = "match")]
+    match_key: Option<JsonPreserveMatch>,
     #[serde(default)]
     when: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum JsonPreserveMatch {
+    Unique(JsonUnique),
+    Key(Vec<String>),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum JsonUnique {
+    Unique,
 }
 
 #[derive(Debug, Deserialize)]
@@ -900,6 +916,17 @@ impl JsonResolver {
             self.plan.preserves.push(PreserveRule {
                 table: preserve.table.clone(),
                 where_clause: self.interpolate_string(&preserve.where_clause)?,
+                match_key: match &preserve.match_key {
+                    None => PreserveMatch::Replace,
+                    Some(JsonPreserveMatch::Unique(_)) => PreserveMatch::Unique,
+                    Some(JsonPreserveMatch::Key(columns)) if columns.is_empty() => {
+                        return Err(ClientError::Resolution(format!(
+                            "preserve rule for table '{}' has an empty match key",
+                            preserve.table
+                        )));
+                    }
+                    Some(JsonPreserveMatch::Key(columns)) => PreserveMatch::Key(columns.clone()),
+                },
             });
         }
         Ok(())
@@ -1105,5 +1132,40 @@ mod tests {
         assert_eq!(rules.len(), 2);
         assert_eq!(rules[0].condition.as_deref(), Some("path LIKE 'payment/%'"));
         assert_eq!(rules[1].condition, None);
+    }
+
+    #[test]
+    fn preserve_match_forms() {
+        let dir = std::env::temp_dir().join(format!("jibs-json-preserve-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        std::fs::write(
+            &path,
+            r#"{
+              "preserve": [
+                {"table": "a", "where": "1"},
+                {"table": "b", "where": "1", "match": "unique"},
+                {"table": "c", "where": "1", "match": ["scope", "path"]}
+              ]
+            }"#,
+        )
+        .unwrap();
+        let plan = parse_json_config(&path, &HashMap::new()).unwrap();
+
+        std::fs::write(&path, r#"{"preserve": [{"table": "a", "where": "1", "match": "primary"}]}"#)
+            .unwrap();
+        let invalid = parse_json_config(&path, &HashMap::new());
+        std::fs::remove_dir_all(&dir).ok();
+
+        let matches: Vec<&PreserveMatch> = plan.preserves.iter().map(|p| &p.match_key).collect();
+        assert_eq!(
+            matches,
+            [
+                &PreserveMatch::Replace,
+                &PreserveMatch::Unique,
+                &PreserveMatch::Key(vec!["scope".to_string(), "path".to_string()]),
+            ]
+        );
+        assert!(invalid.is_err());
     }
 }

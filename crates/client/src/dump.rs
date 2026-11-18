@@ -24,7 +24,7 @@ use bincode::{Decode, Encode};
 use jibs_protocol::framing::{bincode_config, write_message_noflush};
 use jibs_protocol::{
     AnonymizeRule, AnonymizeTarget, ColumnDef, CompressionMode, ForeignKeyDef, IndexDef,
-    PreserveRule, SetRule, TableOptions,
+    PreserveMatch, PreserveRule, SetRule, TableOptions,
 };
 
 /// Magic bytes at the start of every `.jibsdump` file.
@@ -36,6 +36,9 @@ pub(crate) const MAGIC: &[u8; 8] = b"JIBSDUMP";
 /// v2 added secondary indexes + table options to [`DumpRecord::Table`].
 /// v3 added [`DumpRecord::ForeignKeys`], carrying the source schema's foreign
 /// keys so a load into a fresh database can reconstruct them.
+/// v4 added the preserve match clause: [`DumpRecord::Manifest`] moved to the
+/// end of the enum with the new [`PreserveRule`]; the v3 manifest decodes as
+/// [`DumpRecord::ManifestV3`], so v4 builds still read v3 dumps.
 ///
 /// Compatibility policy: a jibs build loads dumps of its own version and the one
 /// before it (N and N-1), so producers and consumers of published dumps can
@@ -45,7 +48,10 @@ pub(crate) const MAGIC: &[u8; 8] = b"JIBSDUMP";
 /// `test/dump-fixture.jibs`): on a bump, add the new version's fixture and keep
 /// the previous one loading. v3 is the first version under this policy; nothing
 /// reads v1 or v2.
-pub(crate) const FORMAT_VERSION: u16 = 3;
+pub(crate) const FORMAT_VERSION: u16 = 4;
+
+/// Oldest format version this build still reads (N-1, see above).
+pub(crate) const MIN_FORMAT_VERSION: u16 = 3;
 
 /// Length of the fixed preamble: 8-byte magic + 2-byte version.
 const PREAMBLE_LEN: usize = 10;
@@ -62,11 +68,10 @@ pub(crate) const DEFAULT_MAX_RECORD_SIZE: usize = 100 * 1024 * 1024;
 /// One record in a `.jibsdump` stream.
 #[derive(Debug, Clone, Encode, Decode)]
 pub(crate) enum DumpRecord {
-    /// Stream-level metadata, emitted once right after the preamble (before any
-    /// `Table`). Carries plan-level rules the loader must honor up front —
-    /// currently `preserve` rules, which must back up local rows *before* a
-    /// table is dropped and recreated.
-    Manifest { preserves: Vec<PreserveRule> },
+    /// The v3 manifest (preserve rules without a match clause). Frozen: only
+    /// read from v3 dumps, and [`DumpReader::next_record`] turns it into a
+    /// [`DumpRecord::Manifest`], so callers never see it.
+    ManifestV3 { preserves: Vec<PreserveRuleV3> },
     /// A table's schema. Emitted once per table, before any of its chunks.
     Table {
         name: String,
@@ -106,6 +111,19 @@ pub(crate) enum DumpRecord {
     ForeignKeys { foreign_keys: Vec<ForeignKeyDef> },
     /// Terminator. A complete dump ends with exactly one of these.
     End,
+    /// Stream-level metadata, emitted once right after the preamble (before any
+    /// `Table`). Carries plan-level rules the loader must honor up front —
+    /// currently `preserve` rules, which must back up local rows *before* a
+    /// table is dropped and recreated. Last in the enum (v4) so the variant
+    /// indices of the v3 records stay the same.
+    Manifest { preserves: Vec<PreserveRule> },
+}
+
+/// A preserve rule as v3 dumps encode it (frozen layout).
+#[derive(Debug, Clone, Encode, Decode)]
+pub(crate) struct PreserveRuleV3 {
+    pub(crate) table: String,
+    pub(crate) where_clause: String,
 }
 
 /// An anonymization rule as stored in a jibs dump: only what shapes the DDL.
@@ -277,11 +295,12 @@ impl<R: Read> DumpReader<R> {
             bail!("not a jibs dump file (bad magic bytes)");
         }
         let version = u16::from_le_bytes([preamble[8], preamble[9]]);
-        if version != FORMAT_VERSION {
+        if !(MIN_FORMAT_VERSION..=FORMAT_VERSION).contains(&version) {
             bail!(
-                "unsupported .jibsdump format version {} (this build understands v{}); \
+                "unsupported .jibsdump format version {} (this build understands v{}-v{}); \
                  re-create the dump with a matching jibs version",
                 version,
+                MIN_FORMAT_VERSION,
                 FORMAT_VERSION
             );
         }
@@ -323,7 +342,19 @@ impl<R: Read> DumpReader<R> {
 
         let (rec, _) = bincode::decode_from_slice(&buf, bincode_config())
             .map_err(|e| anyhow::anyhow!("failed to decode dump record: {}", e))?;
-        Ok(Some(rec))
+        Ok(Some(match rec {
+            DumpRecord::ManifestV3 { preserves } => DumpRecord::Manifest {
+                preserves: preserves
+                    .into_iter()
+                    .map(|p| PreserveRule {
+                        table: p.table,
+                        where_clause: p.where_clause,
+                        match_key: PreserveMatch::Replace,
+                    })
+                    .collect(),
+            },
+            rec => rec,
+        }))
     }
 }
 
@@ -478,6 +509,7 @@ mod tests {
         let preserves = vec![PreserveRule {
             table: "users".to_string(),
             where_clause: "is_admin = 1".to_string(),
+            match_key: PreserveMatch::Key(vec!["email".to_string()]),
         }];
         let sets = vec![SetRule {
             table: "config".to_string(),
@@ -508,6 +540,7 @@ mod tests {
             DumpRecord::Manifest { preserves } => {
                 assert_eq!(preserves.len(), 1);
                 assert_eq!(preserves[0].table, "users");
+                assert_eq!(preserves[0].match_key, PreserveMatch::Key(vec!["email".to_string()]));
             }
             other => panic!("expected Manifest first, got {other:?}"),
         }
@@ -629,7 +662,10 @@ mod tests {
 
     /// Checked-in dumps, one per format version this build must load. See the
     /// [`FORMAT_VERSION`] compatibility policy.
-    const FIXTURES: &[(u16, &[u8])] = &[(3, include_bytes!("../tests/fixtures/dump-v3.jibsdump"))];
+    const FIXTURES: &[(u16, &[u8])] = &[
+        (3, include_bytes!("../tests/fixtures/dump-v3.jibsdump")),
+        (4, include_bytes!("../tests/fixtures/dump-v4.jibsdump")),
+    ];
 
     #[test]
     fn fixture_exists_for_current_version() {
@@ -660,7 +696,16 @@ mod tests {
                 match rec {
                     DumpRecord::Manifest { preserves } => {
                         assert_eq!(preserves.len(), 1);
+                        let expected = if *version >= 4 {
+                            PreserveMatch::Unique
+                        } else {
+                            PreserveMatch::Replace
+                        };
+                        assert_eq!(preserves[0].match_key, expected, "v{version}");
                         manifest += 1;
+                    }
+                    DumpRecord::ManifestV3 { .. } => {
+                        panic!("v{version}: ManifestV3 must be normalized by next_record")
                     }
                     DumpRecord::Table { name, anon_rules, .. } => {
                         if name == "users" {

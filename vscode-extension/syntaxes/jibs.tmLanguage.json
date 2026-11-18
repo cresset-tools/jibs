@@ -222,6 +222,14 @@
           "match": "(?<=\\b)exclude(?=\\s)"
         },
         {
+          "comment": "preserve ... match unique / match key (...): contextual keywords",
+          "match": "\\b(match)\\s+(unique|key)\\b",
+          "captures": {
+            "1": { "name": "keyword.other.match.jibs" },
+            "2": { "name": "keyword.other.match-kind.jibs" }
+          }
+        },
+        {
           "name": "keyword.other.match.jibs",
           "match": "\\bmatch\\b"
         },

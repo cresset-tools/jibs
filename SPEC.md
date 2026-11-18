@@ -659,16 +659,18 @@ Keep local values for specific rows; don't overwrite them during import.
 
 ```text
 preserve <table> where "<sql_condition>"
+preserve <table> match unique where "<sql_condition>"
+preserve <table> match key (<column>, ...) where "<sql_condition>"
 ```
 
 ### Examples
 
 ```jibs
 // Keep local development settings
-preserve core_config_data where "path LIKE 'dev/%'"
+preserve core_config_data match unique where "path LIKE 'dev/%'"
 
 // Keep local admin account
-preserve admin_user where "username = 'localadmin'"
+preserve admin_user match key (username) where "username = 'localadmin'"
 ```
 
 ### Behavior
@@ -676,8 +678,39 @@ preserve admin_user where "username = 'localadmin'"
 1. Before the table is imported, matching local rows are copied to a backup
    table (`_jibs_preserve_<table>`).
 2. The table is imported from remote as usual.
-3. After the import, the preserved rows are written back (`REPLACE INTO`)
-   and the backup table is dropped.
+3. After the import, the preserved rows are written back and the backup table
+   is dropped. How they are written back depends on the match clause.
+
+### Match clause
+
+Without a match clause, preserved rows are written back with `REPLACE INTO`
+and all of their columns, so they are matched on the **primary key** (and any
+other unique key). That is fine for a natural primary key, but with an
+auto-increment id the preserved row keeps its *local* id: when the imported
+data uses that id for an unrelated row, `REPLACE` deletes that row.
+
+With a match clause, preserved rows are matched on a unique key instead:
+
+```sql
+INSERT INTO <table> (<columns>) SELECT * FROM (SELECT <columns> FROM _jibs_preserve_<table>) AS kept
+ON DUPLICATE KEY UPDATE <column> = kept.<column>, ...
+```
+
+- `match unique` uses the table's only unique key besides the primary key. It
+  is an error when the table has none, or more than one.
+- `match key (a, b)` uses the unique key (or the primary key) with exactly
+  these columns, in any order. It is an error when no key has exactly these
+  columns.
+- An auto-increment primary key is left out of the insert (unless it is the
+  match key): a matching imported row keeps its id and gets the preserved
+  values; a preserved row with no match is inserted with a new id. Rows in
+  other tables that referenced the old local id are not updated.
+- Only columns that both the preserved rows and the imported table have are
+  written; generated columns are skipped.
+
+The key is checked against the imported table's schema before the local table
+is dropped, so a wrong match clause stops the import with the local rows
+untouched. All preserve rules on one table must use the same match clause.
 
 If an import is interrupted, the backup tables remain so a later `--resume`
 can finish the restore. `--clean` discards them (destroying preserved rows
@@ -1037,7 +1070,7 @@ get product_by_sku (sku: string) {
 }
 
 // === PRESERVE LOCAL VALUES ===
-preserve core_config_data where "path LIKE 'dev/%'"
+preserve core_config_data match unique where "path LIKE 'dev/%'"
 
 // === SET VALUES ===
 set core_config_data {

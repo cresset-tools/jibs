@@ -73,6 +73,12 @@ cargo run -p jibs -- import test/import-resume-test.jibs \
   --resume
 ```
 
+### Test Preserve Match
+`preserve <table> match unique` / `match key (...)` restores preserved rows by a
+unique key instead of `REPLACE INTO` on the primary key.
+`./test/test-preserve-match.sh` sets up local rows whose auto-increment ids
+collide with unrelated remote rows and checks that both survive.
+
 ### Test Dump Export / Load
 `import --dump-to <file>` writes the (already anonymized, aggregate-resolved)
 stream to a versioned, zstd-compressed `.jibsdump` file instead of a local DB.

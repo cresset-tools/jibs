@@ -90,7 +90,7 @@ anonymize customer_entity {
 }
 
 // Keep local values, fix config for local use
-preserve core_config_data where "path LIKE 'dev/%'"
+preserve core_config_data match unique where "path LIKE 'dev/%'"
 set core_config_data {
     match path = "web/secure/base_url", scope = "default", scope_id = 0
     value = $base_url

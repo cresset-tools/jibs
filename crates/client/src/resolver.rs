@@ -5,12 +5,12 @@ use std::path::{Path, PathBuf};
 
 use jibs_parser::ast::{
     AggregateBlock, AnonymizeBlock, Expr, FakerDecl, FakerSource, FakerValue, GetFunctionDef,
-    LimitValue, Literal, PreserveStmt, Program, RelationDecl, SetBlock,
+    LimitValue, Literal, PreserveMatch as AstPreserveMatch, PreserveStmt, Program, RelationDecl, SetBlock,
     SortDirection as AstSortDirection, Statement, StatementKind, StringLiteral, StringPart,
     TablePattern, VarDecl, VarType,
 };
 use jibs_protocol::{
-    AnonymizeRule, AnonymizeTarget, Assignment, ExecutionPlan, PreserveRule, Relation,
+    AnonymizeRule, AnonymizeTarget, Assignment, ExecutionPlan, PreserveMatch, PreserveRule, Relation,
     ResolvedAggregate, SetRule, SortDirection, Value,
 };
 
@@ -111,6 +111,21 @@ pub(crate) fn validate_plan(
                         table, rule.column, faker
                     )));
                 }
+            }
+        }
+    }
+
+    // All preserve rules on a table are restored in one statement, so they
+    // must agree on how rows are matched.
+    let mut preserve_matches: HashMap<&str, &PreserveMatch> = HashMap::new();
+    for rule in &plan.preserves {
+        if let Some(first) = preserve_matches.insert(&rule.table, &rule.match_key) {
+            if first != &rule.match_key {
+                return Err(ClientError::Resolution(format!(
+                    "preserve rules for table '{}' use different match clauses; \
+                     give every preserve rule on a table the same match clause",
+                    rule.table
+                )));
             }
         }
     }
@@ -992,9 +1007,18 @@ impl Resolver {
         let table = preserve_stmt.table.0.to_string();
         let where_clause = self.resolve_string_literal(&preserve_stmt.where_clause.0)?;
 
+        let match_key = match &preserve_stmt.match_key {
+            None => PreserveMatch::Replace,
+            Some((AstPreserveMatch::Unique, _)) => PreserveMatch::Unique,
+            Some((AstPreserveMatch::Key(columns), _)) => {
+                PreserveMatch::Key(columns.iter().map(|c| c.0.to_string()).collect())
+            }
+        };
+
         self.plan.preserves.push(PreserveRule {
             table,
             where_clause,
+            match_key,
         });
         Ok(())
     }
@@ -1067,6 +1091,48 @@ mod tests {
     fn resolve_lenient_str(source: &str) -> Result<ResolvedConfig> {
         let program = jibs_parser::parse(source).expect("test source must parse");
         resolve_lenient(Path::new("test.jibs"), &program, &HashMap::new())
+    }
+
+    #[test]
+    fn preserve_match_clause_is_resolved() {
+        let config = resolve_str(
+            r#"
+            preserve a where "1"
+            preserve b match unique where "1"
+            preserve c match key (scope, path) where "1"
+            "#,
+        )
+        .unwrap();
+        let matches: Vec<&PreserveMatch> =
+            config.plan.preserves.iter().map(|p| &p.match_key).collect();
+        assert_eq!(
+            matches,
+            [
+                &PreserveMatch::Replace,
+                &PreserveMatch::Unique,
+                &PreserveMatch::Key(vec!["scope".to_string(), "path".to_string()]),
+            ]
+        );
+    }
+
+    #[test]
+    fn preserve_rules_on_one_table_must_agree_on_match() {
+        let err = resolve_str(
+            r#"
+            preserve core_config_data match unique where "path = 'a'"
+            preserve core_config_data where "path = 'b'"
+            "#,
+        )
+        .expect_err("mixed match clauses must fail");
+        assert!(err.to_string().contains("different match clauses"), "got: {}", err);
+
+        resolve_str(
+            r#"
+            preserve core_config_data match unique where "path = 'a'"
+            preserve core_config_data match unique where "path = 'b'"
+            "#,
+        )
+        .expect("same match clause is fine");
     }
 
     #[test]

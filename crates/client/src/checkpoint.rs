@@ -6,7 +6,9 @@ use mysql::prelude::*;
 use mysql::Conn;
 use tracing::{debug, info};
 
-use jibs_protocol::PreserveRule;
+use jibs_protocol::{PreserveMatch, PreserveRule};
+
+use crate::preserve::{restore_mode, upsert_sql, RestoreMode, TableKeys};
 
 pub(crate) const BACKUP_TABLE_PREFIX: &str = "_jibs_preserve_";
 
@@ -97,11 +99,35 @@ impl Checkpoint {
 /// Returns true if a backup exists (either created now or from a previous run).
 ///
 /// On resume: uses existing backup table if present.
+/// The match clause shared by the preserve rules of `table` (the resolver
+/// rejects rules on one table that disagree).
+pub(crate) fn preserve_match_for<'a>(
+    rules: impl IntoIterator<Item = &'a PreserveRule>,
+    table: &str,
+) -> PreserveMatch {
+    rules
+        .into_iter()
+        .find(|r| r.table == table)
+        .map(|r| r.match_key.clone())
+        .unwrap_or_default()
+}
+
+/// Back up the local rows matching `preserve_rules` before `table` is
+/// recreated. `incoming_keys` are the keys of the table about to be imported:
+/// a match clause that cannot be resolved against them fails here, before
+/// anything is dropped.
 pub(crate) fn backup_preserved_rows(
     conn: &mut Conn,
     table: &str,
     preserve_rules: &[&PreserveRule],
+    incoming_keys: &TableKeys,
 ) -> Result<bool> {
+    restore_mode(
+        table,
+        &preserve_match_for(preserve_rules.iter().copied(), table),
+        incoming_keys,
+    )?;
+
     let backup_table = preserve_backup_table(table);
 
     // Check if backup table already exists (resume scenario)
@@ -162,7 +188,11 @@ pub(crate) fn backup_preserved_rows(
 }
 
 
-pub(crate) fn restore_preserved_rows(conn: &mut Conn, table: &str) -> Result<()> {
+pub(crate) fn restore_preserved_rows(
+    conn: &mut Conn,
+    table: &str,
+    match_key: &PreserveMatch,
+) -> Result<()> {
     let backup_table = preserve_backup_table(table);
 
     // Check if backup table exists
@@ -196,11 +226,26 @@ pub(crate) fn restore_preserved_rows(conn: &mut Conn, table: &str) -> Result<()>
         .collect::<Vec<_>>()
         .join(", ");
 
-    // Use REPLACE INTO to restore rows (handles both insert and update)
-    let restore_sql = format!(
-        "REPLACE INTO `{}` ({}) SELECT {} FROM `{}`",
-        table, col_list, col_list, backup_table
-    );
+    let restore_sql = match restore_mode(table, match_key, &TableKeys::from_db(conn, table)?)? {
+        // No match clause: REPLACE INTO with every column (matches on the
+        // primary key as well as any unique key)
+        RestoreMode::Replace => format!(
+            "REPLACE INTO `{}` ({}) SELECT {} FROM `{}`",
+            table, col_list, col_list, backup_table
+        ),
+        RestoreMode::Upsert { key, omit } => {
+            // Only columns the imported table has and that can be written
+            let writable: Vec<String> = conn.exec(
+                "SELECT COLUMN_NAME FROM information_schema.COLUMNS \
+                 WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? \
+                 AND EXTRA NOT LIKE '%VIRTUAL GENERATED%' AND EXTRA NOT LIKE '%STORED GENERATED%'",
+                (table,),
+            )?;
+            let shared: Vec<String> =
+                columns.iter().filter(|c| writable.contains(c)).cloned().collect();
+            upsert_sql(table, &backup_table, &shared, &key, omit.as_deref())?
+        }
+    };
     debug!("Restore preserve: {}", restore_sql);
     conn.query_drop(&restore_sql)?;
 

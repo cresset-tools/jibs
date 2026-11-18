@@ -17,6 +17,7 @@ mod foreign_keys;
 mod import;
 mod load;
 mod loader;
+mod preserve;
 mod protocol;
 mod report;
 mod sql;

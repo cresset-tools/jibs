@@ -58,7 +58,7 @@ get product_by_sku (sku: string) {
 }
 
 // Preserve local values
-preserve core_config_data where "path LIKE 'dev/%'"
+preserve core_config_data match unique where "path LIKE 'dev/%'"
 
 // Set values with string interpolation
 set core_config_data {
