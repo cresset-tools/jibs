@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.9.0](https://github.com/cresset-tools/jibs/compare/jibs-v0.8.0...jibs-v0.9.0) (2026-11-18)
+
+
+### ⚠ BREAKING CHANGES
+
+* a later anonymize block no longer removes earlier rules for columns it does not name.
+
+### Features
+
+* `import <path>` looks files up in an import search path ([#46](https://github.com/cresset-tools/jibs/issues/46)) ([ed1c0d8](https://github.com/cresset-tools/jibs/commit/ed1c0d8ab8afc7f85f64fb4771bd086f778b49ca))
+* anonymize blocks override per column, not per table ([#44](https://github.com/cresset-tools/jibs/issues/44)) ([9a60058](https://github.com/cresset-tools/jibs/commit/9a60058f9037599589cfdff0379f1021c9b10d96))
+
 ## [0.8.0](https://github.com/cresset-tools/jibs/compare/jibs-v0.7.0...jibs-v0.8.0) (2026-11-18)
 
 
