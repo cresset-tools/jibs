@@ -430,11 +430,10 @@ impl JsonResolver {
         self.plan.ignored_tables.extend(other.ignored_tables);
 
         for (table, rules) in other.anonymization {
-            self.plan
-                .anonymization
-                .entry(table)
-                .or_default()
-                .extend(rules);
+            crate::resolver::merge_anonymize_rules(
+                self.plan.anonymization.entry(table).or_default(),
+                rules,
+            );
         }
 
         for (name, values) in other.fakers {
@@ -1162,6 +1161,44 @@ mod tests {
         assert!(matches!(rules[0].target, AnonymizeTarget::Faker(_)));
         assert_eq!(rules[1].column, "name");
         assert!(matches!(rules[1].target, AnonymizeTarget::Null));
+    }
+
+    #[test]
+    fn anonymize_rules_from_an_imported_jibs_file_merge_per_column() {
+        let dir =
+            std::env::temp_dir().join(format!("jibs-json-anon-import-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("project.jibs"),
+            "anonymize users {\n    name -> null\n}\n",
+        )
+        .unwrap();
+        let path = dir.join("config.json");
+        std::fs::write(
+            &path,
+            r#"{
+              "faker": [{"name": "emails", "values": ["a@test"]}],
+              "anonymize": [
+                {"table": "users", "rules": [{"column": "email", "faker": "emails"},
+                                             {"column": "name", "faker": "emails"}]}
+              ],
+              "import": [{"path": "project.jibs"}]
+            }"#,
+        )
+        .unwrap();
+        let plan = parse_json_config(&path, &HashMap::new()).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+
+        let rules = &plan.anonymization["users"];
+        let columns: Vec<&str> = rules.iter().map(|r| r.column.as_str()).collect();
+        assert_eq!(
+            columns.len(),
+            2,
+            "no duplicate rule for name: {:?}",
+            columns
+        );
+        assert!(columns.contains(&"email"));
+        assert!(columns.contains(&"name"));
     }
 
     #[test]
