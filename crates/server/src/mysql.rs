@@ -7,7 +7,7 @@ use mysql::{Conn, Opts, Row, Value as MySqlValue};
 
 use jibs_protocol::{
     ColumnDef, ColumnFlags, ExecutionPlan, ForeignKeyDef, IndexColumn, IndexDef, IndexKind,
-    Relation, TableInfo, TableOptions, TriggerDef,
+    Relation, TableInfo, TableOptions,
 };
 
 use crate::error::{Result, ServerError};
@@ -306,8 +306,7 @@ impl MySqlConnection {
         Ok(result)
     }
 
-    /// Get table-level options (engine, default charset/collation, row format,
-    /// AUTO_INCREMENT counter).
+    /// Get table-level options (engine, default charset/collation, row format).
     /// Without these the recreated table inherits the server/database defaults —
     /// most visibly a different collation.
     pub fn get_table_options(&mut self, table: &str) -> Result<TableOptions> {
@@ -335,22 +334,6 @@ impl MySqlConnection {
                 .map(str::to_string);
             opts.collation = collation;
             opts.row_format = row.get_opt("ROW_FORMAT").and_then(|r| r.ok());
-
-            // The counter comes from SHOW CREATE TABLE, not INFORMATION_SCHEMA:
-            // MySQL 8 caches the latter for up to a day, and even uncached it
-            // reports one less than the real counter until the table is first
-            // opened after a server restart.
-            //
-            // Read the DDL by position, not as a two-column row: for a view the
-            // statement answers four columns (the view, its definition, and
-            // two connection settings), and Magento has one in every install
-            // (`inventory_stock_1`). A view has no counter.
-            let create: Option<Row> = self
-                .conn
-                .query_first(format!("SHOW CREATE TABLE `{}`", escape_identifier(table)))?;
-            opts.auto_increment = create
-                .and_then(|row| row.get_opt::<String, _>(1).and_then(|ddl| ddl.ok()))
-                .and_then(|ddl| auto_increment_from_ddl(&ddl));
         }
 
         self.table_options.insert(table.to_string(), opts.clone());
@@ -465,31 +448,6 @@ impl MySqlConnection {
         Ok(defs)
     }
 
-    /// Capture the source schema's triggers in creation order: per table, timing
-    /// and event, `ACTION_ORDER` is the order they fire in, and recreating them
-    /// in that order reproduces it.
-    pub fn capture_triggers(&mut self) -> Result<Vec<TriggerDef>> {
-        type TriggerRow = (String, String, String, String, String, String);
-        let rows: Vec<TriggerRow> = self.conn.query(
-            "SELECT TRIGGER_NAME, EVENT_OBJECT_TABLE, ACTION_TIMING, EVENT_MANIPULATION, \
-                    ACTION_STATEMENT, SQL_MODE \
-             FROM information_schema.TRIGGERS \
-             WHERE TRIGGER_SCHEMA = DATABASE() \
-             ORDER BY EVENT_OBJECT_TABLE, ACTION_TIMING, EVENT_MANIPULATION, ACTION_ORDER",
-        )?;
-        Ok(rows
-            .into_iter()
-            .map(|(name, table, timing, event, statement, sql_mode)| TriggerDef {
-                name,
-                table,
-                timing,
-                event,
-                statement,
-                sql_mode,
-            })
-            .collect())
-    }
-
     /// Get cached primary key for a table
     pub fn get_cached_primary_key(&self, table: &str) -> Option<&Vec<String>> {
         self.primary_keys.get(table)
@@ -524,19 +482,6 @@ impl MySqlConnection {
     ) -> Result<mysql::QueryResult<'_, '_, '_, mysql::Binary>> {
         Ok(self.conn.exec_iter(query, params)?)
     }
-}
-
-/// The `AUTO_INCREMENT=<n>` table option from `SHOW CREATE TABLE` output, or
-/// `None` when the table has none (no AUTO_INCREMENT column, or a counter
-/// still at 1). Only the options after the column list are searched (SHOW
-/// CREATE TABLE closes it with a `)` at the start of a line; newlines inside
-/// comments and defaults are escaped), so the `AUTO_INCREMENT` column
-/// attribute and a trailing PARTITION clause don't interfere.
-fn auto_increment_from_ddl(ddl: &str) -> Option<u64> {
-    let options = &ddl[ddl.find("\n)")? + 2..];
-    let rest = &options[options.find(" AUTO_INCREMENT=")? + " AUTO_INCREMENT=".len()..];
-    let digits = rest.split(|c: char| !c.is_ascii_digit()).next()?;
-    digits.parse().ok()
 }
 
 /// Escape a MySQL identifier (table name, column name) for use in queries
@@ -628,18 +573,6 @@ pub fn escape_tsv_bytes(buf: &mut Vec<u8>, bytes: &[u8]) {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn reads_auto_increment_table_option() {
-        let ddl = "CREATE TABLE `products` (\n  `id` int NOT NULL AUTO_INCREMENT,\n  `note` varchar(9) DEFAULT ')',\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB AUTO_INCREMENT=1000 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci\n/*!50100 PARTITION BY HASH (`id`)\nPARTITIONS 4 */";
-        assert_eq!(super::auto_increment_from_ddl(ddl), Some(1000));
-    }
-
-    #[test]
-    fn no_auto_increment_table_option() {
-        let ddl = "CREATE TABLE `t` (\n  `id` int NOT NULL AUTO_INCREMENT,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4";
-        assert_eq!(super::auto_increment_from_ddl(ddl), None);
-    }
-
     use super::*;
 
     fn escape_to_string(input: &[u8]) -> String {

@@ -19,7 +19,7 @@ use mysql::prelude::*;
 use mysql::{Conn, Opts};
 use tracing::info;
 
-use jibs_protocol::{AnonymizeRule, ColumnDef, ForeignKeyDef, PreserveRule, SetRule, TriggerDef};
+use jibs_protocol::{AnonymizeRule, ColumnDef, ForeignKeyDef, PreserveRule, SetRule};
 
 use crate::checkpoint::{
     backup_preserved_rows, find_backup_tables, preserve_match_for, restore_preserved_rows, Checkpoint,
@@ -34,7 +34,6 @@ use crate::import::redact_mysql_url;
 use crate::loader::{warn_dropped_rows, wait_for_load, DdlResult, LoaderPool, PendingLoad};
 use crate::preserve::TableKeys;
 use crate::sql::execute_set_block;
-use crate::triggers::apply_triggers;
 
 /// Maximum number of in-flight load chunks before we drain completed ones.
 /// Bounds memory while keeping the pool busy across tables.
@@ -50,8 +49,6 @@ pub(crate) struct LoadConfig {
     pub(crate) max_message_size: usize,
     /// Discard leftover state from a previous interrupted import before loading.
     pub(crate) clean: bool,
-    /// Load into the tables that already exist instead of recreating them.
-    pub(crate) keep_tables: bool,
 }
 
 /// If `source` is an `http://` or `https://` URL, return it as a string; else
@@ -138,63 +135,29 @@ pub(crate) fn run_load(config: LoadConfig) -> Result<()> {
 
     // Drop existing FK constraints so the pool's parallel DROP/CREATE TABLE
     // don't hit ERROR 1217/1822. Restored after a successful load (same as import).
-    //
-    // With --keep-tables no existing table is recreated, so its foreign keys
-    // and triggers stay as they are; remember which tables exist, so only the
-    // ones this load creates get the source's afterwards (same as `get`).
-    let preexisting_tables: Option<std::collections::HashSet<String>> = if config.keep_tables {
-        Some(
-            conn.query::<String, _>(
-                "SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE()",
-            )?
-            .into_iter()
-            .collect(),
-        )
-    } else {
-        preserve_and_drop_foreign_keys(&mut conn)?;
-        None
-    };
+    preserve_and_drop_foreign_keys(&mut conn)?;
 
     let workers = config.client_parallel.unwrap_or(config.parallel).max(1);
     info!("Creating loader pool with {} workers", workers);
-    let pool = LoaderPool::new(&config.local_mysql, workers, config.keep_tables)?;
+    let pool = LoaderPool::new(&config.local_mysql, workers, false)?;
 
-    let outcome = load_and_finalize(&mut reader, &pool, &mut conn, config.keep_tables);
+    let outcome = load_and_finalize(&mut reader, &pool, &mut conn);
 
     // Always drain the pool before touching FKs so no worker is mid-DDL.
     pool.shutdown();
 
     match outcome {
-        Ok((tables, rows, source_fks, triggers)) => {
+        Ok((tables, rows, source_fks)) => {
             // Prefer the authoritative source-schema FKs carried by the dump —
             // they rebuild constraints even in a fresh target the preserve path
             // could never capture. Fall back to the target's own captured FKs
             // only for a dump that carries none. Still FK-checks-off here.
-            match (&preexisting_tables, source_fks) {
-                (Some(existing), source_fks) => {
-                    let new_fks: Vec<_> = source_fks
-                        .unwrap_or_default()
-                        .into_iter()
-                        .filter(|fk| !existing.contains(&fk.table))
-                        .collect();
-                    apply_foreign_keys(&mut conn, &new_fks)?;
-                    let new_triggers: Vec<_> = triggers
-                        .iter()
-                        .filter(|t| !existing.contains(&t.table))
-                        .cloned()
-                        .collect();
-                    apply_triggers(&mut conn, &new_triggers)?;
-                }
-                (None, Some(fks)) => {
+            match source_fks {
+                Some(fks) => {
                     apply_foreign_keys(&mut conn, &fks)?;
                     discard_preserved_foreign_keys(&mut conn)?;
-                    // Every loaded table was recreated, dropping its triggers.
-                    apply_triggers(&mut conn, &triggers)?;
                 }
-                (None, None) => {
-                    restore_foreign_keys(&mut conn)?;
-                    apply_triggers(&mut conn, &triggers)?;
-                }
+                None => restore_foreign_keys(&mut conn)?,
             }
             let _ = conn.query_drop("SET FOREIGN_KEY_CHECKS = 1");
             let _ = conn.query_drop("SET UNIQUE_CHECKS = 1");
@@ -255,9 +218,8 @@ fn load_and_finalize<R: Read>(
     reader: &mut DumpReader<R>,
     pool: &LoaderPool,
     conn: &mut Conn,
-    keep_tables: bool,
-) -> Result<(usize, u64, Option<Vec<ForeignKeyDef>>, Vec<TriggerDef>)> {
-    let loaded = load_records(reader, pool, conn, keep_tables)?;
+) -> Result<(usize, u64, Option<Vec<ForeignKeyDef>>)> {
+    let loaded = load_records(reader, pool, conn)?;
 
     // Restore preserved rows before post-processing (import order). Backups were
     // created by load_records just before each table was dropped.
@@ -284,7 +246,7 @@ fn load_and_finalize<R: Read>(
         conn.query_drop(statement)?;
     }
 
-    Ok((loaded.tables, loaded.rows, loaded.foreign_keys, loaded.triggers))
+    Ok((loaded.tables, loaded.rows, loaded.foreign_keys))
 }
 
 /// Result of consuming a dump stream.
@@ -299,8 +261,6 @@ struct Loaded {
     /// no `ForeignKeys` record (older/foreign producers); `Some` (possibly
     /// empty) when it did, in which case it is authoritative.
     foreign_keys: Option<Vec<ForeignKeyDef>>,
-    /// Source-schema triggers to recreate after load.
-    triggers: Vec<TriggerDef>,
 }
 
 /// Drive the dump records through the loader pool.
@@ -308,7 +268,6 @@ fn load_records<R: Read>(
     reader: &mut DumpReader<R>,
     pool: &LoaderPool,
     conn: &mut Conn,
-    keep_tables: bool,
 ) -> Result<Loaded> {
     let mut preserves: Vec<PreserveRule> = Vec::new();
     let mut schemas: HashMap<String, Arc<Vec<ColumnDef>>> = HashMap::new();
@@ -317,7 +276,6 @@ fn load_records<R: Read>(
     let mut sets: Vec<SetRule> = Vec::new();
     let mut after_statements: Vec<String> = Vec::new();
     let mut foreign_keys: Option<Vec<ForeignKeyDef>> = None;
-    let mut triggers: Vec<TriggerDef> = Vec::new();
     let mut tables_loaded = 0usize;
     let mut rows_loaded = 0u64;
     // Rows sent but not inserted (silent duplicate-key skips), summed per table.
@@ -332,9 +290,6 @@ fn load_records<R: Read>(
             DumpRecord::ManifestV3 { .. } => {
                 unreachable!("DumpReader::next_record turns v3 manifests into Manifest")
             }
-            DumpRecord::TableV4 { .. } => {
-                unreachable!("DumpReader::next_record turns v4 tables into Table")
-            }
             DumpRecord::Table {
                 name,
                 columns,
@@ -348,10 +303,6 @@ fn load_records<R: Read>(
                     preserves.iter().filter(|r| r.table == name).collect();
                 if !rules.is_empty() {
                     backup_preserved_rows(conn, &name, &rules, &TableKeys::from_schema(&columns, &indexes))?;
-                }
-
-                if keep_tables {
-                    crate::sql::ensure_table_matches(conn, &name, &columns)?;
                 }
 
                 let cols = Arc::new(columns);
@@ -415,9 +366,6 @@ fn load_records<R: Read>(
             DumpRecord::ForeignKeys { foreign_keys: fks } => {
                 foreign_keys = Some(fks);
             }
-            DumpRecord::Triggers { triggers: t } => {
-                triggers = t;
-            }
             DumpRecord::End => {
                 saw_end = true;
                 break;
@@ -455,7 +403,6 @@ fn load_records<R: Read>(
         sets,
         after_statements,
         foreign_keys,
-        triggers,
     })
 }
 

@@ -12,18 +12,6 @@ use jibs_protocol::{
 /// Sentinel string emitted by the resolver for `{unique()}` interpolation.
 const UNIQUE_SENTINEL: &str = "{unique()}";
 
-/// The `{unique()}` counter, shared by every writer in the process. A table is
-/// read by several writers — one per traversal query, one per full-table
-/// worker — and a counter per writer started each of them at 0, so a table
-/// reached twice got the same "unique" values twice and the client dropped the
-/// second lot on its UNIQUE index.
-static UNIQUE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// The next `{unique()}` value: never handed out twice in one run.
-fn next_unique() -> u64 {
-    UNIQUE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-}
-
 /// Pre-computed anonymization action for a column
 #[derive(Clone, Copy)]
 enum AnonAction {
@@ -65,6 +53,8 @@ pub struct TsvWriter {
     faker_pools_raw: Vec<Vec<String>>,
     /// RNG for faker selection
     rng: rand::rngs::ThreadRng,
+    /// Counter for unique faker values (monotonically increasing per writer)
+    unique_counter: u64,
 }
 
 impl TsvWriter {
@@ -184,6 +174,7 @@ impl TsvWriter {
             faker_pools,
             faker_pools_raw,
             rng: rand::thread_rng(),
+            unique_counter: 0,
         }
     }
 
@@ -238,9 +229,8 @@ impl TsvWriter {
                     if pool.is_empty() {
                         self.buffer.extend_from_slice(b"\\N");
                     } else {
-                        let counter = next_unique();
-                        let base = &pool[counter as usize % pool.len()];
-                        let counter_str = counter.to_string();
+                        let base = &pool[self.unique_counter as usize % pool.len()];
+                        let counter_str = self.unique_counter.to_string();
                         let unique_value = base.replace(UNIQUE_SENTINEL, &counter_str);
                         if is_binary {
                             self.buffer
@@ -248,6 +238,7 @@ impl TsvWriter {
                         } else {
                             escape_tsv_bytes(&mut self.buffer, unique_value.as_bytes());
                         }
+                        self.unique_counter += 1;
                     }
                 }
                 None => {
@@ -410,14 +401,6 @@ mod tests {
             pick_action(&rules, |_| false),
             Some(AnonAction::Faker(3))
         ));
-    }
-
-    #[test]
-    fn unique_values_are_not_repeated_across_writers() {
-        // Two writers stand for two queries against the same table.
-        let from_one: Vec<u64> = (0..3).map(|_| next_unique()).collect();
-        let from_other: Vec<u64> = (0..3).map(|_| next_unique()).collect();
-        assert!(from_one.iter().all(|v| !from_other.contains(v)));
     }
 
     #[test]

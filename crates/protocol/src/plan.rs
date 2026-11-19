@@ -386,30 +386,6 @@ pub struct ForeignKeyDef {
     pub delete_rule: String,
 }
 
-/// A trigger in the source schema, recreated on the target after all data is
-/// loaded (so it doesn't fire during the load). Carried as its parts rather
-/// than `SHOW CREATE TRIGGER` text so the target's statement carries no
-/// `DEFINER`: the source's definer usually doesn't exist locally, and naming
-/// another user needs privileges a local import doesn't have.
-#[derive(Debug, Clone, Default, Encode, Decode)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct TriggerDef {
-    /// Trigger name (unique per schema).
-    pub name: String,
-    /// Table the trigger is attached to.
-    pub table: String,
-    /// `BEFORE` or `AFTER`.
-    pub timing: String,
-    /// `INSERT`, `UPDATE` or `DELETE`.
-    pub event: String,
-    /// The trigger body (`ACTION_STATEMENT`): a single statement or a
-    /// `BEGIN ... END` block.
-    pub statement: String,
-    /// `sql_mode` the trigger was created under; its body is parsed and runs
-    /// with it, so it is recreated under the same mode.
-    pub sql_mode: String,
-}
-
 /// A secondary index on a table. The PRIMARY KEY is never represented here — it
 /// is emitted from [`ColumnDef::is_primary_key`]; this covers every other index
 /// (unique and non-unique), which the loader would otherwise drop.
@@ -466,9 +442,4 @@ pub struct TableOptions {
     pub collation: Option<String>,
     /// Row format, when the table pins one (e.g. `DYNAMIC`).
     pub row_format: Option<String>,
-    /// The source table's next AUTO_INCREMENT value. Without it the copy's
-    /// counter lands at max(id)+1 of the imported rows, which for a subset
-    /// import is usually far below the source's — so new local rows reuse ids
-    /// (and sequence-driven numbers) that already exist upstream.
-    pub auto_increment: Option<u64>,
 }

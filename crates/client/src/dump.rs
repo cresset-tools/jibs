@@ -24,7 +24,7 @@ use bincode::{Decode, Encode};
 use jibs_protocol::framing::{bincode_config, write_message_noflush};
 use jibs_protocol::{
     AnonymizeRule, AnonymizeTarget, ColumnDef, CompressionMode, ForeignKeyDef, IndexDef,
-    PreserveMatch, PreserveRule, SetRule, TableOptions, TriggerDef,
+    PreserveMatch, PreserveRule, SetRule, TableOptions,
 };
 
 /// Magic bytes at the start of every `.jibsdump` file.
@@ -39,10 +39,6 @@ pub(crate) const MAGIC: &[u8; 8] = b"JIBSDUMP";
 /// v4 added the preserve match clause: [`DumpRecord::Manifest`] moved to the
 /// end of the enum with the new [`PreserveRule`]; the v3 manifest decodes as
 /// [`DumpRecord::ManifestV3`], so v4 builds still read v3 dumps.
-/// v5 added `auto_increment` to the table options, so a load restores the
-/// source's AUTO_INCREMENT counters: [`DumpRecord::Table`] moved to the end of
-/// the enum; the v4 table record decodes as [`DumpRecord::TableV4`]. v5 also
-/// added [`DumpRecord::Triggers`].
 ///
 /// Compatibility policy: a jibs build loads dumps of its own version and the one
 /// before it (N and N-1), so producers and consumers of published dumps can
@@ -52,10 +48,10 @@ pub(crate) const MAGIC: &[u8; 8] = b"JIBSDUMP";
 /// `test/dump-fixture.jibs`): on a bump, add the new version's fixture and keep
 /// the previous one loading. v3 is the first version under this policy; nothing
 /// reads v1 or v2.
-pub(crate) const FORMAT_VERSION: u16 = 5;
+pub(crate) const FORMAT_VERSION: u16 = 4;
 
 /// Oldest format version this build still reads (N-1, see above).
-pub(crate) const MIN_FORMAT_VERSION: u16 = 4;
+pub(crate) const MIN_FORMAT_VERSION: u16 = 3;
 
 /// Length of the fixed preamble: 8-byte magic + 2-byte version.
 const PREAMBLE_LEN: usize = 10;
@@ -76,14 +72,17 @@ pub(crate) enum DumpRecord {
     /// read from v3 dumps, and [`DumpReader::next_record`] turns it into a
     /// [`DumpRecord::Manifest`], so callers never see it.
     ManifestV3 { preserves: Vec<PreserveRuleV3> },
-    /// The v4 table record (options without `auto_increment`). Frozen: only
-    /// read from v4 dumps, and [`DumpReader::next_record`] turns it into a
-    /// [`DumpRecord::Table`], so callers never see it.
-    TableV4 {
+    /// A table's schema. Emitted once per table, before any of its chunks.
+    Table {
         name: String,
         columns: Vec<ColumnDef>,
+        /// Secondary indexes (unique + non-unique); PRIMARY lives in `columns`.
         indexes: Vec<IndexDef>,
-        options: TableOptionsV4,
+        /// Table-level options (engine, default charset/collation, row format).
+        options: TableOptions,
+        /// Anonymization rules that shaped the DDL (e.g. columns forced
+        /// nullable). The data is already anonymized server-side; these are
+        /// carried only so `load` recreates the exact same table definition.
         anon_rules: Option<Vec<DumpAnonymizeRule>>,
     },
     /// One chunk of TSV rows for a table. `data` is stored per `compression`
@@ -118,34 +117,6 @@ pub(crate) enum DumpRecord {
     /// table is dropped and recreated. Last in the enum (v4) so the variant
     /// indices of the v3 records stay the same.
     Manifest { preserves: Vec<PreserveRule> },
-    /// A table's schema. Emitted once per table, before any of its chunks.
-    /// Last in the enum (v5) so the variant indices of the v4 records stay the
-    /// same.
-    Table {
-        name: String,
-        columns: Vec<ColumnDef>,
-        /// Secondary indexes (unique + non-unique); PRIMARY lives in `columns`.
-        indexes: Vec<IndexDef>,
-        /// Table-level options (engine, default charset/collation, row
-        /// format, AUTO_INCREMENT counter).
-        options: TableOptions,
-        /// Anonymization rules that shaped the DDL (e.g. columns forced
-        /// nullable). The data is already anonymized server-side; these are
-        /// carried only so `load` recreates the exact same table definition.
-        anon_rules: Option<Vec<DumpAnonymizeRule>>,
-    },
-    /// Triggers from the source schema (none on ignored tables), recreated after
-    /// all data is loaded. Written once (even empty), just before `End`.
-    Triggers { triggers: Vec<TriggerDef> },
-}
-
-/// Table options as v4 dumps encode them (frozen layout): no `auto_increment`.
-#[derive(Debug, Clone, Encode, Decode)]
-pub(crate) struct TableOptionsV4 {
-    pub(crate) engine: Option<String>,
-    pub(crate) charset: Option<String>,
-    pub(crate) collation: Option<String>,
-    pub(crate) row_format: Option<String>,
 }
 
 /// A preserve rule as v3 dumps encode it (frozen layout).
@@ -298,16 +269,6 @@ impl<W: Write> DumpWriter<W> {
         Ok(())
     }
 
-    /// Write the source schema's triggers, recreated on load after all data is
-    /// in place.
-    pub(crate) fn write_triggers(&mut self, triggers: &[TriggerDef]) -> Result<()> {
-        let rec = DumpRecord::Triggers {
-            triggers: triggers.to_vec(),
-        };
-        write_message_noflush(&mut self.inner, &rec)?;
-        Ok(())
-    }
-
     /// Emit the terminator and flush the underlying writer.
     pub(crate) fn finish(mut self) -> Result<()> {
         write_message_noflush(&mut self.inner, &DumpRecord::End)?;
@@ -391,27 +352,6 @@ impl<R: Read> DumpReader<R> {
                         match_key: PreserveMatch::Replace,
                     })
                     .collect(),
-            },
-            DumpRecord::TableV4 {
-                name,
-                columns,
-                indexes,
-                options,
-                anon_rules,
-            } => DumpRecord::Table {
-                name,
-                columns,
-                indexes,
-                options: TableOptions {
-                    engine: options.engine,
-                    charset: options.charset,
-                    collation: options.collation,
-                    row_format: options.row_format,
-                    // v4 didn't carry counters: the loaded table's counter
-                    // ends up at max(id)+1, as it did under v4.
-                    auto_increment: None,
-                },
-                anon_rules,
             },
             rec => rec,
         }))
@@ -565,14 +505,6 @@ mod tests {
     }
 
     #[test]
-    fn rejects_versions_older_than_min() {
-        let mut bytes = MAGIC.to_vec();
-        bytes.extend_from_slice(&(MIN_FORMAT_VERSION - 1).to_le_bytes());
-        let err = expect_err(open(bytes));
-        assert!(err.to_string().contains("unsupported"));
-    }
-
-    #[test]
     fn roundtrip_manifest_and_post_process() {
         let preserves = vec![PreserveRule {
             table: "users".to_string(),
@@ -667,38 +599,6 @@ mod tests {
         assert!(matches!(r.next_record().unwrap().unwrap(), DumpRecord::End));
     }
 
-    #[test]
-    fn roundtrip_triggers() {
-        let triggers = vec![jibs_protocol::TriggerDef {
-            name: "trg_products_after_insert".to_string(),
-            table: "products".to_string(),
-            timing: "AFTER".to_string(),
-            event: "INSERT".to_string(),
-            statement: "INSERT INTO products_cl (entity_id) VALUES (NEW.id)".to_string(),
-            sql_mode: "ANSI_QUOTES".to_string(),
-        }];
-
-        let mut buf = Vec::new();
-        {
-            let mut w = DumpWriter::new(&mut buf).unwrap();
-            w.write_foreign_keys(&[]).unwrap();
-            w.write_triggers(&triggers).unwrap();
-            w.finish().unwrap();
-        }
-
-        let mut r = open(buf).unwrap();
-        assert!(matches!(r.next_record().unwrap().unwrap(), DumpRecord::ForeignKeys { .. }));
-        match r.next_record().unwrap().unwrap() {
-            DumpRecord::Triggers { triggers } => {
-                assert_eq!(triggers.len(), 1);
-                assert_eq!(triggers[0].name, "trg_products_after_insert");
-                assert_eq!(triggers[0].sql_mode, "ANSI_QUOTES");
-            }
-            other => panic!("expected Triggers, got {other:?}"),
-        }
-        assert!(matches!(r.next_record().unwrap().unwrap(), DumpRecord::End));
-    }
-
     /// A stream truncated mid-record must be an error, not a clean end.
     #[test]
     fn truncation_is_an_error_not_clean_eof() {
@@ -765,7 +665,6 @@ mod tests {
     const FIXTURES: &[(u16, &[u8])] = &[
         (3, include_bytes!("../tests/fixtures/dump-v3.jibsdump")),
         (4, include_bytes!("../tests/fixtures/dump-v4.jibsdump")),
-        (5, include_bytes!("../tests/fixtures/dump-v5.jibsdump")),
     ];
 
     #[test]
@@ -789,7 +688,6 @@ mod tests {
                 .unwrap_or_else(|e| panic!("v{version} fixture rejected: {e:#}"));
             let (mut manifest, mut tables, mut chunks, mut table_ends) = (0, 0, 0, 0);
             let (mut post_process, mut foreign_keys, mut end) = (0, 0, 0);
-            let (mut counters, mut triggers) = (0, 0);
             while let Some(rec) = r
                 .next_record()
                 .unwrap_or_else(|e| panic!("v{version} fixture failed to decode: {e:#}"))
@@ -809,20 +707,9 @@ mod tests {
                     DumpRecord::ManifestV3 { .. } => {
                         panic!("v{version}: ManifestV3 must be normalized by next_record")
                     }
-                    DumpRecord::TableV4 { .. } => {
-                        panic!("v{version}: TableV4 must be normalized by next_record")
-                    }
-                    DumpRecord::Table {
-                        name,
-                        anon_rules,
-                        options,
-                        ..
-                    } => {
+                    DumpRecord::Table { name, anon_rules, .. } => {
                         if name == "users" {
                             assert!(anon_rules.is_some_and(|r| !r.is_empty()));
-                        }
-                        if options.auto_increment.is_some() {
-                            counters += 1;
                         }
                         tables += 1;
                     }
@@ -836,24 +723,11 @@ mod tests {
                         assert!(!fks.is_empty());
                         foreign_keys += 1;
                     }
-                    DumpRecord::Triggers { triggers: t } => {
-                        assert!(!t.is_empty());
-                        triggers += 1;
-                    }
                     DumpRecord::End => end += 1,
                 }
             }
-            // v4 had no Triggers record; v5 writes it unconditionally.
-            assert_eq!(triggers, usize::from(*version >= 5), "v{version}");
             assert_eq!((manifest, post_process, foreign_keys, end), (1, 1, 1, 1), "v{version}");
-            // v5's fixture also has the counter-gap seed's tables.
-            assert_eq!(tables, table_ends, "v{version}");
-            assert!(tables >= 8, "v{version} fixture has {tables} tables");
-            if *version >= 5 {
-                assert!(counters > 0, "v{version} fixture carries no AUTO_INCREMENT counters");
-            } else {
-                assert_eq!(counters, 0, "v{version} decoded with counters it never had");
-            }
+            assert_eq!((tables, table_ends), (8, 8), "v{version}");
             assert!(chunks > 0, "v{version} fixture has no data chunks");
         }
     }
