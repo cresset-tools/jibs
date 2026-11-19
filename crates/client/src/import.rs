@@ -23,7 +23,9 @@ use crate::protocol::{perform_handshake, run_protocol, send_message, ProtocolCon
 use crate::report::display_report;
 use crate::resolver::{self, LimitOverride, ResolvedGetFunction};
 use crate::server_binary;
-use crate::ssh::{get_server_path, SshConfig, SshSession};
+use crate::ssh::{
+    get_server_path, shell_quote, SshConfig, SshSession, RESOLVE_CACHE_DIR_COMMAND,
+};
 pub struct GetInvocation {
     pub func_name: String,
     pub args: HashMap<String, String>,
@@ -525,7 +527,9 @@ pub(crate) fn redact_mysql_url(url: &str) -> String {
 }
 
 
-/// Deploy the server binary to the remote host if needed
+/// Deploy the server binary to the remote host if needed.
+///
+/// Returns the shell-quoted remote path, ready to run as a command.
 async fn deploy_server(session: &SshSession) -> Result<String> {
     // Detect remote architecture
     let (code, arch_output, _) = session
@@ -544,18 +548,34 @@ async fn deploy_server(session: &SshSession) -> Result<String> {
     let server_binary = server_binary::get_server_binary(arch);
 
     if let Some(binary) = server_binary {
+        // The binary lives in the remote user's cache directory rather than
+        // /tmp: it survives tmp cleaners, and nobody else can plant a file at
+        // the path we are about to execute.
+        let (code, cache_dir, stderr) = session
+            .exec(RESOLVE_CACHE_DIR_COMMAND)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to resolve remote cache directory: {}", e))?;
+
+        if code != 0 || !cache_dir.starts_with('/') {
+            return Err(anyhow::anyhow!(
+                "Failed to create remote cache directory: {}",
+                stderr.trim()
+            ));
+        }
+
         // Compute hash-based path for CAS deployment
-        let server_path = get_server_path(binary);
+        let server_path = get_server_path(&cache_dir, binary);
+        let server_command = shell_quote(&server_path);
 
         // Check if binary already exists at this path
         let (code, _, _) = session
-            .exec(&format!("test -x {}", server_path))
+            .exec(&format!("test -x {}", server_command))
             .await
             .map_err(|e| anyhow::anyhow!("Failed to check for server: {}", e))?;
 
         if code == 0 {
             info!("Server already deployed: {}", server_path);
-            return Ok(server_path);
+            return Ok(server_command);
         }
 
         // Upload the binary
@@ -571,7 +591,7 @@ async fn deploy_server(session: &SshSession) -> Result<String> {
             .map_err(|e| anyhow::anyhow!("Failed to upload server: {}", e))?;
 
         info!("Server deployed successfully");
-        return Ok(server_path);
+        return Ok(server_command);
     }
 
     // No server available

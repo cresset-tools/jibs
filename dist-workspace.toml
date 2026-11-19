@@ -123,10 +123,3 @@ cmake = '*'
 
 [dist.binaries]
 "*" = ["jibs"]
-
-# dist 0.32.0 builds aarch64-apple-darwin on `macos-14` by default. GitHub
-# retired that image on 2026-11-02 (jibs 0.9.0 shipped without a macOS binary
-# because of it), so pin a supported one. Releases stay on GitHub-hosted
-# runners, not the self-hosted Mac mini.
-[dist.github-custom-runners]
-aarch64-apple-darwin = "macos-15"

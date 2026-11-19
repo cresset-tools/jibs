@@ -148,7 +148,8 @@ impl SshSession {
     pub async fn upload_file(&self, local_data: &[u8], remote_path: &str) -> Result<()> {
         let mut args = self.base_ssh_args();
         args.push(self.user_host());
-        args.push(format!("cat > {} && chmod +x {}", remote_path, remote_path));
+        let quoted = shell_quote(remote_path);
+        args.push(format!("cat > {quoted} && chmod +x {quoted}"));
 
         let mut child = Command::new("ssh")
             .args(&args)
@@ -471,8 +472,81 @@ pub fn compute_hash(data: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
-/// Get the remote path for the server binary based on its hash
-pub fn get_server_path(server_binary: &[u8]) -> String {
+/// Remote command that creates the per-user jibs cache directory and prints
+/// its absolute path: `$XDG_CACHE_HOME/jibs`, or `~/.cache/jibs` when
+/// `XDG_CACHE_HOME` is unset or not absolute (the XDG Base Directory rules).
+///
+/// Wrapped in `sh -c` so it does not depend on the remote login shell.
+pub const RESOLVE_CACHE_DIR_COMMAND: &str = concat!(
+    r#"sh -c 'case "${XDG_CACHE_HOME:-}" in /*) d=$XDG_CACHE_HOME ;; *) d=$HOME/.cache ;; esac; "#,
+    r#"d=$d/jibs; mkdir -p "$d" && printf %s "$d"'"#,
+);
+
+/// Get the remote path for the server binary inside `cache_dir`, named after
+/// its hash so that different builds never collide.
+pub fn get_server_path(cache_dir: &str, server_binary: &[u8]) -> String {
     let hash = compute_hash(server_binary);
-    format!("/tmp/jibs-{}", &hash[0..16])
+    format!("{}/jibs-{}", cache_dir.trim_end_matches('/'), &hash[0..16])
+}
+
+/// Quote a string so a POSIX shell reads it as a single word.
+pub fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn server_path_is_content_addressed_inside_the_cache_dir() {
+        let path = get_server_path("/home/deploy/.cache/jibs", b"binary");
+        let hash = compute_hash(b"binary");
+        assert_eq!(path, format!("/home/deploy/.cache/jibs/jibs-{}", &hash[..16]));
+        assert_eq!(get_server_path("/home/deploy/.cache/jibs/", b"binary"), path);
+        assert_ne!(get_server_path("/home/deploy/.cache/jibs", b"other"), path);
+    }
+
+    #[test]
+    fn shell_quote_survives_spaces_and_quotes() {
+        assert_eq!(shell_quote("/a b/c"), "'/a b/c'");
+        assert_eq!(shell_quote("it's"), r"'it'\''s'");
+    }
+
+    /// Run the resolver the way the remote login shell would, against a
+    /// throwaway environment.
+    fn resolve(home: &std::path::Path, xdg: Option<&str>) -> String {
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg("-c").arg(RESOLVE_CACHE_DIR_COMMAND).env("HOME", home);
+        match xdg {
+            Some(v) => cmd.env("XDG_CACHE_HOME", v),
+            None => cmd.env_remove("XDG_CACHE_HOME"),
+        };
+        let out = cmd.output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).unwrap()
+    }
+
+    #[test]
+    fn cache_dir_follows_xdg() {
+        let tmp = std::env::temp_dir().join(format!("jibs-cache-dir-test-{}", std::process::id()));
+        let home = tmp.join("home dir");
+        std::fs::create_dir_all(&home).unwrap();
+
+        let default = format!("{}/.cache/jibs", home.display());
+        assert_eq!(resolve(&home, None), default);
+        assert!(std::path::Path::new(&default).is_dir());
+
+        // Relative values are invalid per the spec and must be ignored.
+        assert_eq!(resolve(&home, Some("relative")), default);
+        assert_eq!(resolve(&home, Some("")), default);
+
+        let xdg = tmp.join("xdg");
+        assert_eq!(
+            resolve(&home, Some(xdg.to_str().unwrap())),
+            format!("{}/jibs", xdg.display())
+        );
+
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
 }

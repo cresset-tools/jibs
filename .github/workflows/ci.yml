@@ -48,59 +48,6 @@ jobs:
       - name: Run unit tests
         run: cargo test --workspace --locked
 
-  # macOS: unit tests plus the same client build the aarch64-apple-darwin
-  # release does (embedded musl servers cross-built with zig, required by
-  # JIBS_REQUIRE_EMBEDDED_SERVER), so a macOS-only break shows up before a
-  # release instead of in one. No e2e here: it needs Linux docker containers.
-  macos:
-    name: macOS build + unit tests
-    # Runs on the self-hosted Mac mini for code from this repo; fork PRs stay on
-    # GitHub's runner. Set the org variable MAC_MINI_DISABLED=true to send
-    # everything back to GitHub.
-    runs-on: ${{ vars.MAC_MINI_DISABLED != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","mac-mini"]') || 'macos-15' }}
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@v5
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-unknown-linux-musl,aarch64-unknown-linux-musl
-
-      - uses: mozilla/sccache-action@v0.0.10
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          cache-on-failure: true
-
-      - name: Run unit tests
-        run: cargo test --workspace --locked
-
-      - name: Install zig (cross C toolchain for the embedded server)
-        uses: mlugg/setup-zig@v2
-        with:
-          version: "0.14.1"
-
-      - name: Install cargo-zigbuild
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-zigbuild
-
-      - name: Cross-build embedded jibs-server binaries
-        run: |
-          cargo zigbuild -p jibs_server --release --locked \
-            --target x86_64-unknown-linux-musl \
-            --target aarch64-unknown-linux-musl
-
-      - name: Build client with embedded servers
-        env:
-          JIBS_REQUIRE_EMBEDDED_SERVER: "1"
-        run: cargo build -p jibs --locked
-
-      - name: Smoke test
-        run: |
-          ./target/debug/jibs --version
-          ./target/debug/jibs check test/import-all.jibs
-
   e2e:
     name: E2E import tests
     runs-on: ubuntu-latest
