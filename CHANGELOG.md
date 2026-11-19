@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.0](https://github.com/cresset-tools/jibs/compare/jibs-v0.9.1...jibs-v0.10.0) (2026-11-19)
+
+
+### Features
+
+* **jibs:** keep the uploaded server in the remote user's cache directory ([4af5009](https://github.com/cresset-tools/jibs/commit/4af500938510011d70cea295ee912a1ac5bb763d))
+
 ## [0.9.1](https://github.com/cresset-tools/jibs/compare/jibs-v0.9.0...jibs-v0.9.1) (2026-11-19)
 
 
