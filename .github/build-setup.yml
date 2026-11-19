@@ -11,6 +11,12 @@
 # missing, so a release can never ship a client with empty embedded servers
 # (locally, a missing binary is only a build warning).
 
+# jibs pins no toolchain (no rust-toolchain.toml), so make sure rustup has a
+# default one; the self-hosted Mac mini's rustup may have none.
+- name: Ensure a default Rust toolchain
+  shell: bash
+  run: rustup show active-toolchain >/dev/null 2>&1 || rustup default stable
+
 - name: Install zig (cross C toolchain for the embedded server)
   uses: mlugg/setup-zig@v2
   with:
