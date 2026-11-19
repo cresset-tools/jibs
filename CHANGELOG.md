@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.1](https://github.com/cresset-tools/jibs/compare/jibs-v0.9.0...jibs-v0.9.1) (2026-11-19)
+
+
+### Bug Fixes
+
+* **jibs:** build the macOS release binary on macos-15 ([d786637](https://github.com/cresset-tools/jibs/commit/d786637c6bb0ec744309dc0458fe7a076a6eb095))
+
 ## [0.9.0](https://github.com/cresset-tools/jibs/compare/jibs-v0.8.0...jibs-v0.9.0) (2026-11-18)
 
 
