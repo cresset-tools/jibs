@@ -30,7 +30,7 @@ docker-compose ps
 # Optional: clear cached server binaries to reclaim space. Not needed for
 # correctness — binaries are content-addressed (a rebuilt server uploads under
 # a new hash) and the protocol handshake rejects version mismatches loudly.
-ssh -p 2222 -i test/ssh-keys/id_ed25519 -o StrictHostKeyChecking=no testuser@localhost "rm -f /tmp/jibs-*"
+ssh -p 2222 -i test/ssh-keys/id_ed25519 -o StrictHostKeyChecking=no testuser@localhost 'rm -rf "${XDG_CACHE_HOME:-$HOME/.cache}/jibs"'
 
 # Basic aggregate test (with parallel loading)
 cargo run -p jibs -- import test/import-aggregate.jibs \
