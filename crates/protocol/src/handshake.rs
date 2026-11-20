@@ -29,8 +29,7 @@ pub const PROTOCOL_MAGIC: [u8; 4] = *b"JIBS";
 /// - v2: Init gains dry_run; ServerMessage gains DryRunReport
 /// - v3: AnonymizeRule gains condition (`anonymize t where "..."`)
 /// - v4: PreserveRule gains match_key (`preserve t match unique where "..."`)
-/// - v5: TableOptions gains auto_increment; Done gains triggers
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// Total preamble length in bytes (magic + version)
 pub const PREAMBLE_LEN: usize = 8;
