@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.11.0](https://github.com/cresset-tools/jibs/compare/jibs-v0.10.0...jibs-v0.11.0) (2026-11-20)
+
+
+### ⚠ BREAKING CHANGES
+
+* **jibs:** the .jibsdump format is now v5. Dumps written by this version cannot be loaded by older jibs; upgrade the loading side first. This version still loads v4 dumps, but no longer v3.
+
+### Bug Fixes
+
+* **jibs:** carry AUTO_INCREMENT counters through import and load ([f87c944](https://github.com/cresset-tools/jibs/commit/f87c944e496a17c90b43b6ed32a7ac7432359bde))
+* **jibs:** recreate source triggers after import and load ([5f13b31](https://github.com/cresset-tools/jibs/commit/5f13b3153f1155bdd946a7be3316dde7742316b9))
+
 ## [0.10.0](https://github.com/cresset-tools/jibs/compare/jibs-v0.9.1...jibs-v0.10.0) (2026-11-19)
 
 
