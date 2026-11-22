@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.1](https://github.com/cresset-tools/jibs/compare/jibs-v0.11.0...jibs-v0.11.1) (2026-11-22)
+
+
+### Bug Fixes
+
+* **jibs:** update url to 2.5.9 for RUSTSEC-2026-0592 ([b8317da](https://github.com/cresset-tools/jibs/commit/b8317daad278056d4ccbe9af563b7492bad20ce6))
+
 ## [0.11.0](https://github.com/cresset-tools/jibs/compare/jibs-v0.10.0...jibs-v0.11.0) (2026-11-22)
 
 
