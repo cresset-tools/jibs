@@ -340,10 +340,17 @@ impl MySqlConnection {
             // MySQL 8 caches the latter for up to a day, and even uncached it
             // reports one less than the real counter until the table is first
             // opened after a server restart.
-            let create: Option<(String, String)> = self
+            //
+            // Read the DDL by position, not as a two-column row: for a view the
+            // statement answers four columns (the view, its definition, and
+            // two connection settings), and Magento has one in every install
+            // (`inventory_stock_1`). A view has no counter.
+            let create: Option<Row> = self
                 .conn
                 .query_first(format!("SHOW CREATE TABLE `{}`", escape_identifier(table)))?;
-            opts.auto_increment = create.and_then(|(_, ddl)| auto_increment_from_ddl(&ddl));
+            opts.auto_increment = create
+                .and_then(|row| row.get_opt::<String, _>(1).and_then(|ddl| ddl.ok()))
+                .and_then(|ddl| auto_increment_from_ddl(&ddl));
         }
 
         self.table_options.insert(table.to_string(), opts.clone());
