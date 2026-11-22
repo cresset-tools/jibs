@@ -884,7 +884,31 @@ fn run_aggregate_bfs(
         }
     }
 
-    // Send TableDone for all aggregate tables that had rows
+    // A table the traversal reached but found no rows in still has to exist
+    // locally: the schema is otherwise only sent with a table's first row, and
+    // without it the table would be missing after the import (and every
+    // foreign key into it would fail to be restored). In table-name order, so
+    // the stream is the same on every run. Its TableDone follows below.
+    for table in &all_table_names_vec {
+        if !aggregate_tables.contains(table) || schemas_sent.contains(table) {
+            continue;
+        }
+        // An excluded table can be marked as reached too; the main thread has
+        // already sent its structure.
+        if plan.excluded_tables.contains(table) || plan.ignored_tables.contains(table) {
+            continue;
+        }
+        tx.send(ChannelMessage::Control(ServerMessage::Schema {
+            table_id: table_ids[table],
+            columns: conn.get_column_defs(table)?,
+            indexes: conn.get_indexes(table)?,
+            options: conn.get_table_options(table)?,
+        }))
+        .map_err(|_| ServerError::Protocol("Channel closed".to_string()))?;
+        table_row_counts.entry(table.clone()).or_default();
+    }
+
+    // Send TableDone for every table the traversal reached
     for (table, row_count) in &table_row_counts {
         tx.send(ChannelMessage::Control(ServerMessage::TableDone {
             table_id: table_ids[table],
