@@ -1011,6 +1011,7 @@ anything connects.
 | `--dry-run` | Report what would be imported without touching the local database |
 | `--resume` | Resume a previously interrupted import |
 | `--clean` | Discard state from a previous interrupted import and start fresh |
+| `--keep-tables` | Load into the tables that already exist instead of dropping and recreating them (also on `jibs load`) |
 
 `--dry-run` connects to the remote host, classifies every table the way the
 import would (aggregate / full / excluded), and counts how many root rows
@@ -1022,6 +1023,19 @@ tables in the local database; the next import must choose `--resume` or
 `--clean`. Foreign key constraints in the local schema are dropped during an
 import and automatically restored afterwards (or on the next successful run
 after an interruption).
+
+With `--keep-tables` an import does for every table what `get` does for its
+aggregates: a table that already exists locally is left as it is and the
+incoming rows are merged in (a row with the same primary or unique key is
+replaced, other local rows stay), its foreign keys and triggers are not
+touched, and only tables that are missing are created from the source. It is
+meant for a target that was prepared in advance, such as a schema-only copy or
+a filesystem clone of one: creating tables is most of what an import of a
+small subset costs (on a shop with 826 tables, 79 s recreating them against
+2.7 s with `--keep-tables`). Because the tables are kept, their triggers fire
+during the load, and a table whose columns differ from the source's is refused
+with the name of the column; import once without the option to bring the
+schema up to date.
 
 Each imported table keeps the source's AUTO_INCREMENT counter, so new local
 rows don't reuse ids that exist upstream. The source's triggers on imported

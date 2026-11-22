@@ -50,6 +50,8 @@ pub(crate) struct LoadConfig {
     pub(crate) max_message_size: usize,
     /// Discard leftover state from a previous interrupted import before loading.
     pub(crate) clean: bool,
+    /// Load into the tables that already exist instead of recreating them.
+    pub(crate) keep_tables: bool,
 }
 
 /// If `source` is an `http://` or `https://` URL, return it as a string; else
@@ -136,13 +138,28 @@ pub(crate) fn run_load(config: LoadConfig) -> Result<()> {
 
     // Drop existing FK constraints so the pool's parallel DROP/CREATE TABLE
     // don't hit ERROR 1217/1822. Restored after a successful load (same as import).
-    preserve_and_drop_foreign_keys(&mut conn)?;
+    //
+    // With --keep-tables no existing table is recreated, so its foreign keys
+    // and triggers stay as they are; remember which tables exist, so only the
+    // ones this load creates get the source's afterwards (same as `get`).
+    let preexisting_tables: Option<std::collections::HashSet<String>> = if config.keep_tables {
+        Some(
+            conn.query::<String, _>(
+                "SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE()",
+            )?
+            .into_iter()
+            .collect(),
+        )
+    } else {
+        preserve_and_drop_foreign_keys(&mut conn)?;
+        None
+    };
 
     let workers = config.client_parallel.unwrap_or(config.parallel).max(1);
     info!("Creating loader pool with {} workers", workers);
-    let pool = LoaderPool::new(&config.local_mysql, workers, false)?;
+    let pool = LoaderPool::new(&config.local_mysql, workers, config.keep_tables)?;
 
-    let outcome = load_and_finalize(&mut reader, &pool, &mut conn);
+    let outcome = load_and_finalize(&mut reader, &pool, &mut conn, config.keep_tables);
 
     // Always drain the pool before touching FKs so no worker is mid-DDL.
     pool.shutdown();
@@ -153,15 +170,32 @@ pub(crate) fn run_load(config: LoadConfig) -> Result<()> {
             // they rebuild constraints even in a fresh target the preserve path
             // could never capture. Fall back to the target's own captured FKs
             // only for a dump that carries none. Still FK-checks-off here.
-            match source_fks {
-                Some(fks) => {
+            match (&preexisting_tables, source_fks) {
+                (Some(existing), source_fks) => {
+                    let new_fks: Vec<_> = source_fks
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|fk| !existing.contains(&fk.table))
+                        .collect();
+                    apply_foreign_keys(&mut conn, &new_fks)?;
+                    let new_triggers: Vec<_> = triggers
+                        .iter()
+                        .filter(|t| !existing.contains(&t.table))
+                        .cloned()
+                        .collect();
+                    apply_triggers(&mut conn, &new_triggers)?;
+                }
+                (None, Some(fks)) => {
                     apply_foreign_keys(&mut conn, &fks)?;
                     discard_preserved_foreign_keys(&mut conn)?;
+                    // Every loaded table was recreated, dropping its triggers.
+                    apply_triggers(&mut conn, &triggers)?;
                 }
-                None => restore_foreign_keys(&mut conn)?,
+                (None, None) => {
+                    restore_foreign_keys(&mut conn)?;
+                    apply_triggers(&mut conn, &triggers)?;
+                }
             }
-            // Every loaded table was recreated, dropping its triggers.
-            apply_triggers(&mut conn, &triggers)?;
             let _ = conn.query_drop("SET FOREIGN_KEY_CHECKS = 1");
             let _ = conn.query_drop("SET UNIQUE_CHECKS = 1");
             info!("Load complete: {} tables, {} rows", tables, rows);
@@ -221,8 +255,9 @@ fn load_and_finalize<R: Read>(
     reader: &mut DumpReader<R>,
     pool: &LoaderPool,
     conn: &mut Conn,
+    keep_tables: bool,
 ) -> Result<(usize, u64, Option<Vec<ForeignKeyDef>>, Vec<TriggerDef>)> {
-    let loaded = load_records(reader, pool, conn)?;
+    let loaded = load_records(reader, pool, conn, keep_tables)?;
 
     // Restore preserved rows before post-processing (import order). Backups were
     // created by load_records just before each table was dropped.
@@ -273,6 +308,7 @@ fn load_records<R: Read>(
     reader: &mut DumpReader<R>,
     pool: &LoaderPool,
     conn: &mut Conn,
+    keep_tables: bool,
 ) -> Result<Loaded> {
     let mut preserves: Vec<PreserveRule> = Vec::new();
     let mut schemas: HashMap<String, Arc<Vec<ColumnDef>>> = HashMap::new();
@@ -312,6 +348,10 @@ fn load_records<R: Read>(
                     preserves.iter().filter(|r| r.table == name).collect();
                 if !rules.is_empty() {
                     backup_preserved_rows(conn, &name, &rules, &TableKeys::from_schema(&columns, &indexes))?;
+                }
+
+                if keep_tables {
+                    crate::sql::ensure_table_matches(conn, &name, &columns)?;
                 }
 
                 let cols = Arc::new(columns);

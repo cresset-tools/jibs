@@ -174,6 +174,15 @@ struct ImportArgs {
     #[arg(long, conflicts_with_all = ["resume", "clean", "dry_run"])]
     dump_to: Option<PathBuf>,
 
+    /// Load into the tables that already exist instead of dropping and
+    /// recreating them: rows are merged in (REPLACE), existing foreign keys
+    /// and triggers stay, and only tables that are missing are created. For a
+    /// target prepared in advance (a schema-only template, a clone of one):
+    /// creating tables is most of what an import of a small subset costs. A
+    /// table whose columns differ from the source is refused.
+    #[arg(long, conflicts_with_all = ["dry_run", "dump_to"])]
+    keep_tables: bool,
+
     /// [TEST] Simulate crash after N tables imported (for testing resume)
     /// Only available with --features test-utils
     #[cfg(feature = "test-utils")]
@@ -246,6 +255,11 @@ struct LoadArgs {
     /// interrupted import before loading
     #[arg(long)]
     clean: bool,
+
+    /// Load into the tables that already exist instead of dropping and
+    /// recreating them (see `jibs import --keep-tables`)
+    #[arg(long)]
+    keep_tables: bool,
 }
 
 #[derive(Args)]
@@ -341,6 +355,7 @@ async fn run_import(args: ImportArgs) -> Result<()> {
         host_key_verification,
         max_message_size: args.connection.max_message_size,
         collect_metrics: args.connection.metrics,
+        keep_tables: args.keep_tables,
         show_report: args.connection.report,
         #[cfg(feature = "test-utils")]
         fail_after_tables: args.fail_after_tables,
@@ -384,6 +399,7 @@ async fn run_get(args: GetArgs) -> Result<()> {
         host_key_verification,
         max_message_size: args.connection.max_message_size,
         collect_metrics: args.connection.metrics,
+        keep_tables: false,
         show_report: args.connection.report,
         #[cfg(feature = "test-utils")]
         fail_after_tables: None,
@@ -401,6 +417,7 @@ fn run_load(args: LoadArgs) -> Result<()> {
         client_parallel: args.client_parallel,
         max_message_size: args.max_message_size,
         clean: args.clean,
+        keep_tables: args.keep_tables,
     })
 }
 

@@ -188,6 +188,51 @@ pub(crate) fn table_exists(conn: &mut Conn, table: &str) -> Result<bool> {
     Ok(found.is_some())
 }
 
+/// `--keep-tables`: an existing table is loaded into as it is, so it has to
+/// have the columns the source sends, with the same types. A table that does
+/// not exist yet is fine (it is created from the source schema).
+///
+/// Loading into a table that drifted would fail with a LOAD DATA error, or put
+/// a value in a column of another type; refuse when the table's schema
+/// arrives, before any of its rows are loaded, and say which column.
+pub(crate) fn ensure_table_matches(conn: &mut Conn, table: &str, columns: &[ColumnDef]) -> Result<()> {
+    let local: Vec<(String, String)> = conn.exec(
+        "SELECT COLUMN_NAME, COLUMN_TYPE FROM information_schema.COLUMNS \
+         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION",
+        (table,),
+    )?;
+    if local.is_empty() {
+        return Ok(());
+    }
+    if let Some(difference) = column_difference(&local, columns) {
+        anyhow::bail!(
+            "--keep-tables: local table `{table}` does not match the source ({difference}). \
+             Recreate it from the source (an import without --keep-tables does), then retry."
+        );
+    }
+    Ok(())
+}
+
+/// The first way `local` (name, type) differs from the source's columns, if any.
+fn column_difference(local: &[(String, String)], source: &[ColumnDef]) -> Option<String> {
+    for col in source {
+        match local.iter().find(|(name, _)| name == &col.name) {
+            None => return Some(format!("column `{}` is missing locally", col.name)),
+            Some((_, local_type)) if !local_type.eq_ignore_ascii_case(&col.full_type) => {
+                return Some(format!(
+                    "column `{}` is {} locally and {} on the source",
+                    col.name, local_type, col.full_type
+                ));
+            }
+            Some(_) => {}
+        }
+    }
+    local
+        .iter()
+        .find(|(name, _)| !source.iter().any(|c| &c.name == name))
+        .map(|(name, _)| format!("column `{name}` exists only locally"))
+}
+
 /// Execute a set (upsert) block
 ///
 /// Logic:
@@ -306,8 +351,51 @@ fn value_to_sql(value: &Value) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{index_ddl, table_options_ddl};
-    use jibs_protocol::{IndexColumn, IndexDef, IndexKind, TableOptions};
+    use super::{column_difference, index_ddl, table_options_ddl};
+    use jibs_protocol::{ColumnDef, IndexColumn, IndexDef, IndexKind, TableOptions};
+
+    fn source_col(name: &str, full_type: &str) -> ColumnDef {
+        ColumnDef {
+            name: name.into(),
+            type_name: String::new(),
+            full_type: full_type.into(),
+            max_length: None,
+            nullable: true,
+            is_primary_key: false,
+            charset: None,
+            collation: None,
+            flags: Default::default(),
+        }
+    }
+
+    #[test]
+    fn a_kept_table_must_have_the_source_columns() {
+        let source = [source_col("id", "int(10) unsigned"), source_col("email", "varchar(255)")];
+        let local = |cols: &[(&str, &str)]| -> Vec<(String, String)> {
+            cols.iter().map(|(n, t)| (n.to_string(), t.to_string())).collect()
+        };
+        // Same columns, whatever their order or the type's case.
+        assert_eq!(
+            column_difference(&local(&[("email", "VARCHAR(255)"), ("id", "int(10) unsigned")]), &source),
+            None
+        );
+        assert_eq!(
+            column_difference(&local(&[("id", "int(10) unsigned")]), &source).unwrap(),
+            "column `email` is missing locally"
+        );
+        assert_eq!(
+            column_difference(&local(&[("id", "int(10) unsigned"), ("email", "text")]), &source).unwrap(),
+            "column `email` is text locally and varchar(255) on the source"
+        );
+        assert_eq!(
+            column_difference(
+                &local(&[("id", "int(10) unsigned"), ("email", "varchar(255)"), ("note", "text")]),
+                &source
+            )
+            .unwrap(),
+            "column `note` exists only locally"
+        );
+    }
 
     #[test]
     fn table_options_include_auto_increment() {

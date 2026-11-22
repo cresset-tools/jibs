@@ -63,6 +63,9 @@ pub struct ImportConfig {
     pub max_message_size: usize,
     /// Whether to collect and display timing metrics
     pub collect_metrics: bool,
+    /// Load into the tables that already exist instead of dropping and
+    /// recreating them (what `get` does, for a whole import)
+    pub keep_tables: bool,
     /// Whether to show a report of slowest tables after import
     pub show_report: bool,
     /// Debug: simulate crash after N tables (for testing resume)
@@ -241,9 +244,10 @@ pub async fn run_import(config: ImportConfig) -> Result<()> {
     // Allow inserting 0 into auto-increment columns (e.g. store_website.website_id = 0)
     local_conn.query_drop("SET SQL_MODE = 'NO_AUTO_VALUE_ON_ZERO'")?;
 
-    // `get` (aggregates_only) merges into the existing tables: they are kept,
-    // and rows load with REPLACE (see create_table / build_load_data_sql).
-    let upsert = plan.aggregates_only;
+    // `get` (aggregates_only) and `--keep-tables` merge into the existing
+    // tables: they are kept, and rows load with REPLACE (see create_table /
+    // build_load_data_sql).
+    let upsert = plan.aggregates_only || config.keep_tables;
 
     // Capture all FK constraints in the local database, then drop them to
     // prevent MySQL ERROR 1822 during parallel table recreation. They are
@@ -297,6 +301,7 @@ pub async fn run_import(config: ImportConfig) -> Result<()> {
         fail_after_tables: None,
         parallel: config.parallel as u32,
         collect_metrics: config.collect_metrics,
+        keep_tables: config.keep_tables,
     };
     let outcome = run_protocol(server, &mut local_conn, loader_pool, plan, protocol_config, encoder).await;
 
