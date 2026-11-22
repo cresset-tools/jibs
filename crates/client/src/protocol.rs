@@ -41,6 +41,8 @@ pub(crate) struct ProtocolConfig {
     pub(crate) fail_after_tables: Option<usize>,
     pub(crate) parallel: u32,
     pub(crate) collect_metrics: bool,
+    /// `--keep-tables`: load into existing tables instead of recreating them.
+    pub(crate) keep_tables: bool,
 }
 
 struct LoadAccum {
@@ -287,8 +289,9 @@ async fn run_protocol_inner(
     client_metrics: &mut ClientMetrics,
     mut encoder: MessageWriter<()>,
 ) -> Result<()> {
-    // `get` (aggregates_only) merges into existing tables instead of replacing them
-    let upsert = plan.aggregates_only;
+    // `get` (aggregates_only) and `--keep-tables` merge into existing tables
+    // instead of replacing them
+    let upsert = plan.aggregates_only || config.keep_tables;
 
     // Set up checkpointing
     Checkpoint::create(local_conn)?;
@@ -480,6 +483,10 @@ async fn run_protocol_inner(
 
                 // Get anonymization rules for this table
                 let anon_rules = plan.anonymization.get(table).cloned();
+
+                if config.keep_tables {
+                    crate::sql::ensure_table_matches(local_conn, table, &columns)?;
+                }
 
                 // Dispatch CREATE TABLE to loader pool (parallel) or run synchronously
                 if let Some(pool) = loader_pool {
