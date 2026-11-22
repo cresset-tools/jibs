@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.11.0](https://github.com/cresset-tools/jibs/compare/jibs-v0.10.0...jibs-v0.11.0) (2026-11-22)
+
+
+### ⚠ BREAKING CHANGES
+
+* **jibs:** the .jibsdump format is now v5. Dumps written by this version cannot be loaded by older jibs; upgrade the loading side first. This version still loads v4 dumps, but no longer v3.
+
+### Features
+
+* **jibs:** --keep-tables loads an import into the tables that exist ([00a72a5](https://github.com/cresset-tools/jibs/commit/00a72a5487b6ddab4edb234bb49d2fde4bf1d80a))
+
+
+### Bug Fixes
+
+* **jibs:** carry AUTO_INCREMENT counters through import and load ([f87c944](https://github.com/cresset-tools/jibs/commit/f87c944e496a17c90b43b6ed32a7ac7432359bde))
+* **jibs:** create tables an aggregate reaches without finding rows ([69dac51](https://github.com/cresset-tools/jibs/commit/69dac51dd35cac998f60111ca45f7094a1810bbe))
+* **jibs:** keep {unique()} unique across the queries of one import ([d1ee065](https://github.com/cresset-tools/jibs/commit/d1ee065334d441da710edda45493dcbb3ae60234))
+* **jibs:** read table options of a view without panicking ([8920af3](https://github.com/cresset-tools/jibs/commit/8920af340746778eeec47b8a699d2484e2efe6fd))
+* **jibs:** recreate source triggers after import and load ([5f13b31](https://github.com/cresset-tools/jibs/commit/5f13b3153f1155bdd946a7be3316dde7742316b9))
+
 ## [0.10.0](https://github.com/cresset-tools/jibs/compare/jibs-v0.9.1...jibs-v0.10.0) (2026-11-19)
 
 
