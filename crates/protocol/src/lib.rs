@@ -22,5 +22,5 @@ pub use messages::{
 pub use plan::{
     AnonymizeRule, AnonymizeTarget, Assignment, ColumnDef, ColumnFlags, CompressionMode,
     ExecutionPlan, ForeignKeyDef, IndexColumn, IndexDef, IndexKind, PreserveMatch, PreserveRule, Relation,
-    ResolvedAggregate, SetRule, SortDirection, TableInfo, TableOptions, TriggerDef, Value,
+    ResolvedAggregate, SetRule, SortDirection, TableInfo, TableOptions, Value,
 };

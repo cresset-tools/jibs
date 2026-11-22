@@ -4,7 +4,6 @@ use bincode::{Decode, Encode};
 
 use crate::plan::{
     ColumnDef, CompressionMode, ExecutionPlan, ForeignKeyDef, IndexDef, TableInfo, TableOptions,
-    TriggerDef,
 };
 
 /// Timing for a single query executed during aggregate BFS traversal
@@ -155,9 +154,6 @@ pub enum ServerMessage {
         /// or import into a fresh database can reconstruct them. Empty when the
         /// stream was interrupted (a partial run doesn't assert an FK set).
         foreign_keys: Vec<ForeignKeyDef>,
-        /// Triggers on non-ignored source tables, in creation order, recreated
-        /// after loading. Empty when the stream was interrupted.
-        triggers: Vec<TriggerDef>,
     },
     /// Error occurred
     Error { message: String, recoverable: bool },

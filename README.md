@@ -124,7 +124,7 @@ in [vscode-extension/](vscode-extension/).
 
 | Command | Purpose |
 |---------|---------|
-| `jibs import <config>` | Run the import (`--dry-run`, `--resume`, `--clean`, `--keep-tables`, `--parallel N`, `--var k=v`) |
+| `jibs import <config>` | Run the import (`--dry-run`, `--resume`, `--clean`, `--parallel N`, `--var k=v`) |
 | `jibs get <config> -- fn --arg v` | Fetch specific aggregates into the local database |
 | `jibs check <config>` | Parse, resolve, and validate a config without connecting |
 | `jibs plan <config>` | Print the resolved execution plan as JSON |

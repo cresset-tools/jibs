@@ -164,7 +164,7 @@ dependencies = [
  "regex",
  "rustc-hash",
  "shlex",
- "syn 2.0.119",
+ "syn 3.0.10",
 ]
 
 [[package]]
@@ -502,9 +502,9 @@ checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
 
 [[package]]
 name = "form_urlencoded"
-version = "1.2.3"
+version = "1.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "afa489199eaffb1211795df1c6236ce1ad0d41a6fa45250add73e3b02420f06e"
+checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
 dependencies = [
  "percent-encoding",
 ]
@@ -746,7 +746,7 @@ checksum = "3bd1574e617a9a6c1f8f8181bd7e841e1f20e4277607ef28945765188d6284d4"
 
 [[package]]
 name = "jibs"
-version = "0.11.1"
+version = "0.10.0"
 dependencies = [
  "anyhow",
  "bincode",
@@ -771,14 +771,14 @@ dependencies = [
 
 [[package]]
 name = "jibs_parser"
-version = "0.11.1"
+version = "0.10.0"
 dependencies = [
  "ariadne",
 ]
 
 [[package]]
 name = "jibs_protocol"
-version = "0.11.1"
+version = "0.10.0"
 dependencies = [
  "bincode",
  "serde",
@@ -786,7 +786,7 @@ dependencies = [
 
 [[package]]
 name = "jibs_server"
-version = "0.11.1"
+version = "0.10.0"
 dependencies = [
  "hex",
  "itoa",
@@ -1719,9 +1719,9 @@ dependencies = [
 
 [[package]]
 name = "url"
-version = "2.5.9"
+version = "2.5.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f00cd2407bb42c0ef17be88d4cf020f5cceffd121665bac9b8b9493a369b3b1a"
+checksum = "ff67a8a4397373c3ef660812acab3268222035010ab8680ec4215f38ba3d0eed"
 dependencies = [
  "form_urlencoded",
  "idna",

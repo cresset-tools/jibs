@@ -14,7 +14,6 @@ use jibs_protocol::{
 
 use crate::checkpoint::{find_backup_tables, Checkpoint};
 use crate::dry_run::run_dry_run;
-use crate::triggers::apply_triggers;
 use crate::foreign_keys::{
     apply_foreign_keys, discard_preserved_foreign_keys, preserve_and_drop_foreign_keys,
     restore_foreign_keys,
@@ -63,9 +62,6 @@ pub struct ImportConfig {
     pub max_message_size: usize,
     /// Whether to collect and display timing metrics
     pub collect_metrics: bool,
-    /// Load into the tables that already exist instead of dropping and
-    /// recreating them (what `get` does, for a whole import)
-    pub keep_tables: bool,
     /// Whether to show a report of slowest tables after import
     pub show_report: bool,
     /// Debug: simulate crash after N tables (for testing resume)
@@ -244,10 +240,9 @@ pub async fn run_import(config: ImportConfig) -> Result<()> {
     // Allow inserting 0 into auto-increment columns (e.g. store_website.website_id = 0)
     local_conn.query_drop("SET SQL_MODE = 'NO_AUTO_VALUE_ON_ZERO'")?;
 
-    // `get` (aggregates_only) and `--keep-tables` merge into the existing
-    // tables: they are kept, and rows load with REPLACE (see create_table /
-    // build_load_data_sql).
-    let upsert = plan.aggregates_only || config.keep_tables;
+    // `get` (aggregates_only) merges into the existing tables: they are kept,
+    // and rows load with REPLACE (see create_table / build_load_data_sql).
+    let upsert = plan.aggregates_only;
 
     // Capture all FK constraints in the local database, then drop them to
     // prevent MySQL ERROR 1822 during parallel table recreation. They are
@@ -301,7 +296,6 @@ pub async fn run_import(config: ImportConfig) -> Result<()> {
         fail_after_tables: None,
         parallel: config.parallel as u32,
         collect_metrics: config.collect_metrics,
-        keep_tables: config.keep_tables,
     };
     let outcome = run_protocol(server, &mut local_conn, loader_pool, plan, protocol_config, encoder).await;
 
@@ -342,18 +336,6 @@ pub async fn run_import(config: ImportConfig) -> Result<()> {
             .cloned()
             .collect();
         apply_foreign_keys(&mut local_conn, &new_table_fks)?;
-        // Existing tables kept their triggers too; only new tables need them.
-        let new_table_triggers: Vec<_> = outcome
-            .stats
-            .source_triggers
-            .iter()
-            .filter(|t| {
-                !preexisting_tables.contains(&t.table)
-                    && outcome.stats.tables_imported_names.contains(&t.table)
-            })
-            .cloned()
-            .collect();
-        apply_triggers(&mut local_conn, &new_table_triggers)?;
     } else if outcome.result.is_ok() {
         if outcome.stats.source_foreign_keys.is_empty() {
             restore_foreign_keys(&mut local_conn)?;
@@ -361,9 +343,6 @@ pub async fn run_import(config: ImportConfig) -> Result<()> {
             apply_foreign_keys(&mut local_conn, &outcome.stats.source_foreign_keys)?;
             discard_preserved_foreign_keys(&mut local_conn)?;
         }
-        // Every imported table was dropped and recreated, which dropped its
-        // triggers (including tables finished by an earlier, resumed run).
-        apply_triggers(&mut local_conn, &outcome.stats.source_triggers)?;
     }
 
     // Re-enable checks
